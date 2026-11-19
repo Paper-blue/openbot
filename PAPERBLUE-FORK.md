@@ -74,25 +74,19 @@ flags=0x10000(runtime)
 codesign --verify --deep --strict  → 0
 ```
 
-### 公证（需要一份凭据）
+### 公证
 
-`electron-builder.yml` 里 `mac.notarize: true`，凭据走其一：
-
-- App Store Connect API key：`APPLE_API_KEY`（.p8 路径）、`APPLE_API_KEY_ID`、`APPLE_API_ISSUER`
-- Apple ID：`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_TEAM_ID`
-- 或 `xcrun notarytool store-credentials <profile>` 后在 `mac.notarize.keychainProfile` 指它
-
-本机 `~/.appstoreconnect/private_keys/` 下已有 `.p8`（文件名即 Key ID），**但 Issuer ID 不在磁盘上**，需要从 App Store Connect › Users and Access › Integrations 取。配好之后：
+一键脚本：`scripts/paperblue-notarize.sh`（构建 → 签名 → 送公证 → 装订 → `spctl` 检查）。它读一个 keychain profile，用前先建一次：
 
 ```sh
-export APPLE_API_KEY=~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8
-export APPLE_API_KEY_ID=<KEYID>
-export APPLE_API_ISSUER=<ISSUER-UUID>
-bunx electron-builder --dir --mac --config.mac.identity="InfoAuto, LLC (2U8YUANQ8T)" \
-  --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
-  --config.mac.entitlementsInherit=build/entitlements.mac.inherit.plist
-spctl -a -vvv -t exec dist/mac-arm64/OpenBot.app   # 期望 source=Notarized Developer ID
+xcrun notarytool store-credentials openbot-notary \
+  --key ~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8 \
+  --key-id <KEYID> --issuer <ISSUER-UUID>
 ```
+
+Key ID 就是 `.p8` 文件名里的那串；Issuer ID 在 App Store Connect › Users and Access › Integrations 里。也可以用环境变量代替 profile：`APPLE_API_KEY` / `APPLE_API_KEY_ID` / `APPLE_API_ISSUER`，或 `APPLE_KEYCHAIN_PROFILE` 指定 profile 名。
+
+**已知阻塞**：如果团队的 Apple Developer 法律协议没签或已过期，`notarytool` 会在校验凭据这一步直接回 `HTTP 403 A required agreement is missing or has expired`。这不是 key 的问题（换另一把 key 一样报），要账号持有人去 [App Store Connect › 商务](https://appstoreconnect.apple.com) › 协议、税务和银行业务 里把待签协议接受掉，然后再建 profile。
 
 ### 换成我们的签名之后
 
