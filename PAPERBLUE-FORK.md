@@ -48,6 +48,57 @@ bun run package
 3. `dist/` 如果残留了缺执行位的目录（`drw-r--r--`），打包会 `EACCES: mkdir dist/mac-arm64.tmp`。`chmod 755 dist` 或删掉重来。
 4. `--config.mac.identity=null` 产出的是 ad-hoc 签名，不是 Apple 公证版本。本机运行没问题，但**不能用来发布**，也别指望应用内自动更新。
 
+## 用我们自己的 Developer ID 签名与公证
+
+这台机器上有 `Developer ID Application: InfoAuto, LLC (2U8YUANQ8T)`（keychain 里 SHA-1 `C903755C…`），所以自建包可以签成正规的 Developer ID 版本，不必停在 ad-hoc。
+
+**签不过去的原因**：上游 `build/entitlements.mac.plist` 带两条属于上游团队的限制性权限——`com.apple.developer.team-identifier` = `ZTRDTUL87R`、`com.apple.developer.associated-domains` = `applinks:openbot.run`。换我们的证书保留它们，内核会拒绝启动（"Code has restricted entitlements"）。所以另存了 `build/entitlements.mac.paperblue.plist`，只保留 JIT、未签名可执行内存、麦克风、Apple Events。代价是 `openbot.run` 的网页深链不会打开我们这个构建（域名那边的 apple-app-site-association 认的是上游团队），`openbot://` 自定义 scheme 不受影响。
+
+构建命令（identity 名**不要**带 `Developer ID Application:` 前缀，否则 electron-builder 报错）：
+
+```sh
+bun run build
+bunx electron-builder --dir --mac \
+  --config.mac.identity="InfoAuto, LLC (2U8YUANQ8T)" \
+  --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
+  --config.mac.entitlementsInherit=build/entitlements.mac.inherit.plist \
+  --config.mac.notarize=false      # 公证见下
+```
+
+签名完成后应该是：
+
+```
+Authority=Developer ID Application: InfoAuto, LLC (2U8YUANQ8T)
+TeamIdentifier=2U8YUANQ8T
+flags=0x10000(runtime)
+codesign --verify --deep --strict  → 0
+```
+
+### 公证（需要一份凭据）
+
+`electron-builder.yml` 里 `mac.notarize: true`，凭据走其一：
+
+- App Store Connect API key：`APPLE_API_KEY`（.p8 路径）、`APPLE_API_KEY_ID`、`APPLE_API_ISSUER`
+- Apple ID：`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_TEAM_ID`
+- 或 `xcrun notarytool store-credentials <profile>` 后在 `mac.notarize.keychainProfile` 指它
+
+本机 `~/.appstoreconnect/private_keys/` 下已有 `.p8`（文件名即 Key ID），**但 Issuer ID 不在磁盘上**，需要从 App Store Connect › Users and Access › Integrations 取。配好之后：
+
+```sh
+export APPLE_API_KEY=~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8
+export APPLE_API_KEY_ID=<KEYID>
+export APPLE_API_ISSUER=<ISSUER-UUID>
+bunx electron-builder --dir --mac --config.mac.identity="InfoAuto, LLC (2U8YUANQ8T)" \
+  --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
+  --config.mac.entitlementsInherit=build/entitlements.mac.inherit.plist
+spctl -a -vvv -t exec dist/mac-arm64/OpenBot.app   # 期望 source=Notarized Developer ID
+```
+
+### 换成我们的签名之后
+
+- 屏幕录制、辅助功能这些 TCC 授权会因为我们换了签名身份而需要重新批准一次。
+- 应用内自动更新只会接受**我们团队**签的包，官方发布包不会自动覆盖上来。想更新就 `scripts/paperblue-sync.sh` 重新构建。
+
 ## 验收
 
 构建后至少过一遍：
