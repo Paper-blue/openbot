@@ -131,6 +131,8 @@ jobs:
             --config.mac.notarize=false \
             --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
             --publish never
+      - name: Verify macOS update artifacts
+        run: bun run verify:update-artifacts macos
       - name: Keep the artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -139,6 +141,7 @@ jobs:
           path: |
             dist/*.dmg
             dist/*.zip
+            dist/*.blockmap
             dist/latest-mac.yml
           if-no-files-found: error
 
