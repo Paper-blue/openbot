@@ -60,8 +60,10 @@ this repository and downloads the AppImage it names, and the desktop app reads
 upstream.
 
 The update script accepts only `X.Y.Z` versions without a prerelease suffix and
-expects the artifact named `OpenBot-$version-$architecture.AppImage`. A
-prerelease tag builds but cannot be installed by the hosted server.
+expects the artifact named `OpenBot-$version-$architecture.AppImage`. It stages
+an update only when its version is newer than the installed version. A fork
+release therefore needs a version greater than the installed upstream build;
+building the same or an older version cannot validate an upgrade.
 
 The macOS job does not use Developer ID or Apple notarization; the Windows job
 does not use a Windows signing identity. These builds can trigger operating
