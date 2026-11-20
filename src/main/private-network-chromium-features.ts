@@ -27,7 +27,12 @@ export function disabledChromiumFeatures(userData: string): string[] {
 function privateNetworkRoute(userData: string): boolean {
   try {
     const parsed = JSON.parse(readFileSync(join(userData, ROUTE_PREFERENCE_FILE), "utf8"));
-    return isDynamicRecord(parsed) && isRemoteNetworkRoute(parsed.route) && parsed.route === "private";
+    return (
+      isDynamicRecord(parsed) &&
+      parsed.version === 1 &&
+      isRemoteNetworkRoute(parsed.route) &&
+      parsed.route === "private"
+    );
   } catch {
     return false;
   }
