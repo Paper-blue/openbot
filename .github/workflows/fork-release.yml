@@ -148,6 +148,7 @@ jobs:
           bunx electron-builder --mac --arm64 \
             --config.mac.identity="$CSC_NAME" \
             --config.mac.notarize=false \
+            --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
             --config.publish.provider=github \
             --config.publish.owner=Paper-blue \
             --config.publish.repo=openbot \
