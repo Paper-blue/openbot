@@ -23,8 +23,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: fork-release
+  group: fork-release-${{ github.event_name == 'push' && 'publish' || format('validate-{0}', github.ref) }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   version:

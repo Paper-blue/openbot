@@ -108,3 +108,5 @@ jobs:
           else
             gh issue comment "$existing" --repo "$FORK" --body "$body"
           fi
+          echo '::error::Upstream merge requires conflict resolution.'
+          exit 1
