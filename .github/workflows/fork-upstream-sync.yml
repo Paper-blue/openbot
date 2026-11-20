@@ -28,7 +28,6 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
-      actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,27 +78,18 @@ jobs:
           git config --local "http.https://github.com/.extraheader" \
             "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           git push --force-with-lease origin "$BRANCH"
-          gh label create automerge --repo "$FORK" \
-            --description "Merge once the required checks pass" \
-            --color 0e8a16 2>/dev/null || true
           number="$(gh pr list --repo "$FORK" --head "$BRANCH" --base "$BASE" \
             --state open --json number --jq '.[0].number // empty')"
           if [ -z "$number" ]; then
             gh pr create --repo "$FORK" --base "$BASE" --head "$BRANCH" \
               --title "chore: merge upstream $UPSTREAM" \
-              --label automerge \
               --body "Automated merge of $UPSTREAM main at $UPSTREAM_SHA into $BASE. The required checks decide whether this merges."
             number="$(gh pr list --repo "$FORK" --head "$BRANCH" --base "$BASE" \
               --state open --json number --jq '.[0].number')"
           fi
           echo "number=$number" >> "$GITHUB_OUTPUT"
-          gh workflow run ci.yml --repo "$FORK" --ref "$BRANCH" \
-            || echo "::warning::could not start the checks"
-          gh workflow run fork-merge-gate.yml --repo "$FORK" --ref "$BRANCH" \
-            -f "pr=$number" \
-            || echo "::warning::could not start the merge gate"
-          gh pr merge "$number" --repo "$FORK" --merge --auto \
-            || echo "::warning::auto-merge refused; the checks still gate the merge"
+          echo '::error::Trusted CI dispatch and review for sync PRs are not configured.'
+          exit 1
 
       - name: Report a conflict
         if: steps.merge.outputs.conflict == 'true'

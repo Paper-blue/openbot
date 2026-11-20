@@ -26,8 +26,11 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      head: ${{ steps.verify.outputs.head }}
     steps:
       - name: Wait for the review of this commit
+        id: verify
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -39,11 +42,23 @@ jobs:
         run: |
           set -euo pipefail
           pr="${DISPATCHED_PR:-$EVENT_PR}"
-          if [ -n "$DISPATCHED_PR" ]; then
-            head="$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)"
-          else
-            head="$EVENT_SHA"
+          [[ "$pr" =~ ^[0-9]+$ ]] || { echo '::error::Invalid PR number'; exit 1; }
+          metadata="$(gh api "repos/$REPO/pulls/$pr")"
+          head="$(jq -r '.head.sha' <<<"$metadata")"
+          base="$(jq -r '.base.ref' <<<"$metadata")"
+          base_repo="$(jq -r '.base.repo.full_name' <<<"$metadata")"
+          state="$(jq -r '.state' <<<"$metadata")"
+          if [ "$base_repo" != "$REPO" ] || [ "$state" != 'open' ] ||
+            { [ "$base" != 'maintenance' ] && [ "$base" != 'main' ]; }; then
+            echo '::error::PR target is not an open maintenance or main PR'
+            exit 1
           fi
+          if [ -n "$DISPATCHED_PR" ]; then
+            [ "$head" = "$GITHUB_SHA" ] || { echo '::error::Workflow ref differs from PR head'; exit 1; }
+          else
+            [ "$head" = "$EVENT_SHA" ] || { echo '::error::PR head changed'; exit 1; }
+          fi
+          echo "head=$head" >> "$GITHUB_OUTPUT"
           echo "pr=$pr head=$head"
           deadline=$(( $(date +%s) + DEADLINE_MINUTES * 60 ))
           while :; do
@@ -75,6 +90,7 @@ jobs:
 
   automerge:
     name: Enable auto-merge
+    if: vars.FORK_AUTOMERGE_ENABLED == 'true'
     needs: review
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -90,6 +106,7 @@ jobs:
           EVENT_PR: ${{ github.event.pull_request.number }}
           EVENT_AUTHOR: ${{ github.event.pull_request.user.login }}
           EVENT_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          REVIEWED_HEAD: ${{ needs.review.outputs.head }}
         run: |
           set -euo pipefail
           pr="${DISPATCHED_PR:-$EVENT_PR}"
@@ -106,5 +123,5 @@ jobs:
               exit 0
             esac
           esac
-          gh pr merge "$pr" --repo "$REPO" --merge --auto --delete-branch \
-            || gh pr merge "$pr" --repo "$REPO" --merge --auto
+          gh pr merge "$pr" --repo "$REPO" --merge --auto --match-head-commit "$REVIEWED_HEAD" --delete-branch \
+            || gh pr merge "$pr" --repo "$REPO" --merge --auto --match-head-commit "$REVIEWED_HEAD"

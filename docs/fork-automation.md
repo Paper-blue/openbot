@@ -10,21 +10,20 @@ and client updates have not yet been verified end to end.
 `Codex review finished`. A change lands only when the checks pass and Codex
 finished reviewing the exact commit being merged with no unresolved finding.
 
-`fork-merge-gate.yml` supplies `Codex review finished` and switches on
-auto-merge. It reads the state the Codex connector keeps in its summary comment
-and accepts only that comment from `chatgpt-codex-connector[bot]`, so another
-commenter cannot claim a review happened. The state names the reviewed commit,
-so a review of an older push never unlocks a newer one.
-
-Auto-merge turns on for pull requests this repository produces by itself: those
-carrying the `automerge` label, and those opened by a bot such as Codex. A pull
-request opened by a person waits for that person.
+`fork-merge-gate.yml` supplies `Codex review finished`. Automatic merging is
+currently disabled until the controller's trust boundaries have been verified.
+The gate reads the state the Codex connector keeps in its summary comment
+and accepts only that comment from `chatgpt-codex-connector[bot]`. The state names
+the reviewed commit; manual dispatch also checks its run SHA against the PR
+head. These checks still require end-to-end verification.
 
 ## Upstream
 
-`fork-upstream-sync.yml` runs daily and on demand. It merges
-`nightly-labs/openbot` `main` into `automation/upstream-sync`, opens or updates a
-pull request to `maintenance`, and enables auto-merge.
+`fork-upstream-sync.yml` is intended to run daily and on demand, merge
+`nightly-labs/openbot` `main` into `automation/upstream-sync`, and open or update
+a pull request to `maintenance`. It deliberately fails after opening the PR until
+trusted CI dispatch and review are implemented. It is not on the default branch,
+so scheduling is not active.
 
 It merges rather than squashes because the next sync asks whether upstream `main`
 is already an ancestor of `maintenance`. A squash would copy the file changes
@@ -35,12 +34,12 @@ A merge that conflicts stops the run and opens an issue. Resolution is manual: a
 guessed resolution to inherited upstream code is worse than a person looking at
 it.
 
-The sync dispatches `ci.yml` and `fork-merge-gate.yml` explicitly. GitHub
-currently documents that `pull_request` opened, synchronize, and reopened events
-caused by `GITHUB_TOKEN` may create runs that require approval; other generated
-pull request activities do not trigger runs. `workflow_dispatch` is an
-exception. This fallback has not been verified end to end, and GitHub's rule for
-Actions runs alone does not establish whether Codex will review the generated PR.
+GitHub currently documents that `pull_request` opened, synchronize, and reopened
+events caused by `GITHUB_TOKEN` may create runs that require approval; other
+generated pull request activities do not trigger runs. `workflow_dispatch` is an
+exception, but dispatching a workflow from the unreviewed sync branch can run
+its workflow definition with write permissions. A trusted controller is needed
+before automatic checks and merging can be enabled safely.
 
 ## Releases
 
