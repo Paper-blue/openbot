@@ -70,7 +70,9 @@ async function send(method: string, url: URL, body?: BodyInit, contentType?: str
   };
   if (contentType !== undefined) headers["content-type"] = contentType;
   try {
-    return await fetch(url, { method, headers, body });
+    const options: RequestInit = { method, headers };
+    if (body !== undefined) options.body = body;
+    return await fetch(url, options);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new ReleaseFailure(`${method} ${url.href} failed: ${redact(reason)}.`);
