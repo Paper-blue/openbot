@@ -59,8 +59,9 @@ expects the artifact named `OpenBot-$version-$architecture.AppImage`. A
 prerelease tag builds but cannot be installed by the hosted server.
 
 The macOS job requires `MAC_RELEASE_ENABLED=true` and signing and notarization
-secrets. The Windows job currently supports unsigned manual builds for
-verification only; tag-triggered runs fail until a signing solution is configured.
+secrets. The Windows job runs an unsigned x64 build on relevant pull requests
+and on manual dispatch for verification only; tag-triggered runs fail until a
+signing solution is configured.
 Without successful builds on all three platforms no release is published. The
 release credentials and the automation's trust boundaries still need verification.
 

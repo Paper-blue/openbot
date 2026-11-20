@@ -4,6 +4,14 @@ on:
   push:
     tags:
       - "v*.*.*"
+  pull_request:
+    branches: [maintenance]
+    paths:
+      - .github/workflows/fork-release.yml
+      - electron-builder.yml
+      - package.json
+      - scripts/verify-windows-package.ts
+      - scripts/verify-update-artifacts.ts
   workflow_dispatch:
     inputs:
       dry_run:
@@ -48,7 +56,7 @@ jobs:
   linux:
     name: Linux AppImage
     needs: version
-    if: github.repository == 'Paper-blue/openbot'
+    if: github.repository == 'Paper-blue/openbot' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -88,7 +96,7 @@ jobs:
   mac:
     name: macOS build
     needs: version
-    if: github.repository == 'Paper-blue/openbot' && vars.MAC_RELEASE_ENABLED == 'true'
+    if: github.repository == 'Paper-blue/openbot' && github.event_name != 'pull_request' && vars.MAC_RELEASE_ENABLED == 'true'
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
