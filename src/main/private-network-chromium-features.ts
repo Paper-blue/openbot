@@ -26,7 +26,7 @@ export function disabledChromiumFeatures(userData: string): string[] {
 /** Whether this computer is on the private network route. Anything unreadable means the default. */
 function privateNetworkRoute(userData: string): boolean {
   try {
-    const parsed: unknown = JSON.parse(readFileSync(join(userData, ROUTE_PREFERENCE_FILE), "utf8"));
+    const parsed = JSON.parse(readFileSync(join(userData, ROUTE_PREFERENCE_FILE), "utf8"));
     return isDynamicRecord(parsed) && isRemoteNetworkRoute(parsed.route) && parsed.route === "private";
   } catch {
     return false;
