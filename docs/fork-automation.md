@@ -7,8 +7,9 @@ and client updates have not yet been verified end to end.
 
 `maintenance` requires these checks: `Detect changed areas`, `Check`,
 `Tests (desktop 1/2)`, `Tests (desktop 2/2)`, `Browser smoke` and
-`Codex review finished`. A change lands only when the checks pass and Codex
-finished reviewing the exact commit being merged with no unresolved finding.
+`Codex review finished`. These checks are required and strict on both `main`
+and `maintenance`, including administrators. They do not yet establish a safe
+trust boundary for code that can modify workflow definitions.
 
 `fork-merge-gate.yml` supplies `Codex review finished`. Automatic merging is
 currently disabled until the controller's trust boundaries have been verified.
