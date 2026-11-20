@@ -22,9 +22,17 @@ head. These checks still require end-to-end verification.
 
 `fork-upstream-sync.yml` is intended to run daily and on demand, merge
 `nightly-labs/openbot` `main` into `automation/upstream-sync`, and open or update
-a pull request to `maintenance`. It deliberately fails after opening the PR until
+a pull request to `maintenance`. It stays inactive unless the repository variable
+`FORK_SYNC_ENABLED` is `true`, and it deliberately fails after opening the PR until
 trusted CI dispatch and review are implemented. It is not on the default branch,
 so scheduling is not active.
+
+A pull request opened with `GITHUB_TOKEN` does not start the required checks, and
+this repository has no token that can. Enabling the schedule therefore needs an
+installation token or fine-grained token with permission to create runs, which
+means a new credential and a deliberate decision to give the workflow that
+access. Until then the sync stays off rather than opening pull requests that
+nothing can verify.
 
 It merges rather than squashes because the next sync asks whether upstream `main`
 is already an ancestor of `maintenance`. A squash would copy the file changes
@@ -71,6 +79,14 @@ system security prompts. The published macOS updater normally requires signing,
 so artifact generation alone does not verify that updates can be installed.
 Any eventual release requires successful builds on all three platforms, and the
 release automation and trust boundaries still need end-to-end verification.
+
+Only macOS arm64, Windows x64, and Linux x64 artifacts are produced. The
+updater's Linux arm64 feed and Intel macOS feed therefore stay unpublished, and
+a machine on either of those platforms has no compatible fork update. That is a
+deliberate limit of the personal build: add the missing architectures before
+treating the fork feed as complete for other machines. The publish job releases
+only the manifests the three jobs actually upload, so a missing feed is never
+replaced by a manifest for a different architecture.
 
 ## Where the explanations live
 

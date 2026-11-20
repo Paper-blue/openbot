@@ -63,10 +63,8 @@ jobs:
           deadline=$(( $(date +%s) + DEADLINE_MINUTES * 60 ))
           while :; do
             state="$(gh api "repos/$REPO/issues/$pr/comments" --paginate \
-              --jq "[.[] | select(.user.login == \"$REVIEWER\")
-                | select(.body | contains(\"codex-review-state:v1\"))
-                | .body] | last // \"\"" \
-              | sed -n 's/.*codex-review-state:v1 \(.*\) -->.*/\1/p')"
+              --jq '.[] | select(.user.login == "'"$REVIEWER"'") | select(.body | contains("codex-review-state:v1")) | .body' \
+              | sed -n 's/.*codex-review-state:v1 \(.*\) -->.*/\1/p' | tail -1)"
             if [ -n "$state" ]; then
               reviewed="$(jq -r '.code_review.commit_sha // ""' <<<"$state")"
               status="$(jq -r '.code_review.status // ""' <<<"$state")"

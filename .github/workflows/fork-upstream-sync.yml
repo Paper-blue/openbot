@@ -21,7 +21,7 @@ env:
 jobs:
   sync:
     name: Merge upstream into maintenance
-    if: github.repository == 'Paper-blue/openbot'
+    if: github.repository == 'Paper-blue/openbot' && vars.FORK_SYNC_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -48,6 +48,15 @@ jobs:
           else
             echo "current=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Authenticate Git for the sync branch
+        if: steps.upstream.outputs.current == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --local "http.https://github.com/.extraheader" \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
 
       - name: Merge upstream
         if: steps.upstream.outputs.current == 'false'
