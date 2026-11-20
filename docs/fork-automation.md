@@ -43,10 +43,11 @@ not merge.
 ## Releases
 
 `fork-release.yml` builds on a `v*.*.*` tag. It checks the tag against
-`package.json` and prepares the native runtimes. The publish job requires Linux,
-signed and notarized macOS, and Windows builds to succeed. It checks their
-update manifests and packages, uploads them to a draft release, then publishes
-it. This workflow has not yet been validated end to end.
+`package.json` and prepares the native runtimes. The publish job is disabled
+unless `PERSONAL_RELEASE_ENABLED` is explicitly enabled. The build workflow now
+creates personal macOS and Windows artifacts without Developer ID or Windows
+signing, and runs both jobs on relevant pull requests. macOS auto-update and
+installation of the personal build are not yet verified.
 
 The hosted server's updater reads `latest-linux.yml` from the newest release of
 this repository and downloads the AppImage it names, and the desktop app reads
@@ -58,12 +59,12 @@ The update script accepts only `X.Y.Z` versions without a prerelease suffix and
 expects the artifact named `OpenBot-$version-$architecture.AppImage`. A
 prerelease tag builds but cannot be installed by the hosted server.
 
-The macOS job requires `MAC_RELEASE_ENABLED=true` and signing and notarization
-secrets. The Windows job runs an unsigned x64 build on relevant pull requests
-and on manual dispatch for verification only; tag-triggered runs fail until a
-signing solution is configured.
-Without successful builds on all three platforms no release is published. The
-release credentials and the automation's trust boundaries still need verification.
+The macOS job does not use Developer ID or Apple notarization; the Windows job
+does not use a Windows signing identity. These builds can trigger operating
+system security prompts. The published macOS updater normally requires signing,
+so artifact generation alone does not verify that updates can be installed.
+Any eventual release requires successful builds on all three platforms, and the
+release automation and trust boundaries still need end-to-end verification.
 
 ## Where the explanations live
 

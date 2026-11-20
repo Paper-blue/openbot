@@ -136,11 +136,9 @@ Key ID 就是 `.p8` 文件名里的那串；Issuer ID 在 App Store Connect › 
 | `ci.yml` | push / PR 到 `main`、`maintenance` | 原有的检查；`deploy-production` 加了仓库判断，只在上游仓库跑 |
 | `fork-upstream-sync.yml` | 每天 03:17 与手动 | 把上游 `main` 合并到 `maintenance`，开 PR 并打 `automerge`；有冲突就不猜，开 issue |
 | `fork-merge-gate.yml` | PR | 等 Codex 审完当前提交且没有未解决意见，再开启自动合并 |
-| `fork-release.yml` | 推 `v*.*.*` 标签 | 构建并发布 Linux AppImage（有 macOS 签名密钥时也发 macOS 包） |
+| `fork-release.yml` | PR / 标签 / 手动 | 构建个人使用的 macOS、Windows 和 Linux 产物；发布默认关闭，等待验证 |
 
-合并需要两件事同时成立：`ci.yml` 的检查全绿，并且 Codex 对**当前提交**的审查没有未解决意见。审查结论取自 Codex 在 PR 上维护的那条摘要评论，里面的 `commit_sha` 保证旧提交的审查不会解锁新提交。
-
-注意 `fork-release.yml` 的 macOS 任务默认跳过：它需要 `MAC_CERTIFICATE_P12`、`MAC_CERTIFICATE_PASSWORD`、`MAC_SIGNING_IDENTITY` 三个密钥，并把仓库变量 `MAC_RELEASE_ENABLED` 设为 `true` 才会跑。没有这些时只发 Linux 产物，Mac 客户端仍从本机签名构建。
+自动审查、合并及更新流程尚未端到端验证。个人构建不需要 Developer ID 或 Apple 公证；macOS 原生自动更新需要签名，因此不能因为产物构建成功就声称自动更新可用。详细状态见 `docs/fork-automation.md`。
 
 `.yamllint.yml` 声明了本仓库真实的 YAML 约定：继承来的 workflow 行宽远超 yamllint 默认的 80 列，且 `on:` 是 GitHub Actions 的键而不是布尔值。
 

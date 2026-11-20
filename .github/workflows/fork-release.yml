@@ -96,7 +96,7 @@ jobs:
   mac:
     name: macOS build
     needs: version
-    if: github.repository == 'Paper-blue/openbot' && github.event_name != 'pull_request' && vars.MAC_RELEASE_ENABLED == 'true'
+    if: github.repository == 'Paper-blue/openbot'
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
@@ -111,24 +111,6 @@ jobs:
           no-cache: true
       - name: Install dependencies
         run: bun install --frozen-lockfile
-      - name: Import the Developer ID certificate
-        env:
-          CERTIFICATE_P12: ${{ secrets.MAC_CERTIFICATE_P12 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          keychain="$RUNNER_TEMP/signing.keychain-db"
-          echo "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security create-keychain -p actions "$keychain"
-          security set-keychain-settings -lut 1800 "$keychain"
-          security unlock-keychain -p actions "$keychain"
-          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
-            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s \
-            -k actions "$keychain"
-          security list-keychains -d user -s "$keychain" \
-            "$(security default-keychain -d user | tr -d ' "')"
-          rm -f "$RUNNER_TEMP/cert.p12"
       - name: Prepare the runtime resources
         run: |
           set -euo pipefail
@@ -136,24 +118,13 @@ jobs:
           bun run prepare:remote-desktop-runtime
           bun run verify:remote-desktop-runtime
           bun run prepare:cua-driver
-      - name: Build and publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_NAME: ${{ secrets.MAC_SIGNING_IDENTITY }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.MAC_NOTARIZE_APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.MAC_NOTARIZE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.MAC_NOTARIZE_TEAM_ID }}
+      - name: Build personal macOS artifacts
         run: |
           set -euo pipefail
-          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
-            echo "::error::macOS releases need notarization credentials"
-            exit 1
-          fi
           bun run build
           bunx electron-builder --mac --arm64 \
-            --config.mac.identity="$CSC_NAME" \
-            --config.mac.notarize=true \
+            --config.mac.identity=null \
+            --config.mac.notarize=false \
             --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
             --publish never
       - name: Keep the artifacts
@@ -185,12 +156,6 @@ jobs:
         with:
           bun-version: 1.4.2
           no-cache: true
-      - name: Reject unsigned production releases
-        if: github.event_name == 'push'
-        shell: pwsh
-        run: |
-          Write-Error "Windows signing is not configured for this fork."
-          exit 1
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Build installer
@@ -220,7 +185,7 @@ jobs:
   publish:
     name: Publish complete release
     needs: [version, linux, mac, windows]
-    if: github.event_name == 'push' && needs.linux.result == 'success' && needs.mac.result == 'success' && needs.windows.result == 'success'
+    if: github.event_name == 'push' && vars.PERSONAL_RELEASE_ENABLED == 'true' && needs.linux.result == 'success' && needs.mac.result == 'success' && needs.windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
