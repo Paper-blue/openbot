@@ -1,0 +1,119 @@
+name: Upstream sync
+
+# Keeps the fork's maintenance branch current with upstream without anyone
+# watching it. The merge is a plain merge commit: conflicts stop the run and
+# open an issue instead of guessing at a resolution, and the pull request it
+# opens still has to pass the same checks as any other change.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: nightly-labs/openbot
+  FORK: Paper-blue/openbot
+  BASE: maintenance
+  BRANCH: automation/upstream-sync
+
+jobs:
+  sync:
+    name: Merge upstream into maintenance
+    if: github.repository == 'Paper-blue/openbot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: maintenance
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare with upstream
+        id: upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream main
+          sha="$(git rev-parse upstream/main)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::maintenance already contains upstream $sha"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::upstream $sha is ahead of maintenance"
+          fi
+
+      - name: Merge upstream
+        if: steps.upstream.outputs.current == 'false'
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "openbot-fork-bot"
+          git config user.email "openbot-fork-bot@users.noreply.github.com"
+          git switch --force-create "$BRANCH"
+          if git merge --no-edit upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::error::upstream conflicts with maintenance"
+          fi
+
+      - name: Open or update the sync pull request
+        if: >-
+          steps.upstream.outputs.current == 'false' &&
+          steps.merge.outputs.conflict == 'false'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "$BRANCH"
+          gh label create automerge --repo "$FORK" \
+            --description "Merge once the required checks pass" \
+            --color 0e8a16 2>/dev/null || true
+          number="$(gh pr list --repo "$FORK" --head "$BRANCH" --base "$BASE" \
+            --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$number" ]; then
+            gh pr create --repo "$FORK" --base "$BASE" --head "$BRANCH" \
+              --title "chore: merge upstream $UPSTREAM" \
+              --label automerge \
+              --body "Automated merge of $UPSTREAM main at $UPSTREAM_SHA into $BASE. The required checks decide whether this merges."
+            number="$(gh pr list --repo "$FORK" --head "$BRANCH" --base "$BASE" \
+              --state open --json number --jq '.[0].number')"
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          gh pr merge "$number" --repo "$FORK" --squash --auto \
+            || echo "::warning::auto-merge refused; the checks still gate the merge"
+
+      - name: Report a conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          title="Upstream merge conflict on $BASE"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="Merging $UPSTREAM main at $UPSTREAM_SHA into $BASE failed with conflicts. Resolve them by hand on $BASE. Run: $run_url"
+          existing="$(gh issue list --repo "$FORK" --state open \
+            --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [ -z "$existing" ]; then
+            gh issue create --repo "$FORK" --title "$title" --body "$body"
+          else
+            gh issue comment "$existing" --repo "$FORK" --body "$body"
+          fi

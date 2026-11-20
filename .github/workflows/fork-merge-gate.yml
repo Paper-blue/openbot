@@ -1,0 +1,97 @@
+name: Merge gate
+
+# The fork merges on its own only when two independent things agree: the checks
+# in `ci.yml` pass, and Codex finished reviewing the exact commit being merged
+# with no unresolved finding. This workflow supplies the second half as a status
+# check and switches on auto-merge; branch protection supplies the first.
+#
+# The review state comes from the summary comment the Codex connector keeps
+# updated on the pull request. Its marker names the reviewed commit, so a review
+# of an older push never unlocks a newer one.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Codex review finished
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Wait for the review of this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEADLINE_MINUTES: "35"
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + DEADLINE_MINUTES * 60 ))
+          while :; do
+            state="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq '[.[] | select(.body | contains("codex-review-state:v1")) | .body]
+                    | last // ""' \
+              | sed -n 's/.*codex-review-state:v1 \(.*\) -->.*/\1/p')"
+            if [ -n "$state" ]; then
+              reviewed="$(jq -r '.code_review.commit_sha // ""' <<<"$state")"
+              status="$(jq -r '.code_review.status // ""' <<<"$state")"
+              unresolved="$(jq -r '.code_review.has_unresolved_findings' <<<"$state")"
+              echo "reviewed=$reviewed status=$status unresolved=$unresolved"
+              if [ "$reviewed" = "$HEAD_SHA" ] && [ "$status" != "running" ]; then
+                if [ "$unresolved" = "true" ]; then
+                  echo "::error::Codex review of $HEAD_SHA has unresolved findings"
+                  exit 1
+                fi
+                echo "::notice::Codex reviewed $HEAD_SHA with no unresolved finding"
+                exit 0
+              fi
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::No finished Codex review of $HEAD_SHA within $DEADLINE_MINUTES minutes"
+              exit 1
+            fi
+            sleep 30
+          done
+
+  automerge:
+    name: Enable auto-merge
+    needs: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Merge once the required checks pass
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          # Only work this repository produced on its own merges unattended:
+          # the sync workflow labels its pull requests, and Codex opens them as
+          # a bot. A pull request opened by a person waits for a person.
+          case ",$LABELS," in *,automerge,*) ;; *)
+            case "$AUTHOR" in *"[bot]") ;; *)
+              echo "::notice::$AUTHOR has to merge this one"
+              exit 0
+            esac
+          esac
+          gh pr merge "$PR" --repo "$REPO" --squash --auto --delete-branch \
+            || gh pr merge "$PR" --repo "$REPO" --squash --auto

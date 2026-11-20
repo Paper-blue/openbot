@@ -1,0 +1,15 @@
+# yamllint settings for this fork.
+#
+# The workflows inherited from upstream run to 300 columns and carry no `---`
+# document header, so the default rules report every one of those lines as a
+# defect and bury real findings. Line width is not a rule this repository
+# enforces anywhere; the rules that catch actual mistakes stay on.
+extends: default
+rules:
+  line-length: disable
+  document-start: disable
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  truthy:
+    allowed-values: ["true", "false", "on"]

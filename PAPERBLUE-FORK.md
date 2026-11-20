@@ -122,3 +122,28 @@ Key ID 就是 `.p8` 文件名里的那串；Issuer ID 在 App Store Connect › 
 - 加载页：`2611-开源grok-bot/tools/openbot-calm-loading.py` 给已安装的 `app.asar` 打补丁（改完要更新 asar 头部与 Info.plist 两处哈希并重签名，脚本已处理）。
 - 私有路由：在主机 `/opt/OpenBot/hosted/openbot-hosted-server` 的启动行加 `--disable-features=WebRtcHideLocalIpsWithMdns`。
 - 这两处都会在 OpenBot 升级时被覆盖，需要重跑。
+
+## 本 fork 自己的更新来源
+
+- `electron-builder.yml` 的 `publish` 指向 `Paper-blue/openbot`，所以这里构建出的桌面应用读的是本仓库的 release，不是上游的。
+- `scripts/hosting/openbot-hosted-update` 的 `RELEASES` 也指向本仓库，VM103 上的托管服务因此从这个 release 升级。
+- 该更新脚本只接受 `X.Y.Z` 形式、不带预发布后缀的版本号，并要求产物名为 `OpenBot-$version-$architecture.AppImage`，版本和产物名对不上会直接拒绝。
+
+## 自动化
+
+| workflow | 触发 | 做什么 |
+| --- | --- | --- |
+| `ci.yml` | push / PR 到 `main`、`maintenance` | 原有的检查；`deploy-production` 加了仓库判断，只在上游仓库跑 |
+| `fork-upstream-sync.yml` | 每天 03:17 与手动 | 把上游 `main` 合并到 `maintenance`，开 PR 并打 `automerge`；有冲突就不猜，开 issue |
+| `fork-merge-gate.yml` | PR | 等 Codex 审完当前提交且没有未解决意见，再开启自动合并 |
+| `fork-release.yml` | 推 `v*.*.*` 标签 | 构建并发布 Linux AppImage（有 macOS 签名密钥时也发 macOS 包） |
+
+合并需要两件事同时成立：`ci.yml` 的检查全绿，并且 Codex 对**当前提交**的审查没有未解决意见。审查结论取自 Codex 在 PR 上维护的那条摘要评论，里面的 `commit_sha` 保证旧提交的审查不会解锁新提交。
+
+注意 `fork-release.yml` 的 macOS 任务默认跳过：它需要 `MAC_CERTIFICATE_P12`、`MAC_CERTIFICATE_PASSWORD`、`MAC_SIGNING_IDENTITY` 三个密钥，并把仓库变量 `MAC_RELEASE_ENABLED` 设为 `true` 才会跑。没有这些时只发 Linux 产物，Mac 客户端仍从本机签名构建。
+
+`.yamllint.yml` 声明了本仓库真实的 YAML 约定：继承来的 workflow 行宽远超 yamllint 默认的 80 列，且 `on:` 是 GitHub Actions 的键而不是布尔值。
+
+## 私有路由这一处改动的验证方式
+
+`private-network-chromium-features.ts` 只按路由偏好决定 Chromium 开关。仓库规则是不加单测，只写 E2E，而这里没有现成的、能在 CI 里观测 Chromium 开关的 E2E；用 Playwright 起整个应用会在启动阶段超时。所以这项改动不挂自动测试，依据是真实重连：VM103 设为 `private` 路由后客户端 3–4 秒完成能力协商并请求成功（见 `reports/openbot-mesh-route-vm103/README.md`）。

@@ -1,0 +1,162 @@
+name: Fork release
+
+# Publishes the artifacts this fork's own machines update from.
+#
+# The hosted-server updater reads `latest-linux.yml` from the newest release and
+# downloads the AppImage it names, and the desktop app reads `latest-mac.yml`.
+# Both resolve against this repository once `electron-builder.yml` names it, so
+# a tag here is what makes an update available to VM103 and to the Mac.
+#
+# A Mac build needs the Developer ID certificate and password as repository
+# secrets. Without them the macOS job is skipped and only Linux artifacts are
+# published, so the pipeline still runs.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and upload artifacts without publishing a release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Check the tag against package.json
+    if: github.repository == 'Paper-blue/openbot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = "push" ] && [ "v$version" != "$TAG_NAME" ]; then
+            echo "::error::tag $TAG_NAME does not match version $version"
+            exit 1
+          fi
+
+  linux:
+    name: Linux AppImage
+    needs: version
+    if: github.repository == 'Paper-blue/openbot'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISH: ${{ (github.event_name == 'push') && 'always' || 'never' }}
+        run: |
+          set -euo pipefail
+          bun run build
+          bunx electron-builder --linux AppImage --x64 \
+            --config.publish.provider=github \
+            --config.publish.owner=Paper-blue \
+            --config.publish.repo=openbot \
+            --publish "$PUBLISH"
+      - name: Keep the artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-appimage
+          path: |
+            dist/*.AppImage
+            dist/latest-linux.yml
+          if-no-files-found: warn
+          include-hidden-files: false
+
+  mac:
+    name: macOS build
+    needs: version
+    if: github.repository == 'Paper-blue/openbot' && vars.MAC_RELEASE_ENABLED == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Import the Developer ID certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MAC_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          echo "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p actions "$keychain"
+          security set-keychain-settings -lut 1800 "$keychain"
+          security unlock-keychain -p actions "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k actions "$keychain"
+          security list-keychains -d user -s "$keychain" \
+            "$(security default-keychain -d user | tr -d ' "')"
+          rm -f "$RUNNER_TEMP/cert.p12"
+      - name: Build and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_NAME: ${{ secrets.MAC_SIGNING_IDENTITY }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          PUBLISH: ${{ (github.event_name == 'push') && 'always' || 'never' }}
+        run: |
+          set -euo pipefail
+          bun run build
+          bunx electron-builder --mac --arm64 \
+            --config.mac.identity="$CSC_NAME" \
+            --config.mac.notarize=false \
+            --config.publish.provider=github \
+            --config.publish.owner=Paper-blue \
+            --config.publish.repo=openbot \
+            --publish "$PUBLISH"
+      - name: Keep the artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-build
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/latest-mac.yml
+          if-no-files-found: warn
+          include-hidden-files: false
