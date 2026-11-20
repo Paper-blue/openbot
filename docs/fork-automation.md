@@ -43,9 +43,11 @@ not merge.
 
 ## Releases
 
-`fork-release.yml` publishes on a `v*.*.*` tag. It checks that the tag matches
-`package.json`, prepares the same native runtimes `package:linux` and `dist:mac`
-prepare locally, and publishes a released rather than draft GitHub release.
+`fork-release.yml` builds on a `v*.*.*` tag. It checks the tag against
+`package.json` and prepares the native runtimes. The publish job requires both
+Linux and signed, notarized macOS builds to succeed, checks that both update
+manifests and packages exist, and then uploads them to a draft release before
+publishing it. This workflow has not yet been validated end to end.
 
 The hosted server's updater reads `latest-linux.yml` from the newest release of
 this repository and downloads the AppImage it names, and the desktop app reads
@@ -57,14 +59,9 @@ The update script accepts only `X.Y.Z` versions without a prerelease suffix and
 expects the artifact named `OpenBot-$version-$architecture.AppImage`. A
 prerelease tag builds but cannot be installed by the hosted server.
 
-The macOS job is skipped unless the repository has `MAC_CERTIFICATE_P12`,
-`MAC_CERTIFICATE_PASSWORD`, `MAC_SIGNING_IDENTITY`, `MAC_NOTARIZE_APPLE_ID`,
-`MAC_NOTARIZE_PASSWORD` and `MAC_NOTARIZE_TEAM_ID`, and the variable
-`MAC_RELEASE_ENABLED` is `true`. It signs with `build/entitlements.mac.paperblue.plist`
-because the default entitlements request an associated-domain entitlement that
-belongs to the upstream team, not this one. It notarizes, and fails instead of
-publishing when the notarization credentials are missing: a downloaded DMG that
-Gatekeeper blocks is worse than no release at all.
+The macOS job requires `MAC_RELEASE_ENABLED=true` and signing and notarization
+secrets. Without a successful macOS job no release is published. The release
+credentials and the automation's trust boundaries still need verification.
 
 ## Where the explanations live
 

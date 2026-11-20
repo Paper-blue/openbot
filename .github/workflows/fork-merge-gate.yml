@@ -57,9 +57,9 @@ jobs:
               status="$(jq -r '.code_review.status // ""' <<<"$state")"
               unresolved="$(jq -r '.code_review.has_unresolved_findings' <<<"$state")"
               echo "reviewed=$reviewed status=$status unresolved=$unresolved"
-              if [ "$reviewed" = "$head" ] && [ "$status" != "running" ]; then
-                if [ "$unresolved" = "true" ]; then
-                  echo "::error::Codex review of $head has unresolved findings"
+              if [ "$reviewed" = "$head" ] && [ "$status" = "completed" ]; then
+                if [ "$unresolved" != "false" ]; then
+                  echo "::error::Codex review of $head is not clear"
                   exit 1
                 fi
                 echo "::notice::Codex reviewed $head with no unresolved finding"

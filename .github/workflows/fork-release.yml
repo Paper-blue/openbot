@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,18 +71,10 @@ jobs:
           bun run verify:remote-desktop-runtime --linux
           bun scripts/install-cua-driver.ts linux x64
       - name: Build and publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PUBLISH: ${{ (github.event_name == 'push') && 'always' || 'never' }}
         run: |
           set -euo pipefail
           bun run build
-          bunx electron-builder --linux AppImage --x64 \
-            --config.publish.provider=github \
-            --config.publish.owner=Paper-blue \
-            --config.publish.repo=openbot \
-            --config.publish.releaseType=release \
-            --publish "$PUBLISH"
+          bunx electron-builder --linux AppImage --x64 --publish never
       - name: Keep the artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -91,7 +83,7 @@ jobs:
           path: |
             dist/*.AppImage
             dist/latest-linux.yml
-          if-no-files-found: warn
+          if-no-files-found: error
 
   mac:
     name: macOS build
@@ -100,7 +92,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -144,7 +136,6 @@ jobs:
           APPLE_ID: ${{ secrets.MAC_NOTARIZE_APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.MAC_NOTARIZE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.MAC_NOTARIZE_TEAM_ID }}
-          PUBLISH: ${{ (github.event_name == 'push') && 'always' || 'never' }}
         run: |
           set -euo pipefail
           if [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
@@ -156,11 +147,7 @@ jobs:
             --config.mac.identity="$CSC_NAME" \
             --config.mac.notarize=true \
             --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
-            --config.publish.provider=github \
-            --config.publish.owner=Paper-blue \
-            --config.publish.repo=openbot \
-            --config.publish.releaseType=release \
-            --publish "$PUBLISH"
+            --publish never
       - name: Keep the artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -170,4 +157,35 @@ jobs:
             dist/*.dmg
             dist/*.zip
             dist/latest-mac.yml
-          if-no-files-found: warn
+          if-no-files-found: error
+
+  publish:
+    name: Publish complete release
+    needs: [version, linux, mac]
+    if: github.event_name == 'push' && needs.linux.result == 'success' && needs.mac.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-build
+          path: artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-appimage
+          path: artifacts
+      - name: Publish verified artifact set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -s artifacts/latest-linux.yml
+          test -s artifacts/latest-mac.yml
+          compgen -G 'artifacts/*.AppImage' >/dev/null
+          compgen -G 'artifacts/*.zip' >/dev/null
+          gh release create "$TAG" --repo "$REPO" --draft --verify-tag --title "$TAG"
+          gh release upload "$TAG" artifacts/* --repo "$REPO"
+          gh release edit "$TAG" --repo "$REPO" --draft=false
