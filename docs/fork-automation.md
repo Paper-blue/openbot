@@ -35,10 +35,12 @@ A merge that conflicts stops the run and opens an issue. Resolution is manual: a
 guessed resolution to inherited upstream code is worse than a person looking at
 it.
 
-Events created with the workflow token do not start other workflows, so the sync
-also dispatches `ci.yml` and `fork-merge-gate.yml` for the branch it pushed.
-Without that the required checks would never report and the pull request could
-not merge.
+The sync dispatches `ci.yml` and `fork-merge-gate.yml` explicitly. GitHub
+currently documents that `pull_request` opened, synchronize, and reopened events
+caused by `GITHUB_TOKEN` may create runs that require approval; other generated
+pull request activities do not trigger runs. `workflow_dispatch` is an
+exception. This fallback has not been verified end to end, and GitHub's rule for
+Actions runs alone does not establish whether Codex will review the generated PR.
 
 ## Releases
 
