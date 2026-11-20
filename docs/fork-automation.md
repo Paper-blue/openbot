@@ -44,9 +44,11 @@ before automatic checks and merging can be enabled safely.
 ## Releases
 
 `fork-release.yml` builds on a `v*.*.*` tag. It checks the tag against
-`package.json` and prepares the native runtimes. The publish job is disabled
-unless `PERSONAL_RELEASE_ENABLED` is explicitly enabled. The build workflow now
-creates personal macOS and Windows artifacts without Developer ID or Windows
+`package.json`, checks that a tag points into `maintenance` history, and prepares
+the native runtimes. The publish job is disabled unless
+`PERSONAL_RELEASE_ENABLED` is explicitly enabled. The workflow still needs
+independent checks of CI, review status, and upgrade safety before publication.
+It creates personal macOS and Windows artifacts without Developer ID or Windows
 signing, and runs both jobs on relevant pull requests. macOS auto-update and
 installation of the personal build are not yet verified.
 
