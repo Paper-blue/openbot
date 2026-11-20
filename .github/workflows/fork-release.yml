@@ -72,6 +72,8 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Prepare the runtime resources
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           bun run voice:prepare-runtime
@@ -112,6 +114,8 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Prepare the runtime resources
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           bun run voice:prepare-runtime
@@ -159,6 +163,8 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Build installer
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bun run dist:win
       - name: Verify package and update metadata
         shell: pwsh
