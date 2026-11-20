@@ -8,7 +8,6 @@ const REDACTED = "[redacted]";
 const ASSETS_PER_PAGE = 100;
 const MAX_ASSET_PAGES = 10;
 const REQUIRED_MANIFESTS = ["latest-linux.yml", "latest-mac.yml", "latest.yml"];
-const REQUIRED_EXTENSIONS = [".AppImage", ".exe", ".zip"];
 const API_VERSION = "2022-11-28";
 
 class ReleaseFailure extends Error {}
@@ -147,11 +146,19 @@ async function fileDigest(path: string): Promise<string> {
 }
 
 function requiredAssetProblems(names: readonly string[]): string[] {
-  const missingManifests = REQUIRED_MANIFESTS.filter((manifest) => !names.includes(manifest));
-  const missingArtifacts = REQUIRED_EXTENSIONS.filter(
-    (extension) => !names.some((name) => name.endsWith(extension)),
-  ).map((extension) => `no ${extension} artifact`);
-  return [...missingManifests, ...missingArtifacts];
+  if (!/^v\d+\.\d+\.\d+$/.test(TAG)) return ["invalid release tag"];
+  const version = TAG.slice(1);
+  const files = [
+    `OpenBot-${version}-x86_64.AppImage`,
+    `OpenBot-${version}-arm64.zip`,
+    `OpenBot-${version}-arm64.dmg`,
+    `OpenBot-${version}-x64.exe`,
+  ];
+  const expected = [...REQUIRED_MANIFESTS, ...files, ...files.slice(1).map((file) => `${file}.blockmap`)];
+  return [
+    ...expected.filter((name) => !names.includes(name)).map((name) => `missing ${name}`),
+    ...names.filter((name) => !expected.includes(name)).map((name) => `unexpected ${name}`),
+  ];
 }
 
 async function localAssets(): Promise<LocalAsset[]> {
@@ -176,11 +183,16 @@ function difference(asset: LocalAsset, remote: ReleaseAsset): string {
 
 function assetProblems(local: readonly LocalAsset[], remote: readonly ReleaseAsset[]): string[] {
   const byName = new Map(remote.map((asset) => [asset.name, asset]));
-  return local.flatMap((asset) => {
-    const match = byName.get(asset.name);
-    if (match === undefined) return [`${asset.name} is missing`];
-    return match.digest === asset.digest ? [] : [difference(asset, match)];
-  });
+  return [
+    ...local.flatMap((asset) => {
+      const match = byName.get(asset.name);
+      if (match === undefined) return [`${asset.name} is missing`];
+      return match.digest === asset.digest ? [] : [difference(asset, match)];
+    }),
+    ...remote
+      .filter((asset) => !local.some((candidate) => candidate.name === asset.name))
+      .map((asset) => `${asset.name} is unexpected`),
+  ];
 }
 
 async function createDraft(): Promise<ReleaseState> {
@@ -195,7 +207,15 @@ async function createDraft(): Promise<ReleaseState> {
   return releaseStateOf(response);
 }
 
+async function requireDraft(releaseId: number): Promise<void> {
+  const current = await findRelease();
+  if (current === null || current.id !== releaseId || !current.draft) {
+    throw new ReleaseFailure(`The draft release for ${TAG} changed; no further changes will be made.`);
+  }
+}
+
 async function uploadAsset(releaseId: number, asset: LocalAsset): Promise<void> {
+  await requireDraft(releaseId);
   const response = await send(
     "POST",
     new URL(`/repos/${REPOSITORY}/releases/${releaseId}/assets?name=${encodeURIComponent(asset.name)}`, UPLOADS),
@@ -221,7 +241,9 @@ async function uploadMissing(releaseId: number, local: readonly LocalAsset[]): P
   }
   const extra = remote.filter((asset) => !local.some((candidate) => candidate.name === asset.name));
   if (extra.length > 0) {
-    log(`The draft release for ${TAG} also holds ${extra.map((asset) => asset.name)}; this run leaves them.`);
+    throw new ReleaseFailure(
+      `The draft release for ${TAG} has unexpected assets, so this run uploaded nothing: ${extra.map((asset) => asset.name)}.`,
+    );
   }
   for (const asset of missing) await uploadAsset(releaseId, asset);
   if (missing.length === 0) log(`The draft release for ${TAG} already holds all ${local.length} assets.`);
@@ -238,6 +260,7 @@ async function verifyAssets(releaseId: number, local: readonly LocalAsset[]): Pr
 }
 
 async function publish(releaseId: number): Promise<void> {
+  await requireDraft(releaseId);
   const response = await send(
     "PATCH",
     new URL(`/repos/${REPOSITORY}/releases/${releaseId}`, API),

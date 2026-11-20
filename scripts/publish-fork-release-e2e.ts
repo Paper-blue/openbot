@@ -16,16 +16,20 @@ const TOKEN = "ghs_e2e_fork_release_token";
 const RUN_TIMEOUT_MS = 60_000;
 const RELEASE_ID = 501;
 const OTHER_DIGEST = `sha256:${"0".repeat(64)}`;
-const APPIMAGE = "OpenBot-1.2.3-x64.AppImage";
+const APPIMAGE = "OpenBot-1.2.3-x86_64.AppImage";
 const MANIFEST = "latest.yml";
 
 const ARTIFACTS = {
-  "latest-linux.yml": "version: 1.2.3\npath: OpenBot-1.2.3-x64.AppImage\n",
+  "latest-linux.yml": "version: 1.2.3\npath: OpenBot-1.2.3-x86_64.AppImage\n",
   "latest-mac.yml": "version: 1.2.3\npath: OpenBot-1.2.3-arm64.zip\n",
   "latest.yml": "version: 1.2.3\npath: OpenBot-1.2.3-x64.exe\n",
   "OpenBot-1.2.3-arm64.zip": "mac zip bytes",
-  "OpenBot-1.2.3-x64.AppImage": "linux AppImage bytes",
+  "OpenBot-1.2.3-arm64.zip.blockmap": "zip blockmap",
+  "OpenBot-1.2.3-arm64.dmg": "mac dmg bytes",
+  "OpenBot-1.2.3-arm64.dmg.blockmap": "dmg blockmap",
+  "OpenBot-1.2.3-x86_64.AppImage": "linux AppImage bytes",
   "OpenBot-1.2.3-x64.exe": "windows installer bytes",
+  "OpenBot-1.2.3-x64.exe.blockmap": "exe blockmap",
 };
 
 const FILES = Object.entries(ARTIFACTS);
@@ -58,6 +62,8 @@ interface StubState {
   release: StubRelease | null;
   lookupStatus: number | null;
   echoedAuthorization: string;
+  injectExtraOnVerification: boolean;
+  publishBeforeUpload: boolean;
   readonly requests: StubRequest[];
   readonly uploads: Map<string, number>;
 }
@@ -126,6 +132,12 @@ function routeRelease(response: ServerResponse, state: StubState, authorization:
     respond(response, 404, { message: "Not Found" });
     return;
   }
+  if (
+    state.publishBeforeUpload &&
+    state.requests.filter((request) => request.method === "GET" && RELEASE_TAG.test(request.path)).length > 1
+  ) {
+    state.release.draft = false;
+  }
   respond(response, 200, { id: state.release.id, tag_name: TAG, name: TAG, draft: state.release.draft });
 }
 
@@ -157,6 +169,10 @@ async function route(
     return;
   }
   if (method === "GET" && RELEASE_ASSETS.test(url.pathname)) {
+    if (state.injectExtraOnVerification && state.uploads.size === FILES.length && state.release !== null) {
+      state.release.assets.push({ name: "unexpected.exe", digest: OTHER_DIGEST });
+      state.injectExtraOnVerification = false;
+    }
     respond(response, 200, state.release?.assets ?? []);
     return;
   }
@@ -186,6 +202,8 @@ async function startStub(setup: (state: StubState) => void): Promise<Stub> {
     release: null,
     lookupStatus: null,
     echoedAuthorization: "",
+    injectExtraOnVerification: false,
+    publishBeforeUpload: false,
     requests: [],
     uploads: new Map(),
   };
@@ -369,6 +387,63 @@ check(
   "a different asset of the same name names the asset",
   conflicting.run.stderr.includes(MANIFEST) && conflicting.run.stderr.includes("uploaded nothing"),
   "The message does not name the asset.",
+);
+
+const extraAsset = await publishCase((state) => {
+  state.release = { id: RELEASE_ID, draft: true, assets: [{ name: "unexpected.exe", digest: OTHER_DIGEST }] };
+});
+recordOutcome("stops on an unexpected draft asset", extraAsset);
+check(
+  "an unexpected asset leaves the release untouched and unpublished",
+  extraAsset.run.code === 1 && extraAsset.state.release?.draft === true && mutations(extraAsset.state).length === 0,
+  JSON.stringify(mutations(extraAsset.state)),
+);
+
+const changedDraft = await publishCase((state) => {
+  state.release = { id: RELEASE_ID, draft: true, assets: [] };
+  state.publishBeforeUpload = true;
+});
+recordOutcome("stops if the draft is published before upload", changedDraft);
+check(
+  "a changed draft prevents uploads",
+  changedDraft.run.code === 1 && mutations(changedDraft.state).length === 0,
+  JSON.stringify(mutations(changedDraft.state)),
+);
+
+const lateExtra = await publishCase((state) => {
+  state.injectExtraOnVerification = true;
+});
+recordOutcome("stops on an extra asset at final verification", lateExtra);
+check(
+  "an asset added after upload prevents publication",
+  lateExtra.run.code === 1 &&
+    lateExtra.state.release?.draft === true &&
+    !mutations(lateExtra.state).some((item) => item.startsWith("PATCH ")),
+  JSON.stringify(mutations(lateExtra.state)),
+);
+
+const publishedExtra = await publishCase((state) => {
+  state.release = {
+    id: RELEASE_ID,
+    draft: false,
+    assets: [...DIGESTS]
+      .map(([name, digest]) => ({ name, digest }))
+      .concat([{ name: "unexpected.exe", digest: OTHER_DIGEST }]),
+  };
+});
+recordOutcome("refuses an extra asset in a published release", publishedExtra);
+check(
+  "a published release with an extra asset is rejected without mutation",
+  publishedExtra.run.code === 1 && mutations(publishedExtra.state).length === 0,
+  JSON.stringify(mutations(publishedExtra.state)),
+);
+
+const localExtra = await publishCase(() => {}, [...FILES, ["unexpected.blockmap", "other bytes"]]);
+recordOutcome("rejects an extra local artifact", localExtra);
+check(
+  "an extra local artifact makes no request",
+  localExtra.run.code === 1 && localExtra.state.requests.length === 0,
+  JSON.stringify(localExtra.state.requests),
 );
 
 const published = await publishCase((state) => {

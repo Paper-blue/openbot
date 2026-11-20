@@ -101,9 +101,13 @@ The publish job runs `scripts/publish-fork-release.ts`, which continues an exist
 draft instead of failing. It hashes every artifact before any request, skips a
 same-named asset only when the server digest matches, uploads only the assets the
 draft lacks, re-checks the whole set against the server digests, and only then
-publishes. A digest mismatch, a missing digest, or a non-404 lookup error fails
-the run without changing the release; nothing is overwritten or deleted. A release
-that is already published is compared and never edited. `scripts/publish-fork-release-e2e.ts`
+publishes. The local filenames must match the tag and expected platforms exactly;
+unexpected local or remote assets, missing digests, and mismatches stop publication.
+If a problem is detected after uploads, the draft can retain those uploaded assets.
+Nothing is overwritten or deleted, and an already-published release is never edited.
+The job rechecks draft state before mutations, but these checks are not atomic:
+automatic publication must remain disabled until a single release writer is enforced.
+`scripts/publish-fork-release-e2e.ts`
 replays those cases against a loopback stub in CI, so the recovery path is checked
 without touching a real release.
 
