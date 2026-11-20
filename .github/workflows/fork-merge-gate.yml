@@ -1,14 +1,5 @@
 name: Merge gate
 
-# The fork merges on its own only when two independent things agree: the checks
-# in `ci.yml` pass, and Codex finished reviewing the exact commit being merged
-# with no unresolved finding. This workflow supplies the second half as a status
-# check and switches on auto-merge; branch protection supplies the first.
-#
-# The review state comes from the summary comment the Codex connector keeps
-# updated on the pull request. Its marker names the reviewed commit, so a review
-# of an older push never unlocks a newer one.
-
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize, labeled]
@@ -36,14 +27,16 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEWER: chatgpt-codex-connector[bot]
           DEADLINE_MINUTES: "35"
         run: |
           set -euo pipefail
           deadline=$(( $(date +%s) + DEADLINE_MINUTES * 60 ))
           while :; do
             state="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-              --jq '[.[] | select(.body | contains("codex-review-state:v1")) | .body]
-                    | last // ""' \
+              --jq "[.[] | select(.user.login == \"$REVIEWER\")
+                | select(.body | contains(\"codex-review-state:v1\"))
+                | .body] | last // \"\"" \
               | sed -n 's/.*codex-review-state:v1 \(.*\) -->.*/\1/p')"
             if [ -n "$state" ]; then
               reviewed="$(jq -r '.code_review.commit_sha // ""' <<<"$state")"
@@ -84,9 +77,6 @@ jobs:
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
           set -euo pipefail
-          # Only work this repository produced on its own merges unattended:
-          # the sync workflow labels its pull requests, and Codex opens them as
-          # a bot. A pull request opened by a person waits for a person.
           case ",$LABELS," in *,automerge,*) ;; *)
             case "$AUTHOR" in *"[bot]") ;; *)
               echo "::notice::$AUTHOR has to merge this one"

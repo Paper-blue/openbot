@@ -1,16 +1,5 @@
 name: Fork release
 
-# Publishes the artifacts this fork's own machines update from.
-#
-# The hosted-server updater reads `latest-linux.yml` from the newest release and
-# downloads the AppImage it names, and the desktop app reads `latest-mac.yml`.
-# Both resolve against this repository once `electron-builder.yml` names it, so
-# a tag here is what makes an update available to VM103 and to the Mac.
-#
-# A Mac build needs the Developer ID certificate and password as repository
-# secrets. Without them the macOS job is skipped and only Linux artifacts are
-# published, so the pipeline still runs.
-
 on:
   push:
     tags:
@@ -61,7 +50,7 @@ jobs:
     needs: version
     if: github.repository == 'Paper-blue/openbot'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: write
     steps:
@@ -74,6 +63,13 @@ jobs:
           no-cache: true
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Prepare the runtime resources
+        run: |
+          set -euo pipefail
+          bun run voice:prepare-runtime
+          bun scripts/prepare-remote-desktop-runtime.ts linux x64
+          bun run verify:remote-desktop-runtime --linux
+          bun scripts/install-cua-driver.ts linux x64
       - name: Build and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,6 +81,7 @@ jobs:
             --config.publish.provider=github \
             --config.publish.owner=Paper-blue \
             --config.publish.repo=openbot \
+            --config.publish.releaseType=release \
             --publish "$PUBLISH"
       - name: Keep the artifacts
         if: always()
@@ -95,14 +92,13 @@ jobs:
             dist/*.AppImage
             dist/latest-linux.yml
           if-no-files-found: warn
-          include-hidden-files: false
 
   mac:
     name: macOS build
     needs: version
     if: github.repository == 'Paper-blue/openbot' && vars.MAC_RELEASE_ENABLED == 'true'
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: write
     steps:
@@ -133,6 +129,13 @@ jobs:
           security list-keychains -d user -s "$keychain" \
             "$(security default-keychain -d user | tr -d ' "')"
           rm -f "$RUNNER_TEMP/cert.p12"
+      - name: Prepare the runtime resources
+        run: |
+          set -euo pipefail
+          bun run voice:prepare-runtime
+          bun run prepare:remote-desktop-runtime
+          bun run verify:remote-desktop-runtime
+          bun run prepare:cua-driver
       - name: Build and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -148,6 +151,7 @@ jobs:
             --config.publish.provider=github \
             --config.publish.owner=Paper-blue \
             --config.publish.repo=openbot \
+            --config.publish.releaseType=release \
             --publish "$PUBLISH"
       - name: Keep the artifacts
         if: always()
@@ -159,4 +163,3 @@ jobs:
             dist/*.zip
             dist/latest-mac.yml
           if-no-files-found: warn
-          include-hidden-files: false

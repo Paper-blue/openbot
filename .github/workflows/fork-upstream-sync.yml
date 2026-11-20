@@ -1,10 +1,5 @@
 name: Upstream sync
 
-# Keeps the fork's maintenance branch current with upstream without anyone
-# watching it. The merge is a plain merge commit: conflicts stop the run and
-# open an issue instead of guessing at a resolution, and the pull request it
-# opens still has to pass the same checks as any other change.
-
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -50,10 +45,8 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "current=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::maintenance already contains upstream $sha"
           else
             echo "current=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::upstream $sha is ahead of maintenance"
           fi
 
       - name: Merge upstream
@@ -82,6 +75,8 @@ jobs:
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
         run: |
           set -euo pipefail
+          git config --local "http.https://github.com/.extraheader" \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           git push --force-with-lease origin "$BRANCH"
           gh label create automerge --repo "$FORK" \
             --description "Merge once the required checks pass" \
