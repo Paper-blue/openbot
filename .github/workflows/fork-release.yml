@@ -159,10 +159,60 @@ jobs:
             dist/latest-mac.yml
           if-no-files-found: error
 
+  windows:
+    name: Windows x64 installer
+    needs: version
+    if: github.repository == 'Paper-blue/openbot'
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+      - name: Reject unsigned production releases
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          Write-Error "Windows signing is not configured for this fork."
+          exit 1
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build installer
+        run: bun run dist:win
+      - name: Verify package and update metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          bun run verify:package:win --require-update-metadata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installers = @(Get-ChildItem -Path dist -File -Filter *.exe)
+          if ($installers.Count -ne 1 -or -not (Test-Path dist/latest.yml)) {
+            throw "Expected one Windows installer and its update manifest."
+          }
+          bun run verify:update-artifacts windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Keep the artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-build
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+          if-no-files-found: error
+
   publish:
     name: Publish complete release
-    needs: [version, linux, mac]
-    if: github.event_name == 'push' && needs.linux.result == 'success' && needs.mac.result == 'success'
+    needs: [version, linux, mac, windows]
+    if: github.event_name == 'push' && needs.linux.result == 'success' && needs.mac.result == 'success' && needs.windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -175,6 +225,10 @@ jobs:
         with:
           name: linux-appimage
           path: artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-build
+          path: artifacts
       - name: Publish verified artifact set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -184,6 +238,8 @@ jobs:
           set -euo pipefail
           test -s artifacts/latest-linux.yml
           test -s artifacts/latest-mac.yml
+          test -s artifacts/latest.yml
+          compgen -G 'artifacts/*.exe' >/dev/null
           compgen -G 'artifacts/*.AppImage' >/dev/null
           compgen -G 'artifacts/*.zip' >/dev/null
           gh release create "$TAG" --repo "$REPO" --draft --verify-tag --title "$TAG"
