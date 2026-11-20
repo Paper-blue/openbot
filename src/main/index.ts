@@ -153,6 +153,7 @@ import { ensureMacApplicationPresence, secondLaunchResponse } from "./main-windo
 import { MessageLinkRelay, openHttpLink } from "./message-link-relay";
 import { recoverFromNewerDatabase } from "./newer-database-recovery";
 import { removeOrcaPaneEnvironment } from "./orca-pane-environment";
+import { disabledChromiumFeatures } from "./private-network-chromium-features";
 import { flushMainLog, startMainLog } from "./provider-log";
 import { notifyRemoteControlStarted } from "./remote-control-question";
 import { watchRemoteHostDirectory } from "./remote-server-host-directory";
@@ -287,7 +288,6 @@ const developmentRemoteDebuggingPort = !app.isPackaged
   ? readDevelopmentRemoteDebuggingPort(process.env.OPENBOT_DEV_REMOTE_DEBUGGING_PORT)
   : null;
 const analyticsCaptureUrl = !app.isPackaged ? readAnalyticsCaptureUrl(process.env.OPENBOT_ANALYTICS_CAPTURE_URL) : null;
-app.commandLine.appendSwitch("disable-features", "FedCm");
 if (developmentRemoteDebuggingPort) {
   app.commandLine.appendSwitch("remote-debugging-port", developmentRemoteDebuggingPort);
   app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
@@ -309,6 +309,9 @@ if (commandLineUserDataDirectory) {
   );
 }
 app.setName("OpenBot");
+// The private network route needs this computer's own addresses as candidates, so this waits for the
+// user data folder that holds the route preference.
+app.commandLine.appendSwitch("disable-features", disabledChromiumFeatures(app.getPath("userData")).join(","));
 const systemTimezone =
   serverMode || hostedServer || localServerChild
     ? applyServerTimezone(join(app.getPath("userData"), SERVER_TIMEZONE_PREFERENCE_FILE), process.env)

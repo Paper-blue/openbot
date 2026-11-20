@@ -117,7 +117,10 @@ export interface AppLoadingScreenProps {
 export function AppLoadingScreen(props: AppLoadingScreenProps) {
   const { t } = useText();
   const reducedMotion = prefersReducedMotion() || documentStillFaces();
-  const pileScene = untrack(() => props.scene !== "thinking");
+  // A screen that names no scene shows the calm one: the lilac plush and the status lines. The pile
+  // fills the window with dozens of plushes, which is a problem for a user with trypophobia, and
+  // nothing in the app can turn it off. A caller that wants the pile asks for it by name.
+  const pileScene = untrack(() => props.scene === "pile");
   const seat = pileScene
     ? takeSeat(
         untrack(() => props.seed),

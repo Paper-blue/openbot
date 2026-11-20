@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!--
+      The entitlements for our own Developer ID signing.
+
+      The upstream file (entitlements.mac.plist) carries two restricted entitlements that belong to
+      the upstream team: `com.apple.developer.team-identifier` = ZTRDTUL87R and
+      `com.apple.developer.associated-domains` = applinks:openbot.run. Signing with another team's
+      certificate and keeping them makes the kernel refuse to start the app ("Code has restricted
+      entitlements"). The associated domain would not work either way: the apple-app-site-association
+      file of openbot.run names the upstream team, so our build could not claim that link.
+
+      What stays is everything the app needs to run: the hardened-runtime JIT exceptions, audio
+      input, and Apple events for automation. The `openbot://` URL scheme comes from Info.plist and
+      keeps working.
+    -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+  </dict>
+</plist>
