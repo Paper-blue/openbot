@@ -126,7 +126,7 @@ Key ID 就是 `.p8` 文件名里的那串；Issuer ID 在 App Store Connect › 
 ## 本 fork 自己的更新来源
 
 - `electron-builder.yml` 的 `publish` 指向 `Paper-blue/openbot`，所以这里构建出的桌面应用读的是本仓库的 release，不是上游的。
-- `scripts/hosting/openbot-hosted-update` 的 `RELEASES` 也指向本仓库，VM103 上的托管服务因此从这个 release 升级。
+- `scripts/hosting/openbot-hosted-update` 的 `RELEASES` 也指向本仓库；尚需验证托管服务更新。
 - 该更新脚本只接受 `X.Y.Z` 形式、不带预发布后缀的版本号，并要求产物名为 `OpenBot-$version-$architecture.AppImage`，版本和产物名对不上会直接拒绝。
 
 ## 自动化
@@ -144,4 +144,4 @@ Key ID 就是 `.p8` 文件名里的那串；Issuer ID 在 App Store Connect › 
 
 ## 私有路由这一处改动的验证方式
 
-`private-network-chromium-features.ts` 只按路由偏好决定 Chromium 开关。仓库规则是不加单测，只写 E2E，而这里没有现成的、能在 CI 里观测 Chromium 开关的 E2E；用 Playwright 起整个应用会在启动阶段超时。所以这项改动不挂自动测试，依据是真实重连：VM103 设为 `private` 路由后客户端 3–4 秒完成能力协商并请求成功（见 `reports/openbot-mesh-route-vm103/README.md`）。
+`private-network-chromium-features.ts` 只按路由偏好决定 Chromium 开关。仓库规则是不加单测，只写 E2E；之前的真实远程连接验证仅覆盖已有环境，尚需在后续发布版本中复验。
