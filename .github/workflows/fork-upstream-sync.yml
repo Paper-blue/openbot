@@ -28,6 +28,7 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+      actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,7 +93,12 @@ jobs:
               --state open --json number --jq '.[0].number')"
           fi
           echo "number=$number" >> "$GITHUB_OUTPUT"
-          gh pr merge "$number" --repo "$FORK" --squash --auto \
+          gh workflow run ci.yml --repo "$FORK" --ref "$BRANCH" \
+            || echo "::warning::could not start the checks"
+          gh workflow run fork-merge-gate.yml --repo "$FORK" --ref "$BRANCH" \
+            -f "pr=$number" \
+            || echo "::warning::could not start the merge gate"
+          gh pr merge "$number" --repo "$FORK" --merge --auto \
             || echo "::warning::auto-merge refused; the checks still gate the merge"
 
       - name: Report a conflict
