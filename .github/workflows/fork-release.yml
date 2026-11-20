@@ -141,13 +141,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_NAME: ${{ secrets.MAC_SIGNING_IDENTITY }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.MAC_NOTARIZE_APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.MAC_NOTARIZE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.MAC_NOTARIZE_TEAM_ID }}
           PUBLISH: ${{ (github.event_name == 'push') && 'always' || 'never' }}
         run: |
           set -euo pipefail
+          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            echo "::error::macOS releases need notarization credentials"
+            exit 1
+          fi
           bun run build
           bunx electron-builder --mac --arm64 \
             --config.mac.identity="$CSC_NAME" \
-            --config.mac.notarize=false \
+            --config.mac.notarize=true \
             --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
             --config.publish.provider=github \
             --config.publish.owner=Paper-blue \

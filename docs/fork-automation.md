@@ -58,10 +58,13 @@ expects the artifact named `OpenBot-$version-$architecture.AppImage`. A
 prerelease tag builds but cannot be installed by the hosted server.
 
 The macOS job is skipped unless the repository has `MAC_CERTIFICATE_P12`,
-`MAC_CERTIFICATE_PASSWORD` and `MAC_SIGNING_IDENTITY` and the variable
+`MAC_CERTIFICATE_PASSWORD`, `MAC_SIGNING_IDENTITY`, `MAC_NOTARIZE_APPLE_ID`,
+`MAC_NOTARIZE_PASSWORD` and `MAC_NOTARIZE_TEAM_ID`, and the variable
 `MAC_RELEASE_ENABLED` is `true`. It signs with `build/entitlements.mac.paperblue.plist`
 because the default entitlements request an associated-domain entitlement that
-belongs to the upstream team, not this one.
+belongs to the upstream team, not this one. It notarizes, and fails instead of
+publishing when the notarization credentials are missing: a downloaded DMG that
+Gatekeeper blocks is worse than no release at all.
 
 ## Where the explanations live
 
