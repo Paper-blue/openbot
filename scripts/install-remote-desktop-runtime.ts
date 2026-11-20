@@ -62,7 +62,11 @@ export async function installRemoteDesktopRuntime(
       },
     },
   );
-  if (!releaseResponse.ok) throw new Error(`Runtime release lookup failed with HTTP ${releaseResponse.status}.`);
+  if (!releaseResponse.ok) {
+    const remaining = releaseResponse.headers.get("x-ratelimit-remaining");
+    const rateLimit = remaining === null ? "" : ` (GitHub rate limit remaining: ${remaining})`;
+    throw new Error(`Runtime release lookup failed with HTTP ${releaseResponse.status}${rateLimit}.`);
+  }
   const githubRelease = githubReleaseSchema.parse(await releaseResponse.json());
   validateGitHubRelease(githubRelease, release.tag);
 
