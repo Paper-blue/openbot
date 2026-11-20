@@ -96,8 +96,21 @@ cdhash_of() {
   codesign --display --verbose=4 "$1" 2>&1 | sed -n 's/^CandidateCDHash sha256=//p' | head -1
 }
 
-require_github_hosted_macos
+security() {
+  python3 - "$@" <<'PY'
+import subprocess
+import sys
 
+try:
+    result = subprocess.run(["/usr/bin/security", *sys.argv[1:]], timeout=45, check=False)
+    sys.exit(result.returncode)
+except subprocess.TimeoutExpired:
+    print("security command timed out", file=sys.stderr)
+    sys.exit(124)
+PY
+}
+
+require_github_hosted_macos
 work_dir="$(mktemp -d "$RUNNER_TEMP/openbot-signature-probe.XXXXXX")"
 keychain_path="$work_dir/probe.keychain-db"
 keychain_password="$(openssl rand -hex 32)"
@@ -144,13 +157,17 @@ make_openssl_config "$openssl_config"
 /usr/bin/openssl pkcs12 -export -inkey "$key_path" -in "$certificate_path" \
   -out "$identity_path" -name "$identity_common_name" -passout "pass:$p12_password"
 
+printf 'Creating and unlocking the temporary keychain\n'
 security create-keychain -p "$keychain_password" "$keychain_path"
 security set-keychain-settings -lut 3600 "$keychain_path"
 security unlock-keychain -p "$keychain_password" "$keychain_path"
+printf 'Importing the temporary signing identity\n'
 security import "$identity_path" -k "$keychain_path" -P "$p12_password" -T /usr/bin/codesign >/dev/null
+printf 'Setting the key partition list\n'
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path" >/dev/null
 security list-keychains -d user -s "$keychain_path" ${previous_keychains[@]+"${previous_keychains[@]}"} >/dev/null
 
+printf 'Adding user-domain signing trust\n'
 trust_install_status=0
 trust_install_output="$(security add-trusted-cert -r trustRoot -p codeSign -k "$keychain_path" "$certificate_path" 2>&1)" || trust_install_status=$?
 

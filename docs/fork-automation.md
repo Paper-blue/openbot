@@ -50,6 +50,23 @@ exception, but dispatching a workflow from the unreviewed sync branch can run
 its workflow definition with write permissions. A trusted controller is needed
 before automatic checks and merging can be enabled safely.
 
+## Scheduled issue processing
+
+The fork's GitHub Issues are enabled. A recurring worker could inspect a dedicated
+ready label, skip issues already associated with an open pull request, process
+one issue at a time in an isolated checkout, and request independent review. A
+separate daily run could inspect upstream changes. These are proposed operating
+rules; no scheduled worker has been configured or tested.
+
+The existing Codex Cloud environment can run a manually submitted task, but the
+available evidence does not establish a subscription-backed cloud scheduler that
+can submit those tasks while the computer is off. OpenAI's documentation states
+that personal project-scoped desktop scheduled tasks require the computer and
+app to run. ChatGPT Work can schedule cloud tasks, but the documented ChatGPT
+GitHub connector is read-only; that alone does not establish a way to launch a
+Codex Cloud coding task. Do not treat an issue scan as completed development or
+enable extra-billed API usage to fill this gap.
+
 ## Releases
 
 `fork-release.yml` builds on a `v*.*.*` tag. It checks the tag against
