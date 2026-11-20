@@ -210,6 +210,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+          no-cache: true
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: macos-build
@@ -227,18 +234,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          test -s artifacts/latest-linux.yml
-          test -s artifacts/latest-mac.yml
-          test -s artifacts/latest.yml
-          compgen -G 'artifacts/*.exe' >/dev/null
-          compgen -G 'artifacts/*.AppImage' >/dev/null
-          compgen -G 'artifacts/*.zip' >/dev/null
-          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --draft --verify-tag --title "$TAG"
-          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" != "true" ]; then
-            echo "::error::release $TAG is already published"
-            exit 1
-          fi
-          gh release upload "$TAG" artifacts/* --repo "$REPO"
-          gh release edit "$TAG" --repo "$REPO" --draft=false
+          ARTIFACTS_DIR: artifacts
+        run: bun scripts/publish-fork-release.ts

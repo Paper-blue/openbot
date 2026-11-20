@@ -80,6 +80,16 @@ so artifact generation alone does not verify that updates can be installed.
 Any eventual release requires successful builds on all three platforms, and the
 release automation and trust boundaries still need end-to-end verification.
 
+The publish job runs `scripts/publish-fork-release.ts`, which continues an existing
+draft instead of failing. It hashes every artifact before any request, skips a
+same-named asset only when the server digest matches, uploads only the assets the
+draft lacks, re-checks the whole set against the server digests, and only then
+publishes. A digest mismatch, a missing digest, or a non-404 lookup error fails
+the run without changing the release; nothing is overwritten or deleted. A release
+that is already published is compared and never edited. `scripts/publish-fork-release-e2e.ts`
+replays those cases against a loopback stub in CI, so the recovery path is checked
+without touching a real release.
+
 Only macOS arm64, Windows x64, and Linux x64 artifacts are produced. The
 updater's Linux arm64 feed and Intel macOS feed therefore stay unpublished, and
 a machine on either of those platforms has no compatible fork update. That is a
