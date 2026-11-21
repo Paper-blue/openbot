@@ -190,6 +190,8 @@ def protected(path):
 
 def pr_files(api, number):
     files = api.pages(f"pulls/{number}/files")
+    if len(files) > 500:
+        raise Stop("Large pull requests require manual review")
     for item in files:
         if protected(item["filename"]) or protected(
             item.get("previous_filename", item["filename"])
@@ -359,7 +361,33 @@ def select(api, event, directory):
             return
     prs = api.pages(f"pulls?state=open&base={BASE}")
     for pr in prs:
-        if sync_pr(api, pr) and not review_status(api, pr["head"]["sha"]):
+        if (
+            sync_pr(api, pr)
+            and "codex-blocked" not in labels(pr)
+            and not review_status(api, pr["head"]["sha"])
+        ):
+            marker = f"<!-- codex-sync-review:{sha(pr['head']['sha'])}:"
+            attempts = api.pages(f"issues/{pr['number']}/comments")
+            count = sum(
+                item["user"]["login"] == os.environ["MAINTENANCE_BOT_LOGIN"]
+                and item["body"].startswith(marker)
+                for item in attempts
+            )
+            if count >= 2:
+                api.request(
+                    f"issues/{pr['number']}/labels",
+                    "POST",
+                    {"labels": ["codex-blocked"]},
+                )
+                api.comment(
+                    pr["number"],
+                    "Two sync review attempts stopped without a result. Maintainer action is required.",
+                )
+                continue
+            api.comment(
+                pr["number"],
+                f"{marker}{int(os.environ['GITHUB_RUN_ID'])} -->\nIndependent sync review started.",
+            )
             task = {
                 "issue": pr["number"],
                 "pr": pr["number"],

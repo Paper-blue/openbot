@@ -129,6 +129,8 @@ branch updates. Merge conflicts stop the job and require investigation.
 The App-created PR starts CI. The sync job then dispatches the trusted Issue
 controller on `main` for an independent API review. Upstream changes to workflow,
 update, migration, signing, or other protected paths remain manual merge tasks.
+A sync head gets at most two review attempts when a runner stops without a
+result; further attempts require maintainer investigation.
 A successful textual merge is not evidence of runtime compatibility.
 
 ## Personal builds and publication
@@ -160,8 +162,9 @@ step. Developer ID, notarization, TCC permission continuity, Windows installatio
 Linux service upgrades, database-aware rollback, and automatic device updates are
 separate acceptance tasks. No existing installation is changed by this pipeline.
 
-The older stable-tag publisher remains gated by `PERSONAL_RELEASE_ENABLED`.
-Leave that flag off during this rollout. A stable version bump or tag still
+The old tag-triggered publisher has been removed from the build workflow.
+Only the trusted snapshot workflow publishes these manual-install packages.
+Stable updater releases remain separate work. A stable version bump or tag still
 requires the repository's release-upgrade audit.
 
 ## Validation and current limits

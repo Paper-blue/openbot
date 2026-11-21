@@ -3,10 +3,6 @@ name: Maintenance controller checks
 on:
   pull_request:
     branches: [main, maintenance]
-    paths:
-      - .github/automation/**
-      - .github/workflows/fork-*.yml
-      - scripts/fork-maintenance-e2e.py
   workflow_dispatch:
 
 permissions:

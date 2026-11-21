@@ -6,9 +6,6 @@ on:
       source_sha:
         required: true
         type: string
-  push:
-    tags:
-      - "v*.*.*"
   pull_request:
     branches: [maintenance]
     paths:
@@ -18,23 +15,18 @@ on:
       - scripts/verify-windows-package.ts
       - scripts/verify-update-artifacts.ts
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: Build and upload artifacts without publishing a release
-        type: boolean
-        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: fork-release-${{ github.event_name == 'push' && 'publish' || format('validate-{0}', github.ref) }}
+  group: fork-build-${{ github.ref }}-${{ inputs.source_sha || github.sha }}
   cancel-in-progress: false
   queue: max
 
 jobs:
   version:
-    name: Check the tag against package.json
+    name: Check the package version
     if: github.repository == 'Paper-blue/openbot'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -49,24 +41,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - id: version
-        env:
-          TAG_NAME: ${{ github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::Invalid package version'; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [ "$EVENT_NAME" = "push" ]; then
-            if [ "v$version" != "$TAG_NAME" ]; then
-              echo "::error::tag $TAG_NAME does not match version $version"
-              exit 1
-            fi
-            git fetch --no-tags origin "+refs/heads/maintenance:refs/remotes/origin/maintenance"
-            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/maintenance; then
-              echo "::error::release tag is not in maintenance history"
-              exit 1
-            fi
-          fi
 
   linux:
     name: Linux AppImage
@@ -116,7 +95,7 @@ jobs:
   mac:
     name: macOS build
     needs: version
-    if: github.repository == 'Paper-blue/openbot' && (github.event_name != 'push' || vars.PERSONAL_RELEASE_ENABLED == 'true')
+    if: github.repository == 'Paper-blue/openbot'
     runs-on: macos-15
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
@@ -169,7 +148,7 @@ jobs:
   windows:
     name: Windows x64 installer
     needs: version
-    if: github.repository == 'Paper-blue/openbot' && (github.event_name != 'push' || vars.PERSONAL_RELEASE_ENABLED == 'true')
+    if: github.repository == 'Paper-blue/openbot'
     runs-on: windows-2025
     timeout-minutes: 120
     permissions:
@@ -212,39 +191,3 @@ jobs:
             dist/*.blockmap
             dist/latest.yml
           if-no-files-found: error
-
-  publish:
-    name: Publish complete release
-    needs: [version, linux, mac, windows]
-    if: github.event_name == 'push' && vars.PERSONAL_RELEASE_ENABLED == 'true' && needs.linux.result == 'success' && needs.mac.result == 'success' && needs.windows.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.source_sha || github.sha }}
-          persist-credentials: false
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.4.2
-          no-cache: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: macos-build
-          path: artifacts
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: linux-appimage
-          path: artifacts
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: windows-build
-          path: artifacts
-      - name: Publish verified artifact set
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-          ARTIFACTS_DIR: artifacts
-        run: bun scripts/publish-fork-release.ts

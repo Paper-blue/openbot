@@ -20,11 +20,16 @@ def verify_source(api, source):
         f"actions/workflows/{workflow['id']}/runs?head_sha={source}&event=push&branch=maintenance",
         "workflow_runs",
     )
-    if not any(
-        run["head_sha"] == source
-        and run["head_branch"] == "maintenance"
-        and run["conclusion"] == "success"
-        for run in runs
+    latest = (
+        max(runs, key=lambda run: (run.get("id", 0), run.get("run_attempt", 0)))
+        if runs
+        else None
+    )
+    if (
+        not latest
+        or latest["head_sha"] != source
+        or latest["head_branch"] != "maintenance"
+        or latest["conclusion"] != "success"
     ):
         raise Stop("Release source has no successful maintenance push CI")
 
