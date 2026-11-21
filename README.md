@@ -41,6 +41,11 @@ visited pages use the network, and installed plugins may connect to their own se
 
 ## Install
 
+This personal fork currently builds macOS Apple silicon, Windows x64, and Linux
+x64 for its owner's devices. Its experimental update feed does not yet provide
+Intel macOS or Linux arm64 artifacts. The platform information and release links
+below describe upstream OpenBot, not verified releases from this fork.
+
 OpenBot supports macOS 13 or newer on Apple silicon or Intel, Windows 10 or newer on x64 systems, and x64
 or arm64 Linux as an AppImage.
 

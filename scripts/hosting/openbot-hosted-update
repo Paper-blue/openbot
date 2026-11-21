@@ -4,7 +4,8 @@ export LC_ALL=C DEBIAN_FRONTEND=noninteractive
 umask 022
 
 INSTALL=/opt/OpenBot
-RELEASES=https://github.com/nightly-labs/openbot/releases
+# This fork publishes its own releases, so the hosted server updates from them.
+RELEASES=https://github.com/Paper-blue/openbot/releases
 LOCK=/run/openbot-update.lock
 SCRATCH=/var/tmp
 RESTORE=/var/lib/ascii-lazy

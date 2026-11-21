@@ -13,7 +13,7 @@
 set -euo pipefail
 
 app="dist/mac-arm64/OpenBot.app"
-identity="${OPENBOT_SIGN_IDENTITY:-InfoAuto, LLC (2U8YUANQ8T)}"
+identity="${OPENBOT_SIGN_IDENTITY:?Set OPENBOT_SIGN_IDENTITY to the local signing identity}"
 profile="${OPENBOT_NOTARY_PROFILE:-openbot-notary}"
 zip="/tmp/openbot-notarize-$(date +%Y%m%d-%H%M%S).zip"
 

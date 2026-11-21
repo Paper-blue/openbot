@@ -122,7 +122,7 @@ export class HostReleaseService {
 }
 
 async function fetchLatestRelease(target: ReleaseTarget, request: typeof fetch, signal: AbortSignal): Promise<string> {
-  const response = await request(`https://github.com/nightly-labs/openbot/releases/latest/download/${target.feed}`, {
+  const response = await request(`https://github.com/Paper-blue/openbot/releases/latest/download/${target.feed}`, {
     signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
   });
   if (!response.ok || !response.body) {

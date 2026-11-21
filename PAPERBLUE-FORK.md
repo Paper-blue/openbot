@@ -50,7 +50,7 @@ bun run package
 
 ## 用我们自己的 Developer ID 签名与公证
 
-这台机器上有 `Developer ID Application: InfoAuto, LLC (2U8YUANQ8T)`（keychain 里 SHA-1 `C903755C…`），所以自建包可以签成正规的 Developer ID 版本，不必停在 ad-hoc。
+个人使用可以构建不依赖 Developer ID 的版本。若使用 Developer ID，签名身份应通过本地环境变量提供，不要写入仓库。
 
 **签不过去的原因**：上游 `build/entitlements.mac.plist` 带两条属于上游团队的限制性权限——`com.apple.developer.team-identifier` = `ZTRDTUL87R`、`com.apple.developer.associated-domains` = `applinks:openbot.run`。换我们的证书保留它们，内核会拒绝启动（"Code has restricted entitlements"）。所以另存了 `build/entitlements.mac.paperblue.plist`，只保留 JIT、未签名可执行内存、麦克风、Apple Events。代价是 `openbot.run` 的网页深链不会打开我们这个构建（域名那边的 apple-app-site-association 认的是上游团队），`openbot://` 自定义 scheme 不受影响。
 
@@ -59,20 +59,13 @@ bun run package
 ```sh
 bun run build
 bunx electron-builder --dir --mac \
-  --config.mac.identity="InfoAuto, LLC (2U8YUANQ8T)" \
+  --config.mac.identity="$OPENBOT_SIGN_IDENTITY" \
   --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
   --config.mac.entitlementsInherit=build/entitlements.mac.inherit.plist \
   --config.mac.notarize=false      # 公证见下
 ```
 
-签名完成后应该是：
-
-```
-Authority=Developer ID Application: InfoAuto, LLC (2U8YUANQ8T)
-TeamIdentifier=2U8YUANQ8T
-flags=0x10000(runtime)
-codesign --verify --deep --strict  → 0
-```
+构建后运行 `codesign --verify --deep --strict` 检查签名；签名有效不等于已经公证，也不证明自动更新可用。
 
 ### 公证
 
@@ -86,11 +79,11 @@ xcrun notarytool store-credentials openbot-notary \
 
 Key ID 就是 `.p8` 文件名里的那串；Issuer ID 在 App Store Connect › Users and Access › Integrations 里。也可以用环境变量代替 profile：`APPLE_API_KEY` / `APPLE_API_KEY_ID` / `APPLE_API_ISSUER`，或 `APPLE_KEYCHAIN_PROFILE` 指定 profile 名。
 
-**已知阻塞**：如果团队的 Apple Developer 法律协议没签或已过期，`notarytool` 会在校验凭据这一步直接回 `HTTP 403 A required agreement is missing or has expired`。这不是 key 的问题（换另一把 key 一样报），要账号持有人去 [App Store Connect › 商务](https://appstoreconnect.apple.com) › 协议、税务和银行业务 里把待签协议接受掉，然后再建 profile。
+**已知限制**：Apple 账户或团队的会员与协议状态可能导致 `notarytool` 返回 HTTP 403，需根据具体响应检查账户状态。
 
 ### 换成我们的签名之后
 
-- 屏幕录制、辅助功能这些 TCC 授权会因为我们换了签名身份而需要重新批准一次。
+- 屏幕录制、辅助功能等 TCC 授权在签名身份变化后可能需要重新批准，实际状态需要验证。
 - 应用内自动更新只会接受**我们团队**签的包，官方发布包不会自动覆盖上来。想更新就 `scripts/paperblue-sync.sh` 重新构建。
 
 ## 验收
@@ -122,3 +115,26 @@ Key ID 就是 `.p8` 文件名里的那串；Issuer ID 在 App Store Connect › 
 - 加载页：`2611-开源grok-bot/tools/openbot-calm-loading.py` 给已安装的 `app.asar` 打补丁（改完要更新 asar 头部与 Info.plist 两处哈希并重签名，脚本已处理）。
 - 私有路由：在主机 `/opt/OpenBot/hosted/openbot-hosted-server` 的启动行加 `--disable-features=WebRtcHideLocalIpsWithMdns`。
 - 这两处都会在 OpenBot 升级时被覆盖，需要重跑。
+
+## 本 fork 自己的更新来源
+
+- `electron-builder.yml` 的 `publish` 指向 `Paper-blue/openbot`，所以这里构建出的桌面应用读的是本仓库的 release，不是上游的。
+- `scripts/hosting/openbot-hosted-update` 的 `RELEASES` 也指向本仓库；尚需验证托管服务更新。
+- 该更新脚本只接受 `X.Y.Z` 形式、不带预发布后缀的版本号，并要求产物名为 `OpenBot-$version-$architecture.AppImage`，版本和产物名对不上会直接拒绝。
+
+## 自动化
+
+| workflow | 触发 | 做什么 |
+| --- | --- | --- |
+| `ci.yml` | push / PR 到 `main`、`maintenance` | 原有的检查；`deploy-production` 加了仓库判断，只在上游仓库跑 |
+| `fork-upstream-sync.yml` | 每天 03:17 与手动 | 把上游 `main` 合并到 `maintenance`，开 PR 并打 `automerge`；有冲突就不猜，开 issue |
+| `fork-merge-gate.yml` | PR | 等 Codex 审完当前提交且没有未解决意见，再开启自动合并 |
+| `fork-release.yml` | PR / 标签 / 手动 | 构建个人使用的 macOS、Windows 和 Linux 产物；发布默认关闭，等待验证 |
+
+自动审查、合并及更新流程尚未端到端验证。个人构建不需要 Developer ID 或 Apple 公证；macOS 原生自动更新需要签名，因此不能因为产物构建成功就声称自动更新可用。详细状态见 `docs/fork-automation.md`。
+
+`.yamllint.yml` 声明了本仓库真实的 YAML 约定：继承来的 workflow 行宽远超 yamllint 默认的 80 列，且 `on:` 是 GitHub Actions 的键而不是布尔值。
+
+## 私有路由这一处改动的验证方式
+
+`private-network-chromium-features.ts` 只按路由偏好决定 Chromium 开关。仓库规则是不加单测，只写 E2E；之前的真实远程连接验证仅覆盖已有环境，尚需在后续发布版本中复验。

@@ -1,0 +1,135 @@
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-maintenance-controller
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: nightly-labs/openbot
+  FORK: Paper-blue/openbot
+  BASE: maintenance
+  BRANCH: automation/upstream-sync
+
+jobs:
+  sync:
+    name: Merge upstream into maintenance
+    if: github.repository == 'Paper-blue/openbot' && github.ref == 'refs/heads/main' && vars.FORK_SYNC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: fork-control
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        id: app
+        with:
+          app-id: ${{ vars.MAINTENANCE_APP_ID }}
+          private-key: ${{ secrets.MAINTENANCE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: openbot
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: maintenance
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare with upstream
+        id: upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream main
+          sha="$(git rev-parse upstream/main)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate Git for the sync branch
+        if: steps.upstream.outputs.current == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          git config --local "http.https://github.com/.extraheader" \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+
+      - name: Merge upstream
+        if: steps.upstream.outputs.current == 'false'
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "openbot-fork-bot"
+          git config user.email "openbot-fork-bot@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git fetch origin "$BRANCH"
+            git switch -c "$BRANCH" FETCH_HEAD
+            git merge --no-edit "origin/$BASE"
+          else
+            git switch -c "$BRANCH"
+          fi
+          if git merge --no-edit upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::error::upstream conflicts with maintenance"
+          fi
+
+      - name: Open or update the sync pull request
+        if: >-
+          steps.upstream.outputs.current == 'false' &&
+          steps.merge.outputs.conflict == 'false'
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config --local "http.https://github.com/.extraheader" \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git push origin "$BRANCH"
+          number="$(gh pr list --repo "$FORK" --head "$BRANCH" --base "$BASE" \
+            --state open --json number --jq '.[0].number // empty')"
+          gh label create codex-managed --repo "$FORK" --color 1d76db --force
+          gh label create automerge --repo "$FORK" --color 0e8a16 --force
+          if [ -z "$number" ]; then
+            gh pr create --repo "$FORK" --base "$BASE" --head "$BRANCH" \
+              --label codex-managed --label automerge \
+              --title "chore: merge upstream $UPSTREAM" \
+              --body "Automated merge of $UPSTREAM main at $UPSTREAM_SHA into $BASE. The required checks decide whether this merges."
+            number="$(gh pr list --repo "$FORK" --head "$BRANCH" --base "$BASE" \
+              --state open --json number --jq '.[0].number')"
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          gh workflow run fork-maintenance.yml --repo "$FORK" --ref main
+
+      - name: Report a conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          title="Upstream merge conflict on $BASE"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="Merging $UPSTREAM main at $UPSTREAM_SHA into $BASE failed with conflicts. Resolve them by hand on $BASE. Run: $run_url"
+          existing="$(gh issue list --repo "$FORK" --state open \
+            --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [ -z "$existing" ]; then
+            gh issue create --repo "$FORK" --title "$title" --body "$body"
+          else
+            gh issue comment "$existing" --repo "$FORK" --body "$body"
+          fi
+          echo '::error::Upstream merge requires conflict resolution.'
+          exit 1

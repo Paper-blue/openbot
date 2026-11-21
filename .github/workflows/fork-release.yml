@@ -1,0 +1,193 @@
+name: Fork release
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+  pull_request:
+    branches: [maintenance]
+    paths:
+      - .github/workflows/fork-release.yml
+      - electron-builder.yml
+      - package.json
+      - scripts/verify-windows-package.ts
+      - scripts/verify-update-artifacts.ts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-build-${{ github.ref }}-${{ inputs.source_sha || github.sha }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  version:
+    name: Check the package version
+    if: github.repository == 'Paper-blue/openbot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - id: version
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::Invalid package version'; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux AppImage
+    needs: version
+    if: github.repository == 'Paper-blue/openbot'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Prepare the runtime resources
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bun run voice:prepare-runtime
+          bun scripts/prepare-remote-desktop-runtime.ts linux x64
+          bun run verify:remote-desktop-runtime --linux
+          bun scripts/install-cua-driver.ts linux x64
+      - name: Build and publish
+        run: |
+          set -euo pipefail
+          bun run build
+          bunx electron-builder --linux AppImage --x64 --publish never
+      - name: Verify Linux update artifacts
+        run: bun run verify:update-artifacts linux
+      - name: Keep the artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-appimage
+          path: |
+            dist/*.AppImage
+            dist/latest-linux.yml
+          if-no-files-found: error
+
+  mac:
+    name: macOS build
+    needs: version
+    if: github.repository == 'Paper-blue/openbot'
+    runs-on: macos-15
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Prepare the runtime resources
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bun run voice:prepare-runtime
+          bun run prepare:remote-desktop-runtime
+          bun run verify:remote-desktop-runtime
+          bun run prepare:cua-driver
+      - name: Build personal macOS artifacts
+        run: |
+          set -euo pipefail
+          bun run build
+          bunx electron-builder --mac --arm64 \
+            --config.mac.identity=null \
+            --config.mac.notarize=false \
+            --config.mac.entitlements=build/entitlements.mac.paperblue.plist \
+            --publish never
+      - name: Verify macOS update artifacts
+        run: bun run verify:update-artifacts macos
+      - name: Keep the artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-build
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.blockmap
+            dist/latest-mac.yml
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 installer
+    needs: version
+    if: github.repository == 'Paper-blue/openbot'
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build installer
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bun run dist:win
+      - name: Verify package and update metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          bun run verify:package:win --require-update-metadata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installers = @(Get-ChildItem -Path dist -File -Filter *.exe)
+          if ($installers.Count -ne 1 -or -not (Test-Path dist/latest.yml)) {
+            throw "Expected one Windows installer and its update manifest."
+          }
+          bun run verify:update-artifacts windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Keep the artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-build
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+          if-no-files-found: error

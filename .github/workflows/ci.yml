@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, maintenance]
   pull_request:
-    branches: [main]
+    branches: [main, maintenance]
   workflow_dispatch:
 
 permissions:
@@ -334,6 +334,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun scripts/release-version-comparator-e2e.ts
 
+      - name: Run the fork release publish E2E test
+        if: ${{ !cancelled() }}
+        run: bun scripts/publish-fork-release-e2e.ts
+
       - name: Upload the Team API routes E2E report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -343,6 +347,7 @@ jobs:
             .openbot-build/team-api-routes-e2e/
             .openbot-build/crm-team-api-e2e/
             .openbot-build/release-version-comparator-e2e.json
+            .openbot-build/publish-fork-release-e2e/
           if-no-files-found: ignore
 
   reverse-actions-e2e:
@@ -1387,7 +1392,9 @@ jobs:
 
   deploy-production:
     name: Deploy Cloudflare production
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'nightly-labs/openbot' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
     # `surfaces` gates the deploy even though the Worker it ships lives in
     # `apps/auth-api`, which `api` already covers: mobile, the site router, the
     # team client and the remote stack all consume the account API, so a red
