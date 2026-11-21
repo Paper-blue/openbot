@@ -84,6 +84,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         self.respond("PATCH")
 
+    def do_DELETE(self):
+        self.respond("DELETE")
+
     def respond(self, method):
         url = urlsplit(self.path)
         path = url.path.removeprefix("/repos/owner/repo/")
@@ -218,6 +221,12 @@ class Handler(BaseHTTPRequestHandler):
                 value = STATE["release"]
             else:
                 value = [STATE["release"]] if STATE["release"] else []
+        elif path.startswith("releases/assets/"):
+            asset_id = int(path.rsplit("/", 1)[1])
+            value = next(item for item in STATE["assets"] if item.get("id") == asset_id)
+            if method == "DELETE":
+                STATE["assets"].remove(value)
+                value = None
         elif path == "releases/9/assets":
             if method == "POST":
                 STATE["uploads"] += 1
@@ -421,6 +430,30 @@ def main():
             run(publish_args, env, ok=False)
             assert not STATE["writes"]
             checked("protected patch is refused before a remote mutation")
+            for name in (
+                "trusted-ipc.ts",
+                "trusted-ipc.test.ts",
+                "renderer-permissions.ts",
+                "renderer-permissions.test.ts",
+                "update-service.ts",
+                "update-service.test.ts",
+                "host-release-service.ts",
+                "host-release-service.test.ts",
+            ):
+                command(["git", "reset", "--hard", "HEAD"], cwd=repo)
+                target = repo / "src/main" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("export const changed = true;\n")
+                command(["git", "add", "--intent-to-add", str(target)], cwd=repo)
+                (task_dir / "changes.patch").write_text(
+                    command(["git", "diff", "--binary"], cwd=repo).stdout
+                )
+                command(["git", "reset", "--hard", "HEAD"], cwd=repo)
+                run(publish_args, env, ok=False)
+                assert not STATE["writes"]
+            checked(
+                "real permission and update modules and their tests cannot be published"
+            )
             command(["git", "reset", "--hard", "HEAD"], cwd=repo)
             (task_dir / "changes.patch").write_text(diff)
             bare = directory / "remote.git"
@@ -523,11 +556,33 @@ def main():
             assert STATE["release"]["draft"] and len(STATE["assets"]) == 2
             checked("interrupted upload retains a draft with verified assets")
             STATE["fail_upload"] = 0
+            missing_name = "OpenBot-0.73.0-x64.exe"
+            STATE["assets"].append(
+                {
+                    "id": 100,
+                    "name": missing_name,
+                    "state": "starter",
+                    "size": 0,
+                    "digest": None,
+                }
+            )
+            STATE["assets"][-1]["size"] = 1
+            run([SNAPSHOT], release_env, ok=False)
+            assert not any(method == "DELETE" for method, _, _ in STATE["writes"])
+            checked("a nonempty starter asset is never deleted")
+            STATE["assets"][-1]["size"] = 0
             run([SNAPSHOT], release_env)
             assert not STATE["release"]["draft"] and STATE["release"]["prerelease"]
             assert len(STATE["assets"]) == 5
             assert not any(item["name"].endswith(".yml") for item in STATE["assets"])
             checked("resume publishes all packages and checksums without updater feeds")
+            assert any(
+                method == "DELETE" and path == "releases/assets/100"
+                for method, path, _ in STATE["writes"]
+            )
+            checked(
+                "resume removes only a verified empty starter asset in a matching draft"
+            )
             uploads = STATE["uploads"]
             writes = len(STATE["writes"])
             run([SNAPSHOT], release_env)

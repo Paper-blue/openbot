@@ -156,6 +156,10 @@ Only one snapshot writer runs at a time. An interrupted upload can resume the sa
 draft. Existing assets must have matching GitHub digests. Unexpected assets,
 changed tags, changed release state, missing CI, or digest mismatches stop the
 publisher. Published assets are never overwritten or deleted.
+An interrupted upload can leave an empty `starter` asset. The publisher rereads
+the draft, source tag, and asset metadata before deleting only that incomplete,
+zero-byte asset with no digest, then retries the upload. Complete assets and
+nonempty starter assets are not deleted.
 
 macOS packages require manual installation and may require an explicit OS allow
 step. Developer ID, notarization, TCC permission continuity, Windows installation,

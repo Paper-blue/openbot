@@ -144,6 +144,25 @@ def publish(api, source, directory):
         raise Stop("Unexpected remote asset")
     for path, digest in local:
         found = next((item for item in remote if item["name"] == path.name), None)
+        if found and found.get("state") == "starter":
+            current = api.request(f"releases/{release['id']}")
+            current_ref = api.request(f"git/ref/tags/{tag}")
+            asset = api.request(f"releases/assets/{int(found['id'])}")
+            if (
+                not current["draft"]
+                or current["target_commitish"] != source
+                or not current["prerelease"]
+                or current["tag_name"] != tag
+                or current_ref["object"]["type"] != "commit"
+                or current_ref["object"]["sha"] != source
+                or asset.get("state") != "starter"
+                or asset.get("size") != 0
+                or asset.get("digest") is not None
+                or asset.get("name") != path.name
+            ):
+                raise Stop("Incomplete asset cannot be recovered safely")
+            api.request(f"releases/assets/{int(found['id'])}", "DELETE")
+            found = None
         if found:
             if found.get("digest") != digest:
                 raise Stop("Existing asset digest differs")
