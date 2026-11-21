@@ -1,126 +1,185 @@
-# Fork automation
+# Personal fork automation
 
-These workflows are under development. Automatic merging, signing, publishing,
-and client updates have not yet been verified end to end.
+The owner has authorized OpenAI API usage and personal macOS packages without
+Developer ID signing or notarization. The control plane runs on GitHub-hosted
+runners. It does not need an online Mac or a Codex Cloud session.
 
-## Who may merge
+## Branches and activation
 
-`maintenance` requires these checks: `Detect changed areas`, `Check`,
-`Tests (desktop 1/2)`, `Tests (desktop 2/2)`, `Browser smoke` and
-`Codex review finished`. These checks are required and strict on both `main`
-and `maintenance`, including administrators. They do not yet establish a safe
-trust boundary for code that can modify workflow definitions.
+`main` holds trusted workflow definitions and control scripts. `maintenance` holds
+the product source. Install this change through the existing bootstrap PR into
+`maintenance`, then review the maintenance-to-main PR before enabling schedules.
+GitHub reads scheduled workflows from the default branch. A workflow file that
+exists only on a development branch is not an active schedule.
 
-`fork-merge-gate.yml` supplies `Codex review finished`. Automatic merging is
-currently disabled until the controller's trust boundaries have been verified.
-The gate reads the state the Codex connector keeps in its summary comment
-and accepts only that comment from `chatgpt-codex-connector[bot]`. The state names
-the reviewed commit; manual dispatch also checks its run SHA against the PR
-head. These checks still require end-to-end verification.
+Keep `main` and `maintenance` protected, including administrators. Retain the
+existing strict CI requirements and `Codex review finished` requirement. Add
+`Maintenance controller process checks` to required checks after its first run.
+Do not give the maintenance App a ruleset or branch-protection bypass.
 
-## Upstream
+Before setting any enable flag, create the GitHub Environment `fork-control`.
+Set its deployment branch policy to selected branches, with exactly `main`.
+Do not allow tags, pull-request refs, or other branches. Do not require a manual
+reviewer if unattended runs are wanted. Store these secrets in that Environment,
+not as repository secrets:
 
-`fork-upstream-sync.yml` is intended to run daily and on demand, merge
-`nightly-labs/openbot` `main` into `automation/upstream-sync`, and open or update
-a pull request to `maintenance`. It stays inactive unless the repository variable
-`FORK_SYNC_ENABLED` is `true`, and it deliberately fails after opening the PR until
-trusted CI dispatch and review are implemented. It is not on the default branch,
-so scheduling is not active.
+| Setting | Kind | Value |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | Environment secret | A project-specific OpenAI API key |
+| `MAINTENANCE_APP_PRIVATE_KEY` | Environment secret | Private key for the repository-scoped GitHub App |
+| `MAINTENANCE_APP_ID` | Repository variable | App numeric ID |
+| `MAINTENANCE_BOT_LOGIN` | Repository variable | App login including `[bot]` |
+| `MAINTENANCE_MODEL` | Repository variable | Optional API model; empty uses the Codex default |
+| `MAINTENANCE_REVIEW_MODEL` | Repository variable | Optional separate review model |
+| `FORK_CODEX_ENABLED` | Repository variable | `true` enables Issue work and API reviews |
+| `FORK_SYNC_ENABLED` | Repository variable | `true` enables upstream synchronization |
+| `FORK_AUTOMERGE_ENABLED` | Repository variable | `true` enables the trusted merge controller |
+| `PERSONAL_SNAPSHOT_ENABLED` | Repository variable | `true` enables manual-install prereleases |
 
-A pull request opened with `GITHUB_TOKEN` does not start the required checks, and
-this repository has no token that can. Enabling the schedule therefore needs an
-installation token or fine-grained token with permission to create runs, which
-means a new credential and a deliberate decision to give the workflow that
-access. Until then the sync stays off rather than opening pull requests that
-nothing can verify.
+Install the GitHub App on this repository only. It needs Contents, Pull requests,
+Issues, Commit statuses, and Actions read/write. Metadata and Administration are
+read-only; Administration read permits inspection of branch protection. It does
+not need Administration write, Workflows, or organization permissions. App installation
+tokens are short-lived and allow created PRs to trigger checks without a manual
+approval. Do not replace them with a broadly scoped personal token.
 
-It merges rather than squashes because the next sync asks whether upstream `main`
-is already an ancestor of `maintenance`. A squash would copy the file changes
-without the commits, so every sync after the first would try to replay work that
-is already present.
+Create `codex-ready` once in the repository's Labels page. Other queue labels are
+created by the controller when the first authorized task starts. The sync job
+creates its own two labels.
 
-A merge that conflicts stops the run and opens an issue. Resolution is manual: a
-guessed resolution to inherited upstream code is worse than a person looking at
-it.
+Enable Issue work first, run a small controlled Issue through the pipeline, and
+then enable merging, synchronization, and snapshots. All flags are off when
+unset. Existing ChatGPT/Codex scheduled tasks must be inspected and paused during
+cutover; these files cannot inspect or change those tasks.
 
-GitHub currently documents that `pull_request` opened, synchronize, and reopened
-events caused by `GITHUB_TOKEN` may create runs that require approval; other
-generated pull request activities do not trigger runs. `workflow_dispatch` is an
-exception, but dispatching a workflow from the unreviewed sync branch can run
-its workflow definition with write permissions. A trusted controller is needed
-before automatic checks and merging can be enabled safely.
+## Issue development and repair
 
-## Scheduled issue processing
+Add `codex-ready` to an Issue with reproduction steps and acceptance criteria.
+Only an actor with write, maintain, or admin permission can authorize work. The
+controller also checks the label's recorded actor during scheduled selection
+and before publication. A ready label applied by a read-only or triage user does
+not authorize API spending.
 
-The fork's GitHub Issues are enabled. A recurring worker could inspect a dedicated
-ready label, skip issues already associated with an open pull request, process
-one issue at a time in an isolated checkout, and request independent review. A
-separate daily run could inspect upstream changes. These are proposed operating
-rules; no scheduled worker has been configured or tested.
+`fork-maintenance.yml` starts on a ready-label event, daily at 01:00 UTC
+(09:00 Asia/Shanghai), on CI completion, or by manual dispatch on `main`.
+GitHub schedule execution can be delayed. The controller and upstream sync share
+a concurrency group; active work is never cancelled by a new queue event.
 
-The existing Codex Cloud environment can run a manually submitted task, but the
-available evidence does not establish a subscription-backed cloud scheduler that
-can submit those tasks while the computer is off. OpenAI's documentation states
-that personal project-scoped desktop scheduled tasks require the computer and
-app to run. ChatGPT Work can schedule cloud tasks, but the documented ChatGPT
-GitHub connector is read-only; that alone does not establish a way to launch a
-Codex Cloud coding task. Do not treat an issue scan as completed development or
-enable extra-billed API usage to fill this gap.
+One Issue is selected per run. It receives a durable attempt marker before API
+work starts. The worker checks out a fixed commit, installs frozen dependencies
+without lifecycle scripts, and uses the official Codex Action in the workspace
+permission profile with `drop-sudo`. It receives the API proxy, but no App key,
+Git write token, server credentials, or release credentials. The Codex home is a
+fresh runner-temporary directory, not repository-provided configuration. All
+Actions are pinned to commit SHAs.
 
-## Releases
+The worker exports a patch. A new job downloads the immutable plan and patch,
+checks the selected commit and current authorization, applies the patch without
+executing product scripts, and checks all changed paths. It refuses patches over
+2 MB or 50 files, symlinks, submodules, automation, agent configuration, signing,
+update controls, database migrations, and selected permission-boundary paths.
+These tasks need a maintainer-driven PR. Git creates a commit directly from the
+validated index; no generated hooks or test scripts run in the publication job.
+The App pushes a normal fast-forward branch and opens or updates the Issue PR.
 
-`fork-release.yml` builds on a `v*.*.*` tag. It checks the tag against
-`package.json`, checks that a tag points into `maintenance` history, and prepares
-the native runtimes. The publish job is disabled unless
-`PERSONAL_RELEASE_ENABLED` is explicitly enabled. The workflow still needs
-independent checks of CI, review status, and upgrade safety before publication.
-It creates personal macOS and Windows artifacts without Developer ID or Windows
-signing, and runs both jobs on relevant pull requests. macOS auto-update and
-installation of the personal build are not yet verified.
+A separate disposable runner reviews the full PR diff with a fresh read-only
+Codex session and structured output. A separate trusted job validates that output,
+checks the head SHA again, writes a PR comment, and publishes `Codex API review`
+with the App's identity. The existing Codex connector review remains an additional
+required check during this rollout.
 
-The hosted server's updater reads `latest-linux.yml` from the newest release of
-this repository and downloads the AppImage it names, and the desktop app reads
-`latest-mac.yml`. Both point here because `electron-builder.yml` and
-`scripts/hosting/openbot-hosted-update` name this repository rather than
-upstream.
+A failed API review or failed CI check selects a repair on a later controller run.
+The repair prompt includes the latest independent findings and failed check names.
+The controller makes at most two repair rounds after the initial implementation.
+After that it labels the PR `codex-blocked` and leaves it open. Worker timeouts,
+missing output, protected patches, and publication errors produce an Issue
+notification and do not trigger unbounded retries. A maintainer must investigate
+an attempt that stopped before opening a PR; remove the bot's attempt marker only
+after confirming there is no active run or corresponding branch/PR.
 
-The update script accepts only `X.Y.Z` versions without a prerelease suffix and
-expects the artifact named `OpenBot-$version-$architecture.AppImage`. It stages
-an update only when its version is newer than the installed version. A fork
-release therefore needs a version greater than the installed upstream build;
-building the same or an older version cannot validate an upgrade.
+The 45-minute development and 30-minute review limits bound runtime, not exact
+API cost. Configure a dedicated API project and monitor its usage; budget alerts
+alone are not a hard spending cap. There is no automatic model fallback or
+unbounded self-retry loop.
 
-The macOS job does not use Developer ID or Apple notarization; the Windows job
-does not use a Windows signing identity. These builds can trigger operating
-system security prompts. The published macOS updater normally requires signing,
-so artifact generation alone does not verify that updates can be installed.
-Any eventual release requires successful builds on all three platforms, and the
-release automation and trust boundaries still need end-to-end verification.
+## Merge controller
 
-The publish job runs `scripts/publish-fork-release.ts`, which continues an existing
-draft instead of failing. It hashes every artifact before any request, skips a
-same-named asset only when the server digest matches, uploads only the assets the
-draft lacks, re-checks the whole set against the server digests, and only then
-publishes. The local filenames must match the tag and expected platforms exactly;
-unexpected local or remote assets, missing digests, and mismatches stop publication.
-If a problem is detected after uploads, the draft can retain those uploaded assets.
-Nothing is overwritten or deleted, and an already-published release is never edited.
-The job rechecks draft state before mutations, but these checks are not atomic:
-automatic publication must remain disabled until a single release writer is enforced.
-`scripts/publish-fork-release-e2e.ts`
-replays those cases against a loopback stub in CI, so the recovery path is checked
-without touching a real release.
+Only `main` executes the merge controller. The old PR-controlled merge job has
+been removed. Eligible PRs must be authored by the configured App, use a known
+Issue or sync branch, have `codex-managed` and `automerge`, and not be drafts.
 
-Only macOS arm64, Windows x64, and Linux x64 artifacts are produced. The
-updater's Linux arm64 feed and Intel macOS feed therefore stay unpublished, and
-a machine on either of those platforms has no compatible fork update. That is a
-deliberate limit of the personal build: add the missing architectures before
-treating the fork feed as complete for other machines. The publish job releases
-only the manifests the three jobs actually upload, so a missing feed is never
-replaced by a manifest for a different architecture.
+The controller rejects protected file changes, requires a successful API review
+from the configured App for the exact head, and reads strict branch protection.
+It requires successful mandatory checks and permits skipped optional test lanes.
+It checks that the current base is an ancestor of the PR head and rechecks both
+head and base before a SHA-bound merge request. GitHub branch protection remains
+the final authority. API errors, stale bases, missing reviews, or missing checks
+stop merging. Issue PRs use squash; upstream PRs use merge to retain ancestry.
 
-## Where the explanations live
+A source change to the base may require updating a PR branch and rerunning its
+checks before merging. The controller does not silently merge an out-of-date PR.
 
-The workflows carry no comments: the repository's rules keep comments out of
-configuration and put reasons in a document. This file is that document. When a
-workflow changes, change this file with it.
+## Upstream synchronization
+
+`fork-upstream-sync.yml` checks upstream `nightly-labs/openbot` `main` daily at
+01:17 UTC and on manual dispatch. It merges into `automation/upstream-sync`,
+retains an existing sync branch, and uses a normal push. There are no forced
+branch updates. Merge conflicts stop the job and require investigation.
+
+The App-created PR starts CI. The sync job then dispatches the trusted Issue
+controller on `main` for an independent API review. Upstream changes to workflow,
+update, migration, signing, or other protected paths remain manual merge tasks.
+A successful textual merge is not evidence of runtime compatibility.
+
+## Personal builds and publication
+
+`fork-release.yml` remains the three-platform builder. It can now be called by
+`fork-personal-release.yml` with an exact source SHA. The build jobs have read-only
+GitHub permissions and no inherited App or OpenAI secrets. macOS sets
+`CSC_IDENTITY_AUTO_DISCOVERY=false`, `mac.identity=null`, and `mac.notarize=false`.
+It produces arm64 DMG and ZIP; Windows produces an x64 installer; Linux produces
+an x64 AppImage. Artifact and updater-metadata validation still runs.
+
+After successful push CI on `maintenance`, the trusted snapshot workflow verifies
+source ancestry and successful CI, then calls those build jobs. Publication runs
+in a new job from the trusted control commit. It creates an immutable
+`personal-<full-source-sha>` tag and a prerelease that is not marked latest.
+The publication script validates the four platform packages, computes SHA-256
+checksums, and uploads the packages plus `SHA256SUMS`. It does not publish updater
+feeds or blockmaps. Thus these personal snapshots do not replace installed apps.
+They also avoid version bumps just to identify a rebuild of the same upstream
+version; the tag and release body identify the exact source commit.
+
+Only one snapshot writer runs at a time. An interrupted upload can resume the same
+draft. Existing assets must have matching GitHub digests. Unexpected assets,
+changed tags, changed release state, missing CI, or digest mismatches stop the
+publisher. Published assets are never overwritten or deleted.
+
+macOS packages require manual installation and may require an explicit OS allow
+step. Developer ID, notarization, TCC permission continuity, Windows installation,
+Linux service upgrades, database-aware rollback, and automatic device updates are
+separate acceptance tasks. No existing installation is changed by this pipeline.
+
+The older stable-tag publisher remains gated by `PERSONAL_RELEASE_ENABLED`.
+Leave that flag off during this rollout. A stable version bump or tag still
+requires the repository's release-upgrade audit.
+
+## Validation and current limits
+
+Run `python3 scripts/fork-maintenance-e2e.py` to exercise the controller against a
+loopback HTTP API and real temporary Git repositories. It writes a JSON report
+under `.openbot-build/fork-maintenance-e2e/`. A sandbox that forbids loopback
+sockets can run `--offline`; this uses the same API fixture via process-local
+transport while still executing the real controller and Git subprocesses. CI runs
+the HTTP version in `fork-controller-check.yml`.
+
+The process fixture checks queue deduplication, maintainer authorization, repair
+limits, protected patches, Git publication, stale review rejection, merge gates,
+interrupted release recovery, digests, idempotence, and source CI. It does not prove
+live API authentication, GitHub App setup, actual Codex output quality, real
+cross-platform installation, or the full unattended production chain.
+
+The repository does not contain the owner's API key or App private key. Live
+acceptance requires the Environment and App setup above, the trusted definitions
+on `main`, an actual Issue, independent review, CI, and a real three-platform
+snapshot run. Report these milestones separately.

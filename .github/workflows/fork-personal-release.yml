@@ -1,0 +1,87 @@
+name: Personal snapshot
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Maintenance commit with successful push CI
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-snapshot-publisher
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: >-
+      github.repository == 'Paper-blue/openbot' &&
+      github.ref == 'refs/heads/main' && vars.PERSONAL_SNAPSHOT_ENABLED == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.head_branch == 'maintenance' && github.event.workflow_run.conclusion == 'success'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source: ${{ steps.source.outputs.source }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify source ancestry and push CI
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          python3 .github/automation/snapshot.py verify
+          echo "source=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: verify
+    uses: ./.github/workflows/fork-release.yml
+    with:
+      source_sha: ${{ needs.verify.outputs.source }}
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    environment: fork-control
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: macos-build
+          path: artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: windows-build
+          path: artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-appimage
+          path: artifacts
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        id: app
+        with:
+          app-id: ${{ vars.MAINTENANCE_APP_ID }}
+          private-key: ${{ secrets.MAINTENANCE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: openbot
+      - name: Publish a resumable manual-install snapshot
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SOURCE_SHA: ${{ needs.verify.outputs.source }}
+          ARTIFACTS_DIR: artifacts
+        run: python3 .github/automation/snapshot.py
