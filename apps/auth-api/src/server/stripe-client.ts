@@ -2,6 +2,7 @@ import {
   BILLING_CURRENCIES,
   BILLING_METADATA,
   type BillingCurrency,
+  type BillingInterval,
   type BillingStorageTier,
   parseStorageTierPrice,
 } from "@openbot/contracts/billing";
@@ -15,7 +16,7 @@ export const STRIPE_API_VERSION = "2025-03-31.basil";
 const STRIPE_API_ORIGIN = "https://api.stripe.com";
 const STRIPE_TIMEOUT_MS = 10_000;
 const SIGNATURE_TOLERANCE_SECONDS = 300;
-const CHECKOUT_LIFETIME_SECONDS = 35 * 60;
+export const CHECKOUT_LIFETIME_SECONDS = 35 * 60;
 
 export type StripeFetch = (input: string, init: RequestInit) => Promise<Response>;
 
@@ -106,6 +107,26 @@ const checkoutSessionListSchema = Schema.Struct({
   data: Schema.Array(Schema.Struct({ ...checkoutSessionSchema.fields, created: Schema.Int })),
 });
 export type StripeOpenCheckoutSession = (typeof checkoutSessionListSchema.Type)["data"][number];
+
+interface CheckoutInlinePrice {
+  productName: string;
+  amount: number;
+  interval: BillingInterval;
+}
+
+type CheckoutLine = { priceId: string } | { inlinePrice: CheckoutInlinePrice };
+
+function checkoutLineFields(line: CheckoutLine, currency: BillingCurrency): Record<string, string> {
+  if ("priceId" in line) return { "line_items[0][price]": line.priceId };
+  return {
+    "line_items[0][price_data][currency]": currency,
+    "line_items[0][price_data][unit_amount]": String(line.inlinePrice.amount),
+    "line_items[0][price_data][recurring][interval]": line.inlinePrice.interval,
+    "line_items[0][price_data][tax_behavior]": "exclusive",
+    "line_items[0][price_data][product_data][name]": line.inlinePrice.productName,
+  };
+}
+
 const priceSchema = Schema.Struct({
   id: Schema.String,
   lookup_key: Schema.NullOr(Schema.String),
@@ -127,6 +148,7 @@ const subscriptionSchema = Schema.Struct({
   canceled_at: Schema.optional(Schema.NullOr(Schema.Int)),
   metadata: Metadata,
   current_period_end: Schema.optional(Schema.Int),
+  start_date: Schema.optional(Schema.Int),
   trial_end: Schema.optional(Schema.NullOr(Schema.Int)),
   discounts: Schema.optional(Schema.NullOr(Schema.Array(expandable))),
   latest_invoice: Schema.optional(Schema.NullOr(expandable)),
@@ -185,7 +207,31 @@ const subscriptionDiscountsSchema = Schema.Struct({
     ),
   ),
 });
+type SubscriptionDiscount = Exclude<
+  NonNullable<(typeof subscriptionDiscountsSchema.Type)["discounts"]>[number],
+  string
+>;
+
+function discountCouponId(discount: SubscriptionDiscount): string | null {
+  const coupon = discount.source?.coupon ?? discount.coupon;
+  return typeof coupon === "string" ? coupon : (coupon?.id ?? null);
+}
+
 const invoicePaymentListSchema = Schema.Struct({ data: Schema.Array(Schema.Struct({ invoice: expandable })) });
+const invoicePaymentIntentListSchema = Schema.Struct({
+  data: Schema.Array(
+    Schema.Struct({
+      payment: Schema.Struct({ payment_intent: Schema.optional(Schema.NullOr(expandable)) }),
+    }),
+  ),
+});
+const paymentIntentSchema = Schema.Struct({
+  latest_charge: Schema.optional(
+    Schema.NullOr(
+      Schema.Union([Schema.String, Schema.Struct({ amount_refunded: Schema.Int, disputed: Schema.Boolean })]),
+    ),
+  ),
+});
 const invoiceSchema = Schema.Struct({
   id: Schema.String,
   billing_reason: Schema.optional(Schema.NullOr(Schema.String)),
@@ -199,11 +245,6 @@ const invoiceSchema = Schema.Struct({
         ),
       }),
     ),
-  ),
-});
-const paymentIntentSchema = Schema.Struct({
-  latest_charge: Schema.optional(
-    Schema.NullOr(Schema.Union([Schema.String, Schema.Struct({ refunded: Schema.Boolean })])),
   ),
 });
 const eventSchema = Schema.Struct({
@@ -450,9 +491,8 @@ export class StripeClient {
 
   readonly createCheckoutSession = Effect.fn("StripeClient.createCheckoutSession")(function* (
     this: StripeClient,
-    input: {
+    input: CheckoutLine & {
       customerId: string;
-      priceId: string;
       currency: BillingCurrency;
       userId: string;
       serverId?: string;
@@ -472,10 +512,10 @@ export class StripeClient {
     const body = new URLSearchParams({
       mode: "subscription",
       customer: input.customerId,
-      "line_items[0][price]": input.priceId,
+      ...checkoutLineFields(input, input.currency),
       "line_items[0][quantity]": String(input.quantity ?? 1),
       currency: input.currency,
-      allow_promotion_codes: "true",
+      allow_promotion_codes: "priceId" in input ? "true" : "false",
       ui_mode: "hosted",
       origin_context: "web",
       submit_type: "auto",
@@ -525,6 +565,64 @@ export class StripeClient {
           Effect.catchIf(isRefusedPromotionCode, () => create(fallback)),
         )
       : create(fallback);
+    if (!session.url) return yield* new StripeRequestError(200, "invalid_response", "missing_url");
+    return { id: session.id, url: session.url };
+  }).bind(this);
+
+  readonly createPaymentCheckoutSession = Effect.fn("StripeClient.createPaymentCheckoutSession")(function* (
+    this: StripeClient,
+    input: {
+      customerId: string;
+      priceId: string;
+      currency: BillingCurrency;
+      clientReferenceId: string;
+      metadata: Readonly<Record<string, string>>;
+      tax: CheckoutTax | null;
+      successUrl: string;
+      cancelUrl: string;
+      nowSeconds: number;
+    },
+  ): Effect.fn.Return<{ id: string; url: string }, StripeRequestError | StripeTransportError> {
+    const body = new URLSearchParams({
+      mode: "payment",
+      customer: input.customerId,
+      "line_items[0][price]": input.priceId,
+      "line_items[0][quantity]": "1",
+      currency: input.currency,
+      client_reference_id: input.clientReferenceId,
+      ui_mode: "hosted",
+      origin_context: "web",
+      submit_type: "pay",
+      billing_address_collection: "required",
+      "phone_number_collection[enabled]": "false",
+      "customer_update[name]": "auto",
+      "customer_update[address]": "auto",
+      "consent_collection[terms_of_service]": "required",
+      "name_collection[individual][enabled]": "true",
+      "name_collection[individual][optional]": "true",
+      success_url: input.successUrl,
+      cancel_url: input.cancelUrl,
+      expires_at: String(input.nowSeconds + CHECKOUT_LIFETIME_SECONDS),
+      "invoice_creation[enabled]": "true",
+    });
+    if (input.tax) {
+      if (input.tax.rateId) body.set("line_items[0][tax_rates][0]", input.tax.rateId);
+      const vat = { [VAT_METADATA.country]: input.tax.country, [VAT_METADATA.treatment]: input.tax.treatment };
+      for (const [key, value] of Object.entries(vat)) {
+        body.set(`metadata[${key}]`, value);
+        body.set(`invoice_creation[invoice_data][metadata][${key}]`, value);
+      }
+    } else {
+      body.set("automatic_tax[enabled]", "true");
+      body.set("tax_id_collection[enabled]", "true");
+      body.set("tax_id_collection[required]", "never");
+    }
+    for (const [key, value] of Object.entries(input.metadata)) {
+      body.set(`metadata[${key}]`, value);
+      body.set(`payment_intent_data[metadata][${key}]`, value);
+      body.set(`invoice_creation[invoice_data][metadata][${key}]`, value);
+    }
+    const session = yield* this.#requestEffect("POST", "/v1/checkout/sessions", body, checkoutSessionSchema);
     if (!session.url) return yield* new StripeRequestError(200, "invalid_response", "missing_url");
     return { id: session.id, url: session.url };
   }).bind(this);
@@ -700,6 +798,29 @@ export class StripeClient {
     };
   }).bind(this);
 
+  readonly isInvoiceRefunded = Effect.fn("StripeClient.isInvoiceRefunded")(function* (
+    this: StripeClient,
+    invoiceId: string,
+  ): Effect.fn.Return<boolean, StripeRequestError | StripeTransportError> {
+    const list = new URLSearchParams({ invoice: invoiceId, limit: "10" });
+    const payments = yield* this.#requestEffect(
+      "GET",
+      `/v1/invoice_payments?${list}`,
+      null,
+      invoicePaymentIntentListSchema,
+    );
+    for (const { payment } of payments.data) {
+      const intent = payment.payment_intent;
+      if (!intent) continue;
+      const intentId = typeof intent === "string" ? intent : intent.id;
+      const query = new URLSearchParams({ "expand[]": "latest_charge" });
+      const path = `/v1/payment_intents/${encodeURIComponent(intentId)}?${query}`;
+      const charge = (yield* this.#requestEffect("GET", path, null, paymentIntentSchema)).latest_charge;
+      if (typeof charge === "object" && charge !== null && charge.amount_refunded > 0 && !charge.disputed) return true;
+    }
+    return false;
+  }).bind(this);
+
   readonly getCustomerCredit = Effect.fn("StripeClient.getCustomerCredit")(function* (
     this: StripeClient,
     customerId: string,
@@ -771,40 +892,48 @@ export class StripeClient {
     return fingerprints;
   }).bind(this);
 
+  readonly subscriptionCouponIds = Effect.fn("StripeClient.subscriptionCouponIds")(function* (
+    this: StripeClient,
+    subscriptionId: string,
+  ): Effect.fn.Return<string[], StripeRequestError | StripeTransportError> {
+    const subscription = yield* this.#subscriptionDiscounts(subscriptionId);
+    return (subscription.discounts ?? []).flatMap((discount) => {
+      const couponId = typeof discount === "string" ? null : discountCouponId(discount);
+      return couponId ? [couponId] : [];
+    });
+  }).bind(this);
+
   readonly removeSubscriptionCoupon = Effect.fn("StripeClient.removeSubscriptionCoupon")(function* (
     this: StripeClient,
     subscriptionId: string,
-    couponId: string,
+    couponIds: readonly string[],
   ): Effect.fn.Return<boolean, StripeRequestError | StripeTransportError> {
-    const path = `/v1/subscriptions/${encodeURIComponent(subscriptionId)}`;
-    const query = new URLSearchParams({ "expand[]": "discounts" });
-    const subscription = yield* this.#requestEffect("GET", `${path}?${query}`, null, subscriptionDiscountsSchema);
+    const subscription = yield* this.#subscriptionDiscounts(subscriptionId);
     if (subscription.status === "canceled" || subscription.status === "incomplete_expired") return false;
     const discounts = subscription.discounts ?? [];
-    const idOf = (value: string | { id: string } | null | undefined) =>
-      typeof value === "string" ? value : (value?.id ?? null);
     const keep = discounts
-      .filter(
-        (discount) => typeof discount === "string" || idOf(discount.source?.coupon ?? discount.coupon) !== couponId,
-      )
+      .filter((discount) => typeof discount === "string" || !couponIds.includes(discountCouponId(discount) ?? ""))
       .map((discount) => (typeof discount === "string" ? discount : discount.id));
     if (keep.length === discounts.length) return false;
     const body = new URLSearchParams();
     if (keep.length === 0) body.set("discounts", "");
     for (const [index, id] of keep.entries()) body.set(`discounts[${index}][discount]`, id);
-    yield* this.#requestEffect("POST", path, body, subscriptionDiscountsSchema);
+    yield* this.#requestEffect(
+      "POST",
+      `/v1/subscriptions/${encodeURIComponent(subscriptionId)}`,
+      body,
+      subscriptionDiscountsSchema,
+    );
     return true;
   }).bind(this);
 
-  readonly isPaymentRefunded = Effect.fn("StripeClient.isPaymentRefunded")(function* (
-    this: StripeClient,
-    paymentIntentId: string,
-  ): Effect.fn.Return<boolean, StripeRequestError | StripeTransportError> {
-    const query = new URLSearchParams({ "expand[]": "latest_charge" });
-    const path = `/v1/payment_intents/${encodeURIComponent(paymentIntentId)}?${query}`;
-    const charge = (yield* this.#requestEffect("GET", path, null, paymentIntentSchema)).latest_charge;
-    return typeof charge === "object" && charge !== null && charge.refunded;
-  }).bind(this);
+  readonly #subscriptionDiscounts = (subscriptionId: string) =>
+    this.#requestEffect(
+      "GET",
+      `/v1/subscriptions/${encodeURIComponent(subscriptionId)}?${new URLSearchParams({ "expand[]": "discounts" })}`,
+      null,
+      subscriptionDiscountsSchema,
+    );
 
   readonly #requestEffect = Effect.fn("StripeClient.request")(function* <T>(
     this: StripeClient,
@@ -914,6 +1043,10 @@ export function subscriptionPaymentMethodId(subscription: StripeSubscription): s
   const method = subscription.default_payment_method;
   if (!method) return null;
   return typeof method === "string" ? method : method.id;
+}
+
+export function subscriptionStartedAt(subscription: StripeSubscription): number | null {
+  return subscription.start_date === undefined ? null : subscription.start_date * 1_000;
 }
 
 export function subscriptionLatestInvoiceId(subscription: StripeSubscription): string | null {

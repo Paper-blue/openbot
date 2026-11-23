@@ -11,14 +11,17 @@ import { SetupReadError } from "./features/onboarding/SetupReadError";
 import { useSetupProviderProps } from "./features/onboarding/setup-provider-props";
 import { useServerScope } from "./features/servers/server-scope";
 import { useServerSelection } from "./features/servers/server-selection";
+import { useServers } from "./features/servers/servers-context";
 import { useSettings } from "./features/settings/settings-context";
 import { useUpdates } from "./features/updates/updates-context";
 import { WhatsNewOverlay } from "./features/updates/WhatsNewOverlay";
 import { QuitShortcutHint } from "./features/window/QuitShortcutHint";
+import { startsAfterRestart } from "./features/window/restarted-start";
 import { useI18n } from "./i18n-context";
 import { AccountLogin, FirstRunFlow, InitialSetup, LanguageStep } from "./lazy-views";
 import { usePlatform } from "./platform";
 import { reportWorkspaceReady } from "./renderer-timing";
+import { startupLoadingScene } from "./startup-animation-preference";
 import { WorkspaceShell } from "./WorkspaceShell";
 
 let startupSplashPlayed = false;
@@ -42,13 +45,17 @@ export function AppAccessGate() {
   const setupProviders = useSetupProviderProps();
   const detection = useProviderDetection();
   const settings = useSettings();
-  const { joinRemoteDuringSetup } = useServerSelection();
+  const { joinRemoteDuringSetup, openServerDuringSetup } = useServerSelection();
+  const { servers } = useServers();
+  const accountServers = createMemo(() =>
+    servers().filter((server) => server.kind === "remote" && server.thisComputer !== true),
+  );
   const updates = useUpdates();
   const [requiredUpdateDismissed, setRequiredUpdateDismissed] = createSignal(false);
   const updateRequired = () => updates.status().requiredVersion !== undefined && !requiredUpdateDismissed();
   const languageLoaded = createMemo<boolean>((was) => was === true || i18n.ready());
   const started = () => setup.setupLoaded() && platform.appInfo() !== null && languageLoaded();
-  const [splashShown, setSplashShown] = createSignal(!platform.landingPreview);
+  const [splashShown, setSplashShown] = createSignal(!platform.landingPreview && !startsAfterRestart());
   const splashPlaysThrough = !startupSplashPlayed && platform.chatWindow === null;
   const [splashOpen, setSplashOpen] = createSignal(false);
   const splashMoving = () => splashShown() && !splashOpen();
@@ -149,6 +156,8 @@ export function AppAccessGate() {
                             }
                             onProviderStepShown={detection.scanOnce}
                             logoVariant={platform.appInfo()?.variant ?? "production"}
+                            existingServers={accountServers()}
+                            onOpenServer={openServerDuringSetup}
                           />
                         </Loading>
                       }
@@ -195,6 +204,8 @@ export function AppAccessGate() {
       <Show when={splashShown()}>
         <AppLoadingScreen
           label={t("app.loading")}
+          title={t("app.loading")}
+          scene={startupLoadingScene()}
           ready={splashReady()}
           quickExit={!splashPlaysThrough}
           onMountViews={() => setSplashOpen(true)}

@@ -16,6 +16,7 @@ import { type DynamicRecord, isString } from "@openbot/contracts/runtime-values"
 import {
   normalizeUiBlockSpec,
   UI_API_KEY_SCOPE_FIELD_ID,
+  UI_CONFIRM_ACTION_QUESTION_ID,
   UI_CONFIRM_EDIT_ACTION_ID,
   UI_VAULT_REQUEST_FIELDS,
   UI_VAULT_SECRET_FIELDS,
@@ -23,6 +24,7 @@ import {
   type UiBlockSpec,
   type UiFormField,
   type UiVaultRequestField,
+  uiBlockFallbackQuestions,
 } from "@openbot/contracts/ui-blocks";
 import { sourceText } from "@openbot/i18n/source";
 import type { SavedApiKey } from "../agent-api-keys";
@@ -43,16 +45,29 @@ export function secretElicitationField(id: string, property: DynamicRecord | und
   return SECRET_FIELD_PATTERN.test(`${id} ${getString(property, "title") ?? ""}`);
 }
 
+function elicitationOptionLabel(text: string): string {
+  return text.slice(0, INPUT_LIMITS.promptOptionLabel);
+}
+
+function isElicitationOptionAnswer(text: string, answer: string | undefined): boolean {
+  return text === answer || elicitationOptionLabel(text) === answer;
+}
+
 function elicitationOptions(property: DynamicRecord): Array<{ label: string; description: string }> | null {
   if (Array.isArray(property.oneOf)) {
     return property.oneOf.filter(isRecord).flatMap((option) => {
       const value = getString(option, "const");
       if (!value) return [];
-      return [{ label: getString(option, "title") ?? value, description: getString(option, "description") ?? "" }];
+      return [
+        {
+          label: elicitationOptionLabel(getString(option, "title") ?? value),
+          description: (getString(option, "description") ?? "").slice(0, INPUT_LIMITS.promptOptionDescription),
+        },
+      ];
     });
   }
   if (Array.isArray(property.enum)) {
-    return property.enum.filter(isString).map((value) => ({ label: value, description: "" }));
+    return property.enum.filter(isString).map((value) => ({ label: elicitationOptionLabel(value), description: "" }));
   }
   if (property.type === "boolean") {
     return [
@@ -70,8 +85,14 @@ export function elicitationValue(property: DynamicRecord | undefined, answers: s
   if (Array.isArray(property.oneOf)) {
     const selected = property.oneOf
       .filter(isRecord)
-      .find((option) => (getString(option, "title") ?? getString(option, "const")) === answers[0]);
+      .find((option) =>
+        isElicitationOptionAnswer(getString(option, "title") ?? getString(option, "const") ?? "", answers[0]),
+      );
     if (selected) return getString(selected, "const") ?? answers[0] ?? "";
+  }
+  if (Array.isArray(property.enum)) {
+    const selected = property.enum.filter(isString).find((value) => isElicitationOptionAnswer(value, answers[0]));
+    if (selected !== undefined) return selected;
   }
   if (property.type === "number" || property.type === "integer") {
     const parsed = Number(answers[0]);
@@ -139,7 +160,14 @@ export function elicitationFieldQuestions(params: unknown, subject: string): Age
     if (!isRecord(property)) return [];
     const description = getString(property, "description");
     const question = description ?? message ?? `${subject} needs more information.`;
-    const detail = index === 0 && description && message && message !== description ? message : undefined;
+    const options = elicitationOptions(property);
+    const hidden = options?.slice(INPUT_LIMITS.promptOptions).map((option) => option.label) ?? [];
+    const detail = [
+      index === 0 && description && message && message !== description ? message : undefined,
+      hidden.length > 0 ? sourceText("status.agent.elicitationMoreOptions", { options: hidden.join(", ") }) : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ");
     return [
       {
         id,
@@ -147,7 +175,7 @@ export function elicitationFieldQuestions(params: unknown, subject: string): Age
         question: question.slice(0, INPUT_LIMITS.promptQuestion),
         ...(detail ? { detail: detail.slice(0, INPUT_LIMITS.promptQuestion) } : {}),
         isSecret: secretElicitationField(id, property),
-        options: elicitationOptions(property),
+        options: options?.slice(0, INPUT_LIMITS.promptOptions) ?? null,
       },
     ];
   });
@@ -359,11 +387,14 @@ export function dynamicPromptResult(answers: Record<string, string[]>): DynamicT
   };
 }
 
-export function detachedPromptResult(): DynamicToolResult {
-  const value = {
-    status: "waiting",
-    next: "The user has not answered yet. The question stays open in the chat, and the answer arrives as the user's next message, which quotes the question. Do not ask it again. End your turn unless other work does not need the answer.",
-  };
+const DETACHED_PROMPT_NOTE =
+  "The user has not answered yet. The question stays open in the chat, and the answer arrives as the user's next message, which quotes the question. Do not ask it again. End your turn unless other work does not need the answer.";
+
+export function detachedPromptResult(
+  responseKind: "dynamic-tool" | "mcp-elicitation" | "user-input" | "ui-block",
+): DynamicToolResult | { answers: Record<string, never>; note: string } {
+  if (responseKind === "user-input") return { answers: {}, note: DETACHED_PROMPT_NOTE };
+  const value = { status: "waiting", next: DETACHED_PROMPT_NOTE };
   return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(value) }] };
 }
 
@@ -375,6 +406,19 @@ export function lateAnswerText(questions: AgentPromptQuestion[], answers: Record
       return [`${quoted(question.question)}\n\n${values.join(", ")}`];
     })
     .join("\n\n");
+}
+
+export function editedPreviewQuestions(
+  questions: AgentPromptQuestion[],
+  spec: UiBlockSpec | undefined,
+  preview: string | undefined,
+): AgentPromptQuestion[] {
+  if (preview === undefined || spec?.type !== "confirm") return questions;
+  return uiBlockFallbackQuestions({ ...spec, preview: "" }).map((question) =>
+    question.id === UI_CONFIRM_ACTION_QUESTION_ID
+      ? { ...question, question: `${question.question}\n\n${preview}` }
+      : question,
+  );
 }
 
 export function vaultLateAnswerText(title: string, savedName: string | null): string {
@@ -584,6 +628,35 @@ const TAKEOVER_SIGN_IN_MISSING_NEXT =
 const TAKEOVER_USER_CANCELLED_NEXT =
   "The user selected Cancel. Do not call submit_secret or request_takeover again for this step, and do not try to get the same result another way. Say in your reply that the user cancelled it, and wait for the user before you try again.";
 
+function browserTakeoverNotes(
+  vault: string | undefined,
+  vaultSkipped: string | undefined,
+  signInMissing: boolean,
+  secureInputFailed: string | undefined,
+) {
+  return {
+    ...(vault ? { vault } : {}),
+    ...(vaultSkipped ? { vaultSkipped } : {}),
+    ...(signInMissing ? { signIn: "not-received" } : {}),
+    ...(secureInputFailed === undefined
+      ? {}
+      : {
+          secureInput: `OpenBot could not finish entering the value.${secureInputFailed ? ` ${secureInputFailed}` : ""} The page went to the user.`,
+        }),
+  };
+}
+
+export function browserTakeoverLateNotes(
+  vault: string | undefined,
+  vaultSkipped: string | undefined,
+  signInMissing: boolean,
+  secureInputFailed: string | undefined,
+): string {
+  const notes = browserTakeoverNotes(vault, vaultSkipped, signInMissing, secureInputFailed);
+  if (Object.keys(notes).length === 0) return "";
+  return JSON.stringify(signInMissing ? { ...notes, next: TAKEOVER_SIGN_IN_MISSING_NEXT } : notes);
+}
+
 export function browserTakeoverResult(
   decision: RespondToBrowserTakeoverInput["decision"],
   vault?: string,
@@ -599,14 +672,7 @@ export function browserTakeoverResult(
         type: "inputText",
         text: JSON.stringify({
           status: decision === "complete" ? "completed" : "cancelled",
-          ...(vault ? { vault } : {}),
-          ...(vaultSkipped ? { vaultSkipped } : {}),
-          ...(signInMissing ? { signIn: "not-received" } : {}),
-          ...(secureInputFailed === undefined
-            ? {}
-            : {
-                secureInput: `OpenBot could not finish entering the value.${secureInputFailed ? ` ${secureInputFailed}` : ""} The page went to the user.`,
-              }),
+          ...browserTakeoverNotes(vault, vaultSkipped, signInMissing, secureInputFailed),
           ...(decision === "complete"
             ? { next: signInMissing ? TAKEOVER_SIGN_IN_MISSING_NEXT : "Take a fresh snapshot and continue the task." }
             : userCancelled
@@ -622,6 +688,22 @@ export function browserTakeoverWaitingResult(tool: string, tabId: string): Dynam
   const value = {
     status: "waiting",
     next: `The user has not finished yet. The card stays open. Call ${tool} again now with tabId "${tabId}" to keep waiting for it; that call does not show a new card. Do not end your turn: the card closes when the turn ends.`,
+  };
+  return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(value) }] };
+}
+
+export function browserTakeoverReleasedResult(tool: string, tabId: string): DynamicToolResult {
+  const value = {
+    status: "waiting",
+    next: `The user has not finished yet. The card stays open for the user, and the browser tools of this chat stay unavailable until the user finishes. When the user finishes or cancels, the result arrives as the user's next message. Do not call ${tool} again for tab "${tabId}" in this turn. Tell the user in one short sentence that the browser waits for them, and end your turn unless other work does not need the browser.`,
+  };
+  return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(value) }] };
+}
+
+export function browserTakeoverExpiredResult(): DynamicToolResult {
+  const value = {
+    status: "expired",
+    next: "The user did not answer in time, and the card closed. Tell the user in one short sentence what they must do in the browser, and end your turn.",
   };
   return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(value) }] };
 }

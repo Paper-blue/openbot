@@ -81,12 +81,13 @@ const peerDecode = <A>(operation: () => A) => Effect.try({ try: operation, catch
 const deviceFileError = () => new FileTransferError({ message: sourceText("error.remote.attachmentChanged") });
 
 import { createRemoteFileReceiver } from "./file-download";
-import { createRemoteFileSender, FileTransferError, type RemoteFileUpload } from "./file-upload";
+import { createRemoteFileSender, FileTransferError, fileTransferError, type RemoteFileUpload } from "./file-upload";
 import { markRemoteSync, type RemoteRequestProfile, startRemoteRequest } from "./sync-profile";
 
 export type { RemoteFileUpload } from "./file-upload";
 export { MOBILE_ATTACHMENT_BYTES } from "./file-upload";
 
+import { iceCandidateRoute, iceServerErrorDetail } from "./ice-diagnostics";
 import {
   judgePath,
   PATH_CHECK_INTERVAL_MS,
@@ -103,6 +104,7 @@ export type RemoteTeamEvent = AgentEvent | TeamRealtimeEvent | LiveVoiceEvent;
 export type RemoteLargeDownload = {
   maxBytes: number;
   mimeType?: string | undefined;
+  file?: string | undefined;
 };
 
 export type RemoteTeamCommand =
@@ -194,8 +196,13 @@ function decodeRemoteFileUpload(value: unknown): RemoteFileUpload | null {
 
 function decodeRemoteLargeDownload(value: unknown): RemoteLargeDownload | null {
   if (!isDynamicRecord(value) || !isNumber(value.maxBytes)) return null;
-  if (value.mimeType === undefined) return { maxBytes: value.maxBytes };
-  return isString(value.mimeType) ? { maxBytes: value.maxBytes, mimeType: value.mimeType } : null;
+  if (!(value.mimeType === undefined || isString(value.mimeType))) return null;
+  if (!(value.file === undefined || (isString(value.file) && value.file.length > 0))) return null;
+  return {
+    maxBytes: value.maxBytes,
+    ...(value.mimeType === undefined ? {} : { mimeType: value.mimeType }),
+    ...(value.file === undefined ? {} : { file: value.file }),
+  };
 }
 
 export function decodeRemoteTeamCommand(value: unknown): {
@@ -271,6 +278,7 @@ export interface RemoteTeamDiagnostic {
     | "peer-state"
     | "ice-state"
     | "ice-gathering"
+    | "ice-candidate-error"
     | "route"
     | "ice-recovery"
     | "channels-open"
@@ -315,6 +323,7 @@ export interface RemoteTeamPeerActions {
   onTeamEvent: (hostId: string, event: RemoteTeamEvent) => Promise<void>;
   digestUploadFile?: (ref: string) => Promise<string>;
   readUploadFile?: (part: { ref: string; offset: number; length: number }) => Promise<string>;
+  writeDownloadFile?: (part: { ref: string; base64: string; append: boolean }) => Promise<void>;
 }
 interface ActionsRef {
   current: RemoteTeamPeerActions;
@@ -510,6 +519,15 @@ export function createRemoteTeamPeer(
         ),
     },
   );
+  const downloadTarget = (ref: string | undefined) => {
+    const write = actions.current.writeDownloadFile;
+    if (ref === undefined || !write) return undefined;
+    return {
+      ref,
+      write: (base64: string, append: boolean) =>
+        peerCall(() => write({ ref, base64, append })).pipe(Effect.mapError(fileTransferError)),
+    };
+  };
   const downloads = createRemoteFileReceiver((data) =>
     Effect.suspend(() => {
       const state = peer;
@@ -606,6 +624,11 @@ export function createRemoteTeamPeer(
         renewSignal(state, actions);
       void runPeerEffect(peerCall(() => actions.current.onNetworkRestored?.())).catch(() => undefined);
     },
+    eventsFailed() {
+      const state = peer;
+      if (state && !state.closed)
+        failPeer(state, referenced(sourceText("error.remote.connectionDropped"), "events/failed"), actions);
+    },
     networkMoved() {
       const state = peer;
       if (active && state && !state.closed)
@@ -630,15 +653,8 @@ export function createRemoteTeamPeer(
   function reportRoute(state: PeerState, connection: RTCPeerConnection) {
     return Effect.fn("RemotePeer.reportRoute")(function* () {
       const pair = selectedCandidates(yield* peerCall(() => connection.getStats()));
-      if (pair)
-        yield* notify(
-          diagnosticCall(state, "route", `${candidateRoute(pair.local)} -> ${candidateRoute(pair.remote)}`),
-        );
+      if (pair) yield* notify(diagnosticCall(state, "route", iceCandidateRoute(pair.local, pair.remote)));
     })();
-  }
-
-  function candidateRoute(candidate: { candidateType?: string; protocol?: string } | undefined): string {
-    return `${candidate?.candidateType ?? "unknown"}/${candidate?.protocol ?? "unknown"}`;
   }
 
   function selectedPair(stats: RTCStatsReport) {
@@ -1386,6 +1402,8 @@ export function createRemoteTeamPeer(
   }
 
   function createPeerConnection(state: PeerState, iceServers: RTCIceServer[], actions: ActionsRef): RTCPeerConnection {
+    if (typeof RTCPeerConnection !== "function")
+      throw referenced(sourceText("error.remote.webrtcBlocked"), "webrtc/unavailable");
     const connection = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
     state.connection = connection;
     state.iceRestarts = 0;
@@ -1408,6 +1426,14 @@ export function createRemoteTeamPeer(
     connection.ondatachannel = (event) => {
       const kind = channelKind(event.channel.label);
       if (kind) bindChannel(state, kind, event.channel, actions);
+    };
+    const candidateErrors = new Set<string>();
+    connection.onicecandidateerror = (event) => {
+      if (state.connection !== connection || state.closed || peer !== state) return;
+      const key = `${event.url} ${event.errorCode}`;
+      if (candidateErrors.has(key)) return;
+      candidateErrors.add(key);
+      diagnose(state, "ice-candidate-error", iceServerErrorDetail(event.url, event.errorCode, event.errorText));
     };
     connection.onicegatheringstatechange = () => {
       if (state.connection !== connection || state.closed || peer !== state) return;
@@ -1601,7 +1627,9 @@ export function createRemoteTeamPeer(
                     channelSeenSubtasks: true,
                     channelTaskWaits: true,
                     mcpManyServers: true,
+                    providerManyAccounts: true,
                     routineResultsWhatsApp: true,
+                    storageWorkflowFiles: true,
                   }),
                 )
               : yield* peerDecode(() =>
@@ -1750,7 +1778,11 @@ export function createRemoteTeamPeer(
       const releaseDownload =
         largeDownload === undefined
           ? null
-          : downloads.allow(Math.min(largeDownload.maxBytes, TEAM_PROTOCOL_V2_MAX_FILE_BYTES), largeDownload.mimeType);
+          : downloads.allow(
+              Math.min(largeDownload.maxBytes, TEAM_PROTOCOL_V2_MAX_FILE_BYTES),
+              largeDownload.mimeType,
+              downloadTarget(largeDownload.file),
+            );
       const stopDownloadWatch = download ? downloads.watch(download.size, download.onProgress) : null;
       return yield* Effect.gen(function* () {
         const bodyTransferId = upload ? yield* files.upload(upload, delivery?.queued) : null;
@@ -1761,7 +1793,12 @@ export function createRemoteTeamPeer(
           ? null
           : sideRoute
             ? yield* peerDecode(() =>
-                sideRoute.request(path, body, { channelIsolation: true, channelPicture: true, channelBrowser: true }),
+                sideRoute.request(path, body, {
+                  channelIsolation: true,
+                  channelPicture: true,
+                  channelBrowser: true,
+                  providerManyAccounts: true,
+                }),
               )
             : // A caller names a provider and model on agent creation only when the host advertises
               yield* peerDecode(() =>

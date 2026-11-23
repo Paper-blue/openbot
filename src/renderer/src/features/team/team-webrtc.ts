@@ -10,6 +10,7 @@ import {
 import { BROWSER_EGRESS_CHANNEL } from "@openbot/contracts/team-protocol/browser-egress-v1";
 import { TEAM_PROTOCOL_V2_CHANNELS } from "@openbot/contracts/team-protocol/v2";
 import { sourceText } from "@openbot/i18n/source";
+import { iceCandidateRoute } from "@openbot/team-client/ice-diagnostics";
 import { encodeTeamWebRtcPayload, TeamWebRtcPayloadDecoder } from "./team-webrtc-framing";
 import { isPrivateNetworkCandidate, privateNetworkSdp } from "./team-webrtc-private-network";
 
@@ -27,7 +28,8 @@ export interface BridgeCommand {
     | "open-egress"
     | "close-egress"
     | "send-egress"
-    | "close";
+    | "close"
+    | "ping";
   peerId: string;
   signalUrl?: string;
   token?: string;
@@ -47,6 +49,11 @@ interface MainBridgeMessage {
   channel?: "rpc" | "events" | "files" | "desktop";
   data?: string | ArrayBuffer;
   path?: "p2p" | "relay";
+  route?: string;
+  side?: "host" | "client";
+  url?: string;
+  errorCode?: number;
+  errorText?: string;
   code?: string;
   message?: string;
   terminal?: boolean;
@@ -59,6 +66,7 @@ interface MainBridgeMessage {
   localFingerprint?: string;
   remoteFingerprint?: string;
   iceServers?: RTCIceServer[];
+  retryInMs?: number;
 }
 
 interface PeerState {
@@ -102,6 +110,7 @@ const DISCONNECT_GRACE_MS = 15_000;
 const SIGNAL_READY_DEADLINE_MS = 30_000;
 const SIGNAL_PROBE_INTERVAL_MS = 4 * 60_000;
 const RELAYED_FRAME_DEADLINE_MS = 30_000;
+const SIGNAL_HOLD_SPREAD_MS = 5_000;
 
 const peers = new Map<string, PeerState>();
 let signalRetryAt = 0;
@@ -116,6 +125,9 @@ interface PreparedSignal {
 const PREPARED_SIGNAL_LIFETIME_MS = 30_000;
 const preparedSignals = new Map<string, PreparedSignal>();
 const dataChannelNames = ["rpc", "events", "files", "desktop"] as const;
+const DATA_CHANNEL_QUEUE_BYTES = 256 * 1024;
+const DATA_CHANNEL_LOW_BYTES = 64 * 1024;
+const EGRESS_QUEUE_BYTES = 4 * 1024 * 1024;
 const maximumIceRestarts = 10;
 let mainPort: MessagePort;
 
@@ -215,7 +227,7 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       if (channel?.readyState !== "open" || data === undefined)
         throw new Error(sourceText("error.remote.channelNotOpen"));
       const sent = state.egressChain.then(async () => {
-        await waitForWritableChannel(channel);
+        await waitForWritableChannel(channel, EGRESS_QUEUE_BYTES);
         if (channel.readyState !== "open") throw new Error(sourceText("error.remote.channelNotOpen"));
         if (isString(data)) channel.send(data);
         else channel.send(data);
@@ -435,7 +447,11 @@ async function handleSignal(state: PeerState, message: SignalServerMessage): Pro
       client &&
         (state.restartIceOnReady ||
           client.connectionState !== "connected" ||
-          (turnRefresh && (await selectedPath(client).catch(() => "relay")) === "relay")),
+          (turnRefresh &&
+            (await selectedPath(client).then(
+              ({ path }) => path,
+              () => "relay",
+            )) === "relay")),
     );
     state.restartIceOnReady = false;
     state.resumeToken = message.resumeToken;
@@ -631,6 +647,21 @@ function createPeerConnection(state: PeerState, iceServers: RTCIceServer[]): RTC
       sdpMLineIndex: event.candidate.sdpMLineIndex,
     });
   };
+  const candidateErrors = new Set<string>();
+  connection.onicecandidateerror = (event) => {
+    if (state.peerConnection !== connection) return;
+    const key = `${event.url} ${event.errorCode}`;
+    if (candidateErrors.has(key)) return;
+    candidateErrors.add(key);
+    post({
+      type: "ice-candidate-error",
+      peerId: state.id,
+      side: state.role,
+      url: event.url,
+      errorCode: event.errorCode,
+      errorText: event.errorText,
+    });
+  };
   connection.ondatachannel = (event) => {
     if (event.channel.label === BROWSER_EGRESS_CHANNEL && state.role === "host") {
       bindEgressChannel(state, event.channel);
@@ -679,7 +710,7 @@ function bindDataChannel(
   channel: RTCDataChannel,
 ): void {
   channel.binaryType = "arraybuffer";
-  channel.bufferedAmountLowThreshold = 1024 * 1024;
+  channel.bufferedAmountLowThreshold = DATA_CHANNEL_LOW_BYTES;
   state.channels[kind] = channel;
   state.payloadDecoders[kind]?.reset();
   const decoder = new TeamWebRtcPayloadDecoder();
@@ -768,14 +799,17 @@ async function sendChannelPayload(
 ): Promise<void> {
   const maximumMessageSize = state.peerConnection?.sctp?.maxMessageSize ?? Number.POSITIVE_INFINITY;
   for (const frame of encodeTeamWebRtcPayload(data, maximumMessageSize)) {
-    await waitForWritableChannel(channel);
+    await waitForWritableChannel(channel, DATA_CHANNEL_QUEUE_BYTES);
     if (isString(frame)) channel.send(frame);
     else channel.send(frame);
   }
 }
 
-function waitForWritableChannel(channel: RTCDataChannel): Promise<void> {
-  if (channel.bufferedAmount <= 4 * 1024 * 1024) return Promise.resolve();
+async function waitForWritableChannel(channel: RTCDataChannel, queueBytes: number): Promise<void> {
+  while (channel.bufferedAmount > queueBytes) await waitForLowBuffer(channel);
+}
+
+function waitForLowBuffer(channel: RTCDataChannel): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
     const timer = window.setTimeout(() => {
@@ -895,10 +929,10 @@ function requiredDescriptionSdp(description: RTCSessionDescriptionInit): string 
 }
 
 async function reportSelectedPath(state: PeerState, connection: RTCPeerConnection): Promise<void> {
-  post({ type: "ice-path", peerId: state.id, path: await selectedPath(connection) });
+  post({ type: "ice-path", peerId: state.id, side: state.role, ...(await selectedPath(connection)) });
 }
 
-async function selectedPath(connection: RTCPeerConnection): Promise<"relay" | "p2p"> {
+async function selectedPath(connection: RTCPeerConnection): Promise<{ path: "relay" | "p2p"; route: string }> {
   const stats = await connection.getStats();
   const transport = [...stats.values()].find((report) => report.type === "transport" && report.selectedCandidatePairId);
   const selectedPair = transport ? stats.get(transport.selectedCandidatePairId) : null;
@@ -910,7 +944,10 @@ async function selectedPath(connection: RTCPeerConnection): Promise<"relay" | "p
     [...stats.values()].find((report) => report.type === "candidate-pair" && report.state === "succeeded");
   const local = pair ? stats.get(pair.localCandidateId) : null;
   const remote = pair ? stats.get(pair.remoteCandidateId) : null;
-  return local?.candidateType === "relay" || remote?.candidateType === "relay" ? "relay" : "p2p";
+  return {
+    path: local?.candidateType === "relay" || remote?.candidateType === "relay" ? "relay" : "p2p",
+    route: iceCandidateRoute(local, remote),
+  };
 }
 
 function sendSignal(state: PeerState, message: SignalClientMessage): void {
@@ -934,10 +971,12 @@ function replaceSignal(state: PeerState): void {
 function scheduleSignalReconnect(state: PeerState): void {
   if (state.reconnectTimer !== null) return;
   const attempt = state.reconnectAttempt++;
+  const holdMs = signalRetryAt - Date.now();
   const delay = Math.max(
-    signalRetryAt - Date.now(),
+    holdMs > 0 ? holdMs + Math.random() * SIGNAL_HOLD_SPREAD_MS : 0,
     attempt === 0 ? 500 + Math.random() * 3_500 : Math.min(30_000, 500 * 2 ** attempt) * (0.5 + Math.random() / 2),
   );
+  if (holdMs > 0) post({ type: "signal-held", peerId: state.id, retryInMs: Math.ceil(delay) });
   state.reconnectTimer = window.setTimeout(() => {
     state.reconnectTimer = null;
     connectSignal(state);

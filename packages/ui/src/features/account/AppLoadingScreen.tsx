@@ -106,7 +106,7 @@ export interface AppLoadingScreenProps {
   ready?: boolean | undefined;
   onExited?: (() => void) | undefined;
   onMountViews?: (() => void) | undefined;
-  scene?: "pile" | "thinking";
+  scene?: "pile" | "thinking" | "quiet";
   seed?: number;
   label?: string;
   title?: string;
@@ -117,10 +117,8 @@ export interface AppLoadingScreenProps {
 export function AppLoadingScreen(props: AppLoadingScreenProps) {
   const { t } = useText();
   const reducedMotion = prefersReducedMotion() || documentStillFaces();
-  // A screen that names no scene shows the calm one: the lilac plush and the status lines. The pile
-  // fills the window with dozens of plushes, which is a problem for a user with trypophobia, and
-  // nothing in the app can turn it off. A caller that wants the pile asks for it by name.
-  const pileScene = untrack(() => props.scene === "pile");
+  const scene = untrack(() => props.scene ?? "thinking");
+  const pileScene = scene === "pile";
   const seat = pileScene
     ? takeSeat(
         untrack(() => props.seed),
@@ -227,7 +225,7 @@ export function AppLoadingScreen(props: AppLoadingScreenProps) {
       }}
       class="app-loading"
       style={{ "--app-loading-at": `${enterAt}s`, "--app-loading-exit-delay": `${fadeDelay()}ms` }}
-      data-scene={pileScene ? "pile" : "thinking"}
+      data-scene={scene}
       data-phase={phase()}
       role="status"
       aria-live="polite"
