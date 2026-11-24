@@ -16,6 +16,7 @@ import type {
   CustomAgentUsage,
   CustomProviderHarness,
   CustomProviderRestart,
+  McpServerConfig,
   ProviderAccountCodeLoginStatus,
   ProviderAccountPool,
   ProviderAccountStatus,
@@ -50,6 +51,7 @@ import {
   AgentProcessExitError,
   type AgentProvider,
   reportsMissingProcessorFeature,
+  unsupportedKernelReason,
 } from "./../agent-client";
 import { AppServerError, CodexAppServerClient } from "./../app-server-client";
 import {
@@ -102,6 +104,7 @@ import { captureBrowser, signInPageByOpenBot } from "./browser-capture";
 import { CliCodeLoginFailed, type CliCodePrompt, PROMPT_TIMEOUT_MS, startCliCodeLogin } from "./cli-code-login";
 import { CliLoginFailed, CliLoginFlow, toCliLoginFailed } from "./cli-login-flow";
 import { CodexLoginFlow, toCodexLoginFailed } from "./codex-login";
+import { readCodexRoutesToOpenai } from "./codex-model-source";
 import type { ConversationRuntime } from "./conversation-runtime";
 import type { FailureContext } from "./failure-signal";
 import { ModelCatalog } from "./model-catalog";
@@ -187,6 +190,8 @@ function userMustFixStart(reason: string | null | undefined): reason is string {
   return (
     reason === sourceText("error.provider.realtimeLimitZero") ||
     reason === sourceText("error.provider.cpuUnsupported") ||
+    reason === sourceText("error.provider.largeMemoryPages") ||
+    reason === sourceText("error.provider.ipv6Missing") ||
     reason === sourceText("error.provider.geminiSettingsUnreadable") ||
     reason === sourceText("error.provider.geminiAccountSettingsUnreadable") ||
     reason === sourceText("error.provider.grokDefaultModelNotAllowed")
@@ -343,6 +348,7 @@ export class ProviderRuntime implements ProviderPort {
   readonly #mcpHandoff: McpHandoffLog;
   readonly #redactMcp: (text: string) => string;
   readonly #reportMcpSignIn: ((provider: AgentProvider, server: string, signInText: string) => void) | null;
+  readonly #recordMcpStartFailure: ((config: McpServerConfig) => void) | null;
   readonly #configRevisions = new WeakMap<AgentClient, number>();
   readonly #cli = new Map<AgentProvider, AgentCliInfo>();
   readonly #cliSources = new Map<AgentProvider, Pick<AgentCliInfo, "source" | "incomplete">>();
@@ -378,6 +384,7 @@ export class ProviderRuntime implements ProviderPort {
   readonly #resetCredits = new WeakMap<AgentClient, number | null>();
   readonly #ownResetCredits = new Map<AgentProvider, number | null>();
   readonly #creditsAvailable = new WeakMap<AgentClient, boolean>();
+  readonly #codexRoutesToOpenai = new WeakMap<AgentClient, boolean>();
   readonly #usageUnreported = new Set<AgentProvider>();
   readonly #usageReadFailed = new Set<AgentProvider>();
   readonly #usageForgets = new Map<AgentProvider, number>();
@@ -438,6 +445,7 @@ export class ProviderRuntime implements ProviderPort {
     mcpHandoff?: McpHandoffLog;
     redactMcp: (text: string) => string;
     reportMcpSignIn?: (provider: AgentProvider, server: string, signInText: string) => void;
+    recordMcpStartFailure?: (config: McpServerConfig) => void;
     accounts?: ProviderAccountStore;
   }) {
     this.#off = new Set(options.offProviders);
@@ -458,6 +466,7 @@ export class ProviderRuntime implements ProviderPort {
     this.#mcpHandoff = options.mcpHandoff ?? new McpHandoffLog();
     this.#redactMcp = options.redactMcp;
     this.#reportMcpSignIn = options.reportMcpSignIn ?? null;
+    this.#recordMcpStartFailure = options.recordMcpStartFailure ?? null;
     this.#codexLogin = new CodexLoginFlow({
       bundledExecutable: () => this.#bundledExecutables.codex,
       installedChosen: () => this.#installedChosen.has("codex") || this.#installedFallback.has("codex"),
@@ -2473,8 +2482,11 @@ export class ProviderRuntime implements ProviderPort {
             );
         }).pipe(
           Effect.mapError((error) => {
-            if (previousExecutable === undefined) delete this.#bundledExecutables[provider];
-            else this.#bundledExecutables[provider] = previousExecutable;
+            const installedIsOnlyCopy = installed && firstInstall;
+            if (!installedIsOnlyCopy) {
+              if (previousExecutable === undefined) delete this.#bundledExecutables[provider];
+              else this.#bundledExecutables[provider] = previousExecutable;
+            }
             const cause = error.cause;
             const failure = new Error(
               sourceText("error.provider.cliUpdateFailed", {
@@ -2577,6 +2589,18 @@ export class ProviderRuntime implements ProviderPort {
     if (!this.#clients.has(provider)) return false;
     const own = this.#ownProcessFor(agent);
     return own === null || this.#confined.get(agent.id)?.key === this.#confinedKey(provider, own);
+  }
+
+  runningAgentClient(agent: AgentSummary): AgentClient | null {
+    if (!this.agentClientRunning(agent)) return null;
+    const provider = providerForAgent(agent);
+    return this.#ownProcessFor(agent)
+      ? (this.#confined.get(agent.id)?.client ?? null)
+      : (this.#clients.get(provider) ?? null);
+  }
+
+  reloadPending(provider: AgentProvider): boolean {
+    return this.#environmentReloadPending.has(provider);
   }
 
   readonly ensureAgentClient = Effect.fn("ProviderRuntime.ensureAgentClient")(function* (
@@ -2904,7 +2928,7 @@ export class ProviderRuntime implements ProviderPort {
 
   applyPushedUsage(source: AgentClient, params: unknown): void {
     const provider = source.provider;
-    if (this.#clients.get(provider) !== source) return;
+    if (this.#clients.get(provider) !== source || this.#codexRoutesToOpenai.get(source) === false) return;
     const pushed = pushedUsageLimit(provider, params);
     if (!pushed) return;
     const kept = this.#lastUsage.get(provider);
@@ -3148,6 +3172,8 @@ export class ProviderRuntime implements ProviderPort {
       return new AgentProcessExitError(sourceText("error.provider.realtimeLimitZero"), null, { cause: detailed });
     if (reportsMissingProcessorFeature(detailed.message, ILLEGAL_INSTRUCTION.test(error.message)))
       return new AgentProcessExitError(sourceText("error.provider.cpuUnsupported"), null, { cause: detailed });
+    const kernel = unsupportedKernelReason(detailed.message);
+    if (kernel) return new AgentProcessExitError(sourceText(kernel), null, { cause: detailed });
     return detailed;
   }
 
@@ -4048,7 +4074,8 @@ export class ProviderRuntime implements ProviderPort {
       client.provider === "codex" ? `openbot_${providerMcpServerName(config?.name ?? "")}` : config?.name;
     if (config?.id === GITHUB_CONNECTOR_MCP_SERVER_ID && key === githubKey)
       this.#reportGitHubToolsFailure(client.provider);
-    if (!server) return;
+    if (!config || !server) return;
+    this.#recordMcpStartFailure?.(config);
     const signIn = getString(params, "failureReason") === "reauthenticationRequired" || isMcpSignInDiagnostic(message);
     this.#reportMcpServerFailure(client.provider, server, message, signIn);
   }
@@ -4482,6 +4509,14 @@ export class ProviderRuntime implements ProviderPort {
     model?: string,
     emit = true,
   ) {
+    if (client.provider === "codex" && !(yield* this.#readCodexRoute(client))) {
+      if (this.#clients.get(client.provider) === client) {
+        this.#lastUsage.delete(client.provider);
+        this.#ownResetCredits.delete(client.provider);
+        this.#usageUnreported.add(client.provider);
+      }
+      return { limits: [] } satisfies AccountUsage;
+    }
     const rateLimits = yield* client
       .request(
         "account/rateLimits/read",
@@ -4506,6 +4541,18 @@ export class ProviderRuntime implements ProviderPort {
     if (emit) this.#emit({ type: "usage-changed", usage: structuredClone(usage) });
     return structuredClone(usage);
   });
+
+  #readCodexRoute(client: AgentClient) {
+    return readCodexRoutesToOpenai(client, providerCheckTimeoutMs(5_000)).pipe(
+      Effect.tap((routesToOpenai) => Effect.sync(() => this.#codexRoutesToOpenai.set(client, routesToOpenai))),
+      Effect.catch(() =>
+        Effect.sync(() => {
+          logger.warn("Codex did not give its model route. OpenBot reads the ChatGPT usage.");
+          return this.#codexRoutesToOpenai.get(client) ?? true;
+        }),
+      ),
+    );
+  }
 
   #setStatus(patch: Partial<AgentStatus>): void {
     const available: AgentProvider[] = [];

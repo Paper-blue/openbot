@@ -265,6 +265,20 @@ when the host advertises it, the user turned on GPT live voice in Settings → V
 has WebRTC (`react-native-webrtc`); otherwise the phone's own voice conversation runs. The phone sends
 a voice name only when it is one of the contract. The web client does not use it yet.
 
+### Dictation for a member
+
+`voice-transcription-v1` (`team-protocol/voice-transcription-v1.ts`) lets any member have the host turn
+a short recording into text. `POST /v1/voice/transcribe` takes the raw body (over WebRTC, a file upload):
+a WAV file of 16 kHz mono 16-bit PCM, at most `VOICE_AUDIO_LIMITS.maximumWavBytes` (120 seconds). The
+host answers `{ text }`; the text goes to no agent. The host uses its own speech recognition, as a video
+transcription does (`application-services.ts`): its voice server when it dictates, else the model of
+Settings → Voice when it is ready (a model on the host, or Groq with the host's key). When that model is
+a local model that is not on the host, the request starts its download and answers 409
+`error.voice.host.preparing`; any other missing recognizer is 409 `error.voice.host.notSetUp`. A WAV that
+is not valid is 400, and a longer one is 413. The host advertises the capability to protocol 10 clients
+only. The browser extension uses it for the mic of its composer; the desktop on a joined server
+transcribes on its own computer, and the web client and the phone do not use it yet.
+
 ### Agent import from a joined server
 
 `agent-import-v1` lets any member, not only an owner or admin, import a Grok Bot export into the host.
@@ -1110,6 +1124,7 @@ host advertises a capability only when its `TeamApiAdmin` member exists.
 | `host-admin-v1` | Server name and logo | `hostAdmin` |
 | `host-update-v1` | Check for, download and restart into an app update; cancel a restart that waits | `hostAdmin` |
 | `host-timezone-v1` | Read and set the server timezone | `hostAdmin` |
+| `host-signal-home-v1` | Read (any member) the Signal servers of the host with the latency that the host measures, and choose (owner or admin) one or automatic. Protocol 10 only | `hostAdmin` |
 | `host-voice-model-v1` | Read the speech recognition model of the host and its downloads, and select, download, stop or remove a model. Owner or admin. Only a server in server mode, a hosted server or a server on a computer advertises it: the desktop app of a person keeps the model in its own Settings > Voice. Protocol 10 only | `hostAdmin` |
 | `host-turn-limits-v1` | Read and set the turns at the same time on the host (1 to 128, unlimited, or automatic) and the default task limit of an agent (1 to 64). Owner or admin. Protocol 9 only | `hostAdmin` |
 | `host-personality-v1` | Read (any member) and set (owner or admin) the response style of the agents | `hostAdmin` |
@@ -1194,6 +1209,26 @@ downloads can be selected; a cloud model gets 400. The download route answers wh
 of the download arrives, and the download continues on the host; a client reads the route again each
 second while a model downloads. The desktop and web clients show it in Server settings > Agent
 defaults for a joined server; mobile shows it in Server settings > Agents.
+
+`host-signal-home-v1` gives the Signal server (Signal home) of the host to an owner or an admin
+(`HostSignalHomeService`, `src/main/host-signal-home.ts`). The host asks the account service for the
+homes (`POST /v2/remote/hosts/:hostId/signal-homes`, machine token) and measures the latency of each
+one: one `GET /health/ready` to open the connection, then the median of three more. A home that does
+not answer in 3 seconds has no latency. The host uses a measurement again for 60 seconds, because any
+member can read the list. The choice is in `openbot-signal-home-v1.json` (`null` is
+automatic) and does not go with an instance transfer, because the latency belongs to the computer.
+Each host ticket that asks for a home sends it as `preferredSignalHome`. The account service gives
+the chosen home when it answers, and the automatic home when it fails or does not answer. A change
+asks for a new ticket one second after the answer, so the answer reaches a remote admin first; when
+the URL changes, the host moves to the new Signal and its members connect again. While the host is on another home than the chosen one, it checks every 15 minutes that the
+chosen home answers from its own network, and only then asks again, so it goes back when the chosen
+home answers. When a move fails after the host left its old Signal, the host asks for another home
+with the failed URL, as after a Signal failure. A change made while a Signal recovery runs waits
+for the recovery to end. The desktop app shows the row in Server settings > General
+only while the host is published and the account service lists two or more homes; the web client
+shows it for a joined server. Mobile shows a Signal server row in Server settings to each member when the
+host lists two or more homes, with the colored latency of the home in use (green under 100 ms, yellow
+under 200 ms, red above or with no answer). Only an owner or an admin can open the list and choose. Safe mode reads the saved choice and sends it too.
 
 `host-timezone-v1` reads and sets the server timezone (`openbot-server-timezone-v1.json`; `null` is
 automatic, the system zone of the host). When an agent creates a routine, the zone comes from the tool

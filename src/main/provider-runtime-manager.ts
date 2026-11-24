@@ -45,7 +45,7 @@ import { createOpenBotLogger, type LogValue, redactText, toLogValue } from "@ope
 import { Deferred, Effect, Exit, Fiber, Result, Scope, Stream } from "effect";
 import lockValue from "../../native-runtime.lock.json";
 import { type AgentRuntimeLock, parseAgentRuntimeLock } from "../../scripts/agent-runtime-lock";
-import { reportsMissingProcessorFeature } from "../backend/agent-client";
+import { reportsMissingProcessorFeature, unsupportedKernelReason } from "../backend/agent-client";
 import {
   type BundledProviderExecutables,
   compareReleases,
@@ -939,8 +939,12 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
         }),
       );
       if (Result.isFailure(result)) {
-        if (installed && !this.#stopping)
-          yield* runtimeIO(() => rm(this.#installRoot(spec), { recursive: true, force: true }));
+        if (installed && !this.#stopping) {
+          const installRoot = this.#installRoot(spec);
+          if (signal.aborted || (yield* this.#workingBackupEffect(dirname(installRoot), spec, spec.version)))
+            yield* runtimeIO(() => rm(installRoot, { recursive: true, force: true }));
+          else yield* this.#removeRuntimePartialsEffect(spec.runtime, spec.target);
+        }
         return yield* result.failure;
       }
       if (download) yield* this.#removeRuntimePartialsEffect(spec.runtime, spec.target);
@@ -1500,10 +1504,13 @@ function unsupportedProcessorFailure(
     isManagedToolRuntime(runtime) ||
     !(cause instanceof Error) ||
     !("stderr" in cause) ||
-    typeof cause.stderr !== "string" ||
-    !reportsMissingProcessorFeature(cause.stderr, "signal" in cause && cause.signal === "SIGILL")
+    typeof cause.stderr !== "string"
   )
     return failure;
+  const kernel = unsupportedKernelReason(cause.stderr);
+  if (kernel) return new ProviderRuntimeFailure({ cause: new Error(sourceText(kernel), { cause }) });
+  const illegalInstruction = "signal" in cause && cause.signal === "SIGILL";
+  if (!illegalInstruction && !reportsMissingProcessorFeature(cause.stderr, false)) return failure;
   return new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.cpuUnsupported"), { cause }) });
 }
 

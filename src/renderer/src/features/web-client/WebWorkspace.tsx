@@ -24,6 +24,7 @@ import {
   decodeAgentNewChatSettings,
   decodeAgentPlanCardSettings,
   decodeAgentSpeedSettings,
+  decodeHostSignalHomeSettings,
   decodeHostTurnLimits,
   decodeHostVoiceModel,
   LEGACY_RESPONSE_STYLE,
@@ -74,6 +75,7 @@ import { DISCORD_ACCESS_CAPABILITY } from "@openbot/contracts/team-protocol/disc
 import { EVENTS_CAPABILITY } from "@openbot/contracts/team-protocol/events-v1";
 import { HOST_PERSONALITY_CAPABILITY } from "@openbot/contracts/team-protocol/host-personality-v1";
 import { HOST_RELEASE_CAPABILITY } from "@openbot/contracts/team-protocol/host-release-v1";
+import { HOST_SIGNAL_HOME_ROUTES } from "@openbot/contracts/team-protocol/host-signal-home-v1";
 import { HOST_TURN_LIMITS_ROUTES } from "@openbot/contracts/team-protocol/host-turn-limits-v1";
 import { HOST_VOICE_MODEL_ROUTES } from "@openbot/contracts/team-protocol/host-voice-model-v1";
 import { HOSTED_SITES_CAPABILITY } from "@openbot/contracts/team-protocol/hosted-sites-v1";
@@ -212,6 +214,7 @@ import { queuedDeliveriesInOrder } from "../../queue-reconciliation";
 import { backgroundWorkKey } from "../conversation/background-work-key";
 import "katex/contrib/copy-tex";
 import "../../selection-copy";
+import type { CreationPreference } from "@openbot/ui/features/agents/agent-creation-model";
 import { actionToast } from "../../action-toast";
 import { desktopAnalytics } from "../../analytics";
 import { collectThreadMessageMatches, formatMessageTime, toAgentMessage } from "../../app-message-projection";
@@ -242,7 +245,6 @@ import {
 import { createUsageRefreshPoll } from "../account/usage-refresh-poll";
 import { conversationThreads } from "../agent-threads/conversation-threads";
 import { sidebarAgentThreads } from "../agent-threads/sidebar-agent-threads";
-import type { CreationPreference } from "../agents/agent-creation-model";
 import {
   agentErrorDetails,
   claimErrorToast,
@@ -300,6 +302,7 @@ import type { OwnerTransferCalls } from "../servers/ServerOwnerTransferSection";
 import { ServerPlanReminder } from "../servers/ServerPlanReminder";
 import type { HostAgentAccessCalls } from "../servers/ServerRolesSection";
 import type { ServerHostedSitesOptions, ServerSettingsSection } from "../servers/ServerSettingsModal";
+import type { HostSignalHomeCalls } from "../servers/ServerSignalHomeSetting";
 import type { HostSkillLearningCalls } from "../servers/ServerSkillLearningSetting";
 import type { HostTimezoneCalls } from "../servers/ServerTimezoneSetting";
 import type { HostTurnLimitsCalls } from "../servers/ServerTurnLimitsSetting";
@@ -1685,6 +1688,12 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
       hostRequest(serverId)("POST", HOST_VOICE_MODEL_ROUTES.settings, decodeHostVoiceModel, {}),
     changeVoiceModel: async ({ action, modelId }, serverId) =>
       hostRequest(serverId)("POST", HOST_VOICE_MODEL_ROUTES.change, decodeHostVoiceModel, { action, modelId }),
+  };
+  const hostSignalHomeCalls: HostSignalHomeCalls = {
+    getSignalHome: async (serverId) =>
+      hostRequest(serverId)("POST", HOST_SIGNAL_HOME_ROUTES.settings, decodeHostSignalHomeSettings, {}),
+    setSignalHome: async (home, serverId) =>
+      hostRequest(serverId)("POST", HOST_SIGNAL_HOME_ROUTES.update, decodeHostSignalHomeSettings, { home }),
   };
   const hostTurnLimitsCalls: HostTurnLimitsCalls = {
     getTurnLimits: async (serverId) =>
@@ -3531,6 +3540,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                         hostUpdate={{ calls: hostUpdateCalls }}
                         hostTimezone={{ calls: hostTimezoneCalls }}
                         hostVoiceModel={{ calls: hostVoiceModelCalls }}
+                        hostSignalHome={{ calls: hostSignalHomeCalls }}
                         hostTurnLimits={{ calls: hostTurnLimitsCalls }}
                         hostPersonality={{ calls: hostPersonalityCalls }}
                         hostMemoryLimit={{ calls: hostMemoryLimitCalls }}
