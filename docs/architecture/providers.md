@@ -335,6 +335,10 @@ OpenBot unloads a session that has no turn, keeps its identity, and resumes it a
   the session's process (`AcpThread.workHold`, #9551). No idle release closes it, and the provider
   process stays, until the session does not change for 30 minutes, or for 4 hours at most. When memory
   is low, `releaseQuietBackgroundThreads` closes a held session that did not change for 10 minutes.
+  When Antigravity loads a session again, it can tell the agent that a server restart stopped its
+  subagents and background tasks, also when nothing ran (#15853). So when OpenBot stops a session
+  with no turn and no held work, the next prompt to that session starts with a note
+  (`SESSION_RELOAD_NOTE`): no server restarted, and the agent's teammates and OpenBot tasks still run.
 - One Codex app server holds every thread of its account, and stops the MCP servers of a thread only
   when it unloads that thread. `CodexIdleSessions` (`src/backend/agent/codex-idle-sessions.ts`)
   releases an agent session 5 minutes after its last turn ends. When a turn ends, it releases at once
@@ -632,8 +636,9 @@ a delivery on its way to one, which holds no turn id yet, or a context compactio
 `turn/started` `ContextCompaction.claimTurn` takes away from the agent - therefore makes the
 update wait, as a restart the user asked for waits, before anything is downloaded. Main shows the
 wait as a `downloading` runtime with no progress and the message `status.provider.updateWaiting`;
-its Cancel aborts the wait. New turns of the provider wait for the update from the start of the
-wait, so a busy provider still gets a moment without turns. No turn may start on that provider until the new client is ready: the drain
+its Cancel aborts the wait. The wait does not hold new turns, so one long turn does not stop the
+other agents of the provider; the update runs at the first moment with no turn. The check that finds
+that moment also starts the hold, in one step. No turn may start on that provider until the new client is ready: the drain
 scheduler skips an agent whose provider reports `isReplacingCli`, before it can reschedule the
 delivery, and `onProviderResumed` schedules the held deliveries when the replacement ends, after a
 failure as well as after a success.
@@ -1124,8 +1129,13 @@ a desktop keyring keeps its sign-in in the Secret Service (service `cursor-crede
 reader runs `secret-tool search`, not `lookup`, so a locked keyring gives no reading and no unlock
 prompt at each poll. It keeps a token until the CLI rewrites `auth.json`, which the CLI does after
 each keyring write, and a read with no token (locked keyring, no session bus, no `secret-tool`) for 30
-minutes. Windows 2026.11.22 keeps its
-sign-in in `auth.dpapi`, which the reader does not read. Cursor does not document
+minutes. A Windows CLI from 2026.11.22 leaves the same marker and keeps its sign-in in `auth.dpapi`
+next to `auth.json`: `{"version":1,"dpapi":"<base64>"}`, encrypted with DPAPI for the current user.
+With that marker the reader decrypts the blob with `ProtectedData.Unprotect` in the system Windows
+PowerShell, as the CLI does, and sends the blob on standard input. It keeps the result by the
+modification time of `auth.dpapi`, with the same 30 minute reuse for a read with no token. The CLI
+uses the Windows Credential Manager only when `CURSOR_CLI_WINDOWS_CREDENTIAL_MANAGER=1`; the reader
+does not read it. Cursor does not document
 this API. `autoPercentUsed` (Cursor's own models) fills the primary window and `apiPercentUsed`
 (all other models) the secondary one, both for the billing cycle; the dock names them by slot for a
 `cursor` row, because both windows have the same length. The total of that split plan

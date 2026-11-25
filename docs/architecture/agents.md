@@ -1109,8 +1109,21 @@ a second `session/prompt` (`AcpFlavor.steerByPromptSince` for Antigravity 1.5.0 
 `steerByPromptCapability` for a Devin CLI that reports `cognition.ai/midTurnPrompts`, because Devin
 reports the version "0.0.0-dev"). While an approval or a question is open, the message waits in the
 queue, because a new prompt would close it. Devin answers each prompt of the run with the same usage,
-so `AcpFlavor.promptRun` reports it once. `scripts/antigravity-steer-e2e.ts` and
+so `AcpFlavor.promptRun` reports it once. A steer that comes before the first update of the running
+prompt waits for that update, or for the turn end or a stop, up to `ACP_STEER_FIRST_UPDATE_WAIT_MS`
+(10 s). A teammate message and a channel post wait for the steer result, so the limit is short. After
+the limit, the message waits in the queue. Before, it failed at once and the message waited for the end
+of the whole turn. `scripts/antigravity-steer-e2e.ts` and
 `scripts/devin-steer-e2e.ts` check these paths.
+
+A message that comes while a turn starts, before the provider gave the turn id, cannot steer yet and
+stays in the queue. When the mode is "steer" and a delivery of the same lane is starting,
+`AgentService` keeps its delivery id (`#steersAfterTurnStart`) and steers it at `turn-started` of the
+same thread if it is still queued. Before, it ran only after the whole turn. A message to an idle
+agent with a held queue is not kept, so it does not join the next turn. A Stop of a chat or task turn
+that fails or that does not stop the turn records the turn in `#failedStops`. The steers that follow
+then join the running turn. The stop mark stays, so a late interrupted end still counts as a stop.
+`scripts/steer-before-turn-id-e2e.ts` checks both.
 
 A custom agent (`acp`) uses the same extension (#4977). Its descriptor has `steer: "reported"`: each
 agent process reports at `initialize` whether it steers, so the provider alone does not tell.
@@ -1155,11 +1168,16 @@ starts a new turn with the steer. The aborted result does not list the steer's u
 (`untakenSteerIds`), so the client closes the open tool calls, aborts its open host tool calls
 (`hostToolCalls`, so the host removes their approval cards), and keeps the OpenBot turn open. The
 result of the steer's turn completes it. A stop from the person (`stopRequested`) still ends the turn
-as interrupted. While a question, an elicitation or a write approval waits for the person
-(`personRequests`), the steer has no priority: the open card stays the one that Claude waits for, and
-the steer arrives after the answer. A shell command that runs one script cannot change its plan: the
-steer reaches the model when the script is done. `scripts/claude-steer-now-e2e.ts` checks the turn
-with a stand-in CLI, `scripts/question-steer-order-e2e.ts` checks the order during a question, and
+as interrupted. While a question, an elicitation, a write approval, or a browser sign-in or secret card
+(`request_takeover`, `submit_secret`) waits for the person (`personRequests`), the steer has no
+priority: the open card stays the one that Claude waits for, and the steer arrives after the answer.
+Before, a message during a sign-in card stopped the call and cancelled the card (#15776). A message
+from another agent or a routine that the busy-message mode steers has no priority either
+(`waitsForRunningTools`, #15730): it waits until the running tool call ends, and does not stop the
+tools or subagents. A message that the person sends or steers from the queue still stops them. A shell
+command that runs one script cannot change its plan: the steer reaches the model when the script is
+done. `scripts/claude-steer-now-e2e.ts` checks the turn with a stand-in CLI, and with
+`--held=takeover` it checks that a sign-in card stays open, `scripts/question-steer-order-e2e.ts` checks the order during a question, and
 `scripts/steer-framing-bench.ts` measures the real CLIs.
 
 A message from another agent follows the recipient's busy-message mode, as a message from the person

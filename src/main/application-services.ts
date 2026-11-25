@@ -1,4 +1,6 @@
+import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import { homedir, hostname, tmpdir } from "node:os";
@@ -1368,6 +1370,7 @@ export async function createApplicationServices({
   };
   const browser = new BrowserHost(mainWindow, store.downloadsRoot, join(app.getPath("userData"), BROWSER_STATE_FILE), {
     memoryLow: () => (hostMemory?.level() ?? "ok") !== "ok",
+    memoryCritical: () => hostMemory?.level() === "critical",
     ...(hostMemory ? { tabLimit: () => hostMemory.browserTabLimit() } : {}),
     browserProfile: (agentId) => {
       const agent = store.get(agentId);
@@ -2013,6 +2016,7 @@ export async function createApplicationServices({
   const workflowRuns = new WorkflowRunStore({ database: store.database });
   const userData = app.getPath("userData");
   const storageSources = {
+    libraryFiles: () => new Set(Object.keys(libraryFolders.getSnapshot().placement)),
     roots: {
       database: store.database.path,
       downloads: store.downloadsRoot,
@@ -2317,6 +2321,7 @@ export async function createApplicationServices({
     updateAgent: (input) => service.updateAgent(input),
     clearAgentContext: (agentId) => service.clearAgentContext(agentId),
   });
+  await Effect.runPromise(automation.removeStaleFiles());
   service.on("event", (event) => {
     if (event.type === "agents-changed") Effect.runFork(automation.requestSync());
   });
@@ -2360,6 +2365,7 @@ export async function createApplicationServices({
     download: (url, maxBytes) => downloadDiscordAttachment(url, maxBytes),
   });
   const workflowGitHub = workflowGitHubDirectory(() => githubConnector.workflowCatalog(), githubRest);
+  const workflowNotices = new EventEmitter<{ notice: [WorkflowNotice] }>();
   const workflowRuntime = await Effect.runPromise(
     createWorkflows({
       store: workflowStore,
@@ -2423,7 +2429,10 @@ export async function createApplicationServices({
           Effect.map((kept) => (typeof kept === "string" ? kept : kept.id)),
           Effect.ensuring(Effect.sync(() => storageUsage.invalidate())),
         ),
-      notify: forwardWorkflowNotice,
+      notify: (notice) => {
+        workflowNotices.emit("notice", notice);
+        forwardWorkflowNotice(notice);
+      },
       connectionOn: (connectionId) => service.messaging.store.connection(connectionId)?.enabled === true,
       post: (connectionId, placeId, markdown) => service.messaging.deliver(connectionId, placeId, markdown),
       channelPost: (input) => service.channels.postNote(input),
@@ -2705,12 +2714,17 @@ export async function createApplicationServices({
     githubSkillSource((url, init) => fetch(url, init)),
   );
   const marketplaceAgents = new AgentMarketplaceService(marketplaceAuth, service, skills);
-  const agentTemplates = new AgentTemplateService(centralAuth, service, {
-    listTemplateSkills: (agentId) => skills.listTemplateSkills(agentId),
-    installVersion: (input) => skills.installVersion(input),
-    library: () => skills.requireLocalLibrary(),
-    installLocal: (input) => skills.installLocal(input),
-  });
+  const agentTemplates = new AgentTemplateService(
+    centralAuth,
+    service,
+    {
+      listTemplateSkills: (agentId) => skills.listTemplateSkills(agentId),
+      installVersion: (input) => skills.installVersion(input),
+      library: () => skills.requireLocalLibrary(),
+      installLocal: (input) => skills.installLocal(input),
+    },
+    marketplaceAuth,
+  );
   const teamStore = new TeamStore(
     join(app.getPath("userData"), TEAM_STORE_FILE),
     join(app.getPath("userData"), LEGACY_TEAM_STORE_FILE),
@@ -3209,6 +3223,7 @@ export async function createApplicationServices({
     store: teamStore,
     agents: service,
     signInWaits: service.signInWaits,
+    workflowNotices,
     agentsReady: () => agentInitialization.awaitRoster(),
     events,
     skills,
@@ -3521,6 +3536,9 @@ export async function createApplicationServices({
     remoteDesktopStateDirectory: join(app.getPath("userData"), "remote-desktop-runtime"),
     getRemoteDesktopRuntimeCredentials: () => Effect.succeed(remoteDesktopRuntimeCredentials),
     remoteDesktopScreenLocked: () => powerMonitor.getSystemIdleState(1) === "locked",
+    wakeRemoteDesktopScreen: () => {
+      execFile("/usr/bin/caffeinate", ["-u", "-t", "5"], () => undefined).unref();
+    },
     getRemoteDesktopDisplays: () => {
       const primaryId = screen.getPrimaryDisplay().id;
       return screen.getAllDisplays().map((display, index) => ({
@@ -3731,6 +3749,7 @@ export async function createApplicationServices({
           }),
       },
       accountReady: centralAuthInitialization,
+      headlessHost: Boolean(hostedServer || serverModeEnvironment),
       ...(hostedServer || serverModeEnvironment || localServerChild
         ? {}
         : {
@@ -3772,6 +3791,7 @@ export async function createApplicationServices({
           centralAuth.updateRemoteMember(hostId, membershipId, role, reactivate),
         removeMember: (hostId, membershipId) => centralAuth.removeRemoteMember(hostId, membershipId),
         removeOwnedHost: (hostId) => centralAuth.removeOwnedRemoteHost(hostId),
+        setHostHidden: (hostId, hidden) => centralAuth.setRemoteHostHidden(hostId, hidden),
         getPrincipalId: () => centralAuth.getSignedInUser().id,
         controlPlaneUrl: centralAuth.resolveApiUrl("/"),
         downloadHostLogo: (hostId, version) => centralAuth.downloadRemoteHostLogo(hostId, version),
