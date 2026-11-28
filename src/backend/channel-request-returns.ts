@@ -35,6 +35,7 @@ export class ChannelRequestReturns {
   readonly #hooks: ChannelRequestReturnHooks;
   readonly #handled = new Set<string>();
   readonly #noted = new Set<string>();
+  readonly #sending = new Set<string>();
   #restored = false;
 
   constructor(channels: ChannelService, mailbox: MailboxStore, hooks: ChannelRequestReturnHooks) {
@@ -62,14 +63,26 @@ export class ChannelRequestReturns {
     if (!pending.length) return;
     const channel = this.#channels.store.get(channelId);
     const recent = this.#channels.store.messages(channelId, Number.MAX_SAFE_INTEGER, RECENT_MESSAGES);
-    for (const item of pending)
-      yield* this.#send(item, channelId, channel.name, channel.leadAgentId, recent).pipe(
-        Effect.catchCause((cause) =>
-          Cause.hasInterruptsOnly(cause)
-            ? Effect.failCause(cause)
-            : Effect.sync(() => this.#hooks.error(Cause.squash(cause))),
-        ),
-      );
+    for (const item of pending) {
+      yield* Effect.suspend(() => {
+        const { key, task } = item;
+        if (this.#handled.has(key) || this.#sending.has(task.id)) return Effect.void;
+        if (task.state === "paused" && this.#noted.has(task.id)) return Effect.void;
+        this.#sending.add(task.id);
+        return this.#send(item, channelId, channel.name, channel.leadAgentId, recent).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              this.#sending.delete(task.id);
+            }),
+          ),
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.failCause(cause)
+              : Effect.sync(() => this.#hooks.error(Cause.squash(cause))),
+          ),
+        );
+      });
+    }
   });
 
   #pending(channelId: string): PendingReturn[] {
@@ -80,9 +93,7 @@ export class ChannelRequestReturns {
       }
       const key = returnKey(task);
       if (this.#handled.has(key)) return [];
-      this.#handled.add(key);
       if (task.state === "paused" && this.#noted.has(task.id)) return [];
-      this.#noted.add(task.id);
       const routed = this.#channels.store.message(channelId, task.requestMessageId);
       if (routed && movedToOpenTask(task, routed)) return [];
       const request = this.#handoffRequest(channelId, task);
@@ -124,6 +135,8 @@ export class ChannelRequestReturns {
       expectsReply: false,
       idempotencyKey: key,
     });
+    this.#handled.add(key);
+    this.#noted.add(task.id);
     yield* this.#hooks.delivered(
       requesterId,
       receipt.deliveries.map((delivery) => delivery.id),

@@ -90,12 +90,20 @@ try {
   });
   channels = service;
   const openTasks = new Set<string>();
+  let failNextReturn = false;
+  const deliveryErrors: unknown[] = [];
+  const enqueue = mailbox.enqueue.bind(mailbox);
+  mailbox.enqueue = (input) => {
+    if (!failNextReturn || !input.idempotencyKey?.startsWith("channel-request-result:")) return enqueue(input);
+    failNextReturn = false;
+    return Effect.die(new Error("Simulated mailbox enqueue failure"));
+  };
   const returns = new ChannelRequestReturns(service, mailbox, {
     agentExists: (agentId) => agents.some((item) => item.id === agentId),
     taskOpen: (taskId) => openTasks.has(taskId),
     delivered: () => Effect.void,
     error: (error) => {
-      throw error;
+      deliveryErrors.push(error);
     },
   });
   const channelId = randomUUID();
@@ -158,6 +166,12 @@ try {
         },
       ],
     });
+    if (name === "writer does the lead's request") {
+      failNextReturn = true;
+      await Effect.runPromise(returns.reconcile(channelId));
+      assert.equal(returnsTo(requester.id).length, before);
+      assert.equal(deliveryErrors.length, 1);
+    }
     await Effect.runPromise(returns.reconcile(channelId));
     const added = returnsTo(requester.id).slice(before);
     const entry: CaseReport = {
