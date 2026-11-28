@@ -1,4 +1,5 @@
 import "../../global.css";
+import "@/shared/lib/native-splash";
 
 import { QueryClientProvider } from "@tanstack/react-query";
 import { usePathname, useSegments } from "expo-router";
@@ -20,6 +21,7 @@ import { installAppLock } from "@/features/app-lock/model/app-lock";
 import { UpdateRequiredOverlay } from "@/features/app-update/components/update-required-overlay";
 import { DevelopmentConnectLinkHandler } from "@/features/auth/components/development-connect-link-handler";
 import { MobileSessionProvider, useMobileSession } from "@/features/auth/context/mobile-session-context";
+import { backgroundRefreshNative } from "@/features/background-refresh/background-refresh-native";
 import { loadOnboardingProgress } from "@/features/onboarding/model/onboarding-progress";
 import { resetNotificationAvatars } from "@/features/push-notifications/notification-avatars";
 import { installNotificationHandler } from "@/features/push-notifications/use-notification-taps";
@@ -27,6 +29,7 @@ import { installQuickActions, resetQuickActions } from "@/features/quick-actions
 import { ThemeSweep } from "@/features/settings/components/theme-sweep";
 import { loadAppLanguage } from "@/features/settings/model/app-language";
 import { loadAppearance, useAppearance } from "@/features/settings/model/appearance";
+import { loadFullScreenCameraPreference } from "@/features/settings/model/camera-mode";
 import { loadChatBackdrop } from "@/features/settings/model/chat-backdrop";
 import { loadChatBackground } from "@/features/settings/model/chat-background";
 import { loadChatDetailPreferences } from "@/features/settings/model/chat-details";
@@ -54,6 +57,7 @@ import { checkRecognitionModels } from "@/features/voice/model/recognition-model
 import { supertonicModel } from "@/features/voice/model/supertonic-model";
 import { loadVoiceServer } from "@/features/voice/model/voice-server";
 import { loadVoiceSettings } from "@/features/voice/model/voice-settings";
+import { installWatch, resetWatch } from "@/features/watch/watch-native";
 import { AppLoadingOverlayProvider, useAppLoadingOverlay } from "@/shared/components/app-loading-overlay";
 import { useBloubColors } from "@/shared/components/bloub-stage/bloub-look";
 import { BloubStage } from "@/shared/components/bloub-stage/bloub-stage";
@@ -75,8 +79,10 @@ export const unstable_settings = {
 installSupportLog();
 installQuickActions();
 installShortcuts();
+installWatch();
 installAppLock();
 installNotificationHandler();
+backgroundRefreshNative?.install();
 
 const UniwindGestureHandlerRootView = withUniwind(GestureHandlerRootView);
 const lightTheme = { ...DefaultTheme, fonts: navigationFonts };
@@ -134,6 +140,7 @@ function RootNavigator() {
     resetShortcutDirectory();
     resetShortcuts();
     resetNotificationAvatars();
+    resetWatch();
   }, [loading, session]);
 
   useLayoutEffect(() => {
@@ -215,33 +222,35 @@ export default function RootLayout() {
     void SystemUI.setBackgroundColorAsync(canvas).catch(() => undefined);
   }, [canvas]);
   useEffect(() => {
-    void untilForeground().then(() => {
-      void loadAppearance().catch(() => undefined);
+    void untilForeground().then(async () => {
+      const firstScreen = [
+        loadAppearance(),
+        loadTextSize(),
+        loadMessageColor(),
+        loadChatBackground(),
+        loadChatBackdrop(),
+        loadFullVisualPreference(),
+        loadRoutineCollapsePreference(),
+        loadChatDetailPreferences(),
+        loadChatOrderPreference(),
+        loadMotionPreferences(),
+      ];
+      const appLanguage = loadAppLanguage().catch(() => undefined);
+      void appLanguage.then(() => offerLayoutRestart(splashColor.current, () => undefined));
+      await Promise.allSettled([...firstScreen, appLanguage, loadOnboardingProgress()]);
       void loadHapticsPreference().catch(() => undefined);
       void loadLargeFilePreference().catch(() => undefined);
       void loadPhotoQualityPreference().catch(() => undefined);
-      void loadMessageColor().catch(() => undefined);
-      void loadChatBackground().catch(() => undefined);
-      void loadChatBackdrop().catch(() => undefined);
-      void loadRoutineCollapsePreference().catch(() => undefined);
-      void loadChatDetailPreferences().catch(() => undefined);
-      void loadFullVisualPreference().catch(() => undefined);
-      void loadChatOrderPreference().catch(() => undefined);
+      void loadFullScreenCameraPreference().catch(() => undefined);
       void loadChatSwipePreference().catch(() => undefined);
       void loadChatPullPreference().catch(() => undefined);
-      void loadTextSize().catch(() => undefined);
       void loadLiveActivitiesPreference().catch(() => undefined);
       void loadPushNotificationPreference().catch(() => undefined);
-      void loadMotionPreferences().catch(() => undefined);
       void loadDictationLanguage().catch(() => undefined);
       void loadVoiceSettings().catch(() => undefined);
       void loadVoiceServer().catch(() => undefined);
       supertonicModel.check();
       checkRecognitionModels();
-      void loadAppLanguage()
-        .catch(() => undefined)
-        .then(() => offerLayoutRestart(splashColor.current, () => undefined));
-      void loadOnboardingProgress().catch(() => undefined);
     });
   }, []);
 

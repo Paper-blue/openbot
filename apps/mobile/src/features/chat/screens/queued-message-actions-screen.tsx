@@ -59,10 +59,9 @@ export function QueuedMessageActionsScreen() {
   const head = queue.queued[0];
   const headEdited = Boolean(head && head.id !== delivery.id && (head.editing || held?.id === head.id));
   const finish = (action: Promise<boolean>) => {
-    void action.then((done) => {
-      void haptics.notification(done ? "success" : "error");
-      if (done) router.back();
-    });
+    setMoving(delivery);
+    router.back();
+    void action.then((done) => void haptics.notification(done ? "success" : "error"));
   };
 
   const runAsThread = () => {
@@ -88,7 +87,7 @@ export function QueuedMessageActionsScreen() {
         })}
       >
         <SettingsRow>
-          <Typography>{queuedMessagePreview(delivery)}</Typography>
+          <Typography>{queuedMessagePreview(delivery, t)}</Typography>
         </SettingsRow>
       </SettingsSection>
 

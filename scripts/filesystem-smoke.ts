@@ -214,7 +214,12 @@ async function runFilesystemSmoke(provider: AgentProvider, completedProviders: A
 async function runWorkspaceOnlySmoke(provider: AgentProvider): Promise<void> {
   const workspaceRoot = join(temporaryRoot, `workspace-${provider}`);
   const outsideRoot = await mkdtemp(join(reportRoot, `outside-${provider}-`));
-  const agent = { access: "workspace", provider, workspacePath: workspaceRoot } as const;
+  const agent = {
+    id: `filesystem-smoke-${provider}`,
+    access: "workspace",
+    provider,
+    workspacePath: workspaceRoot,
+  } as const;
   const token = provider.toUpperCase();
   const paths = {
     workspace: join(workspaceRoot, "inside.txt"),
@@ -287,7 +292,7 @@ async function runWorkspaceOnlySmoke(provider: AgentProvider): Promise<void> {
   try {
     await initialize(client);
     const model = created.model ?? (await defaultModel(client));
-    const codexConfig = provider === "codex" ? codexSandboxConfig(agent, sharedRoot) : {};
+    const codexConfig = provider === "codex" ? await runCauseEffect(codexSandboxConfig(agent, sharedRoot, [])) : {};
     const started = await runCauseEffect(
       client.request(
         "thread/start",
@@ -323,7 +328,7 @@ async function runWorkspaceOnlySmoke(provider: AgentProvider): Promise<void> {
           cwd: workspaceRoot,
           runtimeWorkspaceRoots: [workspaceRoot, sharedRoot],
           approvalPolicy: "on-request",
-          sandboxPolicy: codexSandboxPolicy(agent, sharedRoot),
+          sandboxPolicy: await runCauseEffect(codexSandboxPolicy(agent, sharedRoot, [])),
           input: [
             {
               type: "text",

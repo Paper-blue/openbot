@@ -1,3 +1,4 @@
+import { providerDisplayName } from "@openbot/contracts/agent-providers";
 import type { QueueDelivery } from "@openbot/contracts/ipc";
 import { GlassView } from "expo-glass-effect";
 import { router } from "expo-router";
@@ -14,9 +15,10 @@ import { Alert, Pressable, View, type ViewStyle } from "react-native";
 import Animated, { cubicBezier } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useCSSVariable } from "uniwind";
+import { PLAN_LIMIT_RESET_FORMAT, planLimitResetDate } from "@/features/servers/model/plan-limits";
 import { haptics } from "@/shared/lib/haptics";
 import { useReducedMotion } from "@/shared/lib/motion";
-import { useText } from "@/shared/lib/text";
+import { type MobileText, useText } from "@/shared/lib/text";
 import { lineDirectionStyle, MIRROR_IN_RTL } from "@/shared/lib/text-direction";
 import type { QueuedUpload } from "../context/queued-messages-context";
 import { queuedMessageLocks, queuedMessagePreview } from "../model/queued-message-view";
@@ -56,7 +58,7 @@ export const ChatQueueButton = memo(function ChatQueueButton({
   const waiting = queue.waiting.length > 0;
   const next = rows[0] ?? null;
   const preview = next
-    ? queuedMessagePreview(next)
+    ? queuedMessagePreview(next, t)
     : pending
       ? pending.message.body || (pending.message.attachments ?? []).map((file) => file.name).join(", ")
       : null;
@@ -113,7 +115,8 @@ function ChatQueueCard({
   liquidGlassAvailable,
   fallbackBackground,
 }: ChatQueueCardProps) {
-  const { t } = useText();
+  const text = useText();
+  const { t } = text;
   const insets = useSafeAreaInsets();
   const reducedMotion = useReducedMotion();
   const muted = String(useThemeColor("muted"));
@@ -123,9 +126,17 @@ function ChatQueueCard({
   const locks = next ? queuedMessageLocks(next, { busy: queue.busy, online: queue.online, held }) : null;
   const locked = locks?.locked ?? true;
   const editedElsewhere = locks?.editedElsewhere ?? false;
-  const more = rest > 0 || waiting;
+  const holdLabel = queue.restartingProvider
+    ? t("mobile.chat.queue.providerRestart", { provider: providerDisplayName(queue.restartingProvider) })
+    : queue.signInProvider
+      ? t("mobile.chat.queue.signIn", { provider: providerDisplayName(queue.signInProvider) })
+      : queue.usageLimit
+        ? usageLimitLabel(queue.usageLimit, text)
+        : null;
+  const more = rest > 0 || waiting || holdLabel !== null;
   const moreLabel =
-    rest > 0 ? t("mobile.chat.queue.more", { count: rest }) : waiting ? t("mobile.chat.queue.repliesTitle") : null;
+    holdLabel ??
+    (rest > 0 ? t("mobile.chat.queue.more", { count: rest }) : waiting ? t("mobile.chat.queue.repliesTitle") : null);
   const [shownMoreLabel, setShownMoreLabel] = useState(moreLabel);
   if (moreLabel && moreLabel !== shownMoreLabel) setShownMoreLabel(moreLabel);
   const finish = (action: Promise<boolean>) => {
@@ -248,7 +259,8 @@ function ChatQueueCard({
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={
-              rest > 0 ? t("mobile.chat.queue.buttonLabel", { count: rest + 1 }) : (shownMoreLabel ?? undefined)
+              holdLabel ??
+              (rest > 0 ? t("mobile.chat.queue.buttonLabel", { count: rest + 1 }) : (shownMoreLabel ?? undefined))
             }
             className="flex-1 flex-row items-center justify-center gap-1.5 border-separator border-t"
             style={({ pressed }) => ({ opacity: pressed ? 0.55 : 1 })}
@@ -263,6 +275,13 @@ function ChatQueueCard({
       </Animated.View>
     </View>
   );
+}
+
+function usageLimitLabel(limit: { resetsAt: number | null }, { t, format }: MobileText): string {
+  const date = planLimitResetDate(limit);
+  return date && date.getTime() > Date.now()
+    ? t("mobile.chat.queue.usageLimitResets", { time: format.date(date, PLAN_LIMIT_RESET_FORMAT) })
+    : t("mobile.chat.queue.usageLimit");
 }
 
 function CardAction({

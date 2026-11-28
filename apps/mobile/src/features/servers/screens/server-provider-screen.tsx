@@ -7,8 +7,10 @@ import {
   isKeyOnlyProvider,
   isProviderEnvironmentProvider,
   PROMPT_CACHE_TTLS,
+  PROVIDER_ACCOUNT_POOL_STRATEGIES,
   type PromptCacheTtl,
   type ProviderAccountPool,
+  type ProviderAccountPoolStrategy,
   type ProviderAccountStatus,
   type ProviderApiKeyStatus,
 } from "@openbot/contracts/ipc";
@@ -28,6 +30,7 @@ import Minimize2 from "lucide-react-native/icons/minimize-2";
 import Package from "lucide-react-native/icons/package";
 import RefreshCw from "lucide-react-native/icons/refresh-cw";
 import RotateCcw from "lucide-react-native/icons/rotate-ccw";
+import Scale from "lucide-react-native/icons/scale";
 import Smartphone from "lucide-react-native/icons/smartphone";
 import Star from "lucide-react-native/icons/star";
 import UserPlus from "lucide-react-native/icons/user-plus";
@@ -105,6 +108,7 @@ function keyDescription(row: ProviderRow, key: ProviderApiKeyStatus | undefined,
   if (row.id === "opencode") return t("mobile.server.providers.keyOptional");
   if (row.id === "antigravity" && saved) return t("mobile.server.providers.geminiKeyInUse");
   if (row.id === "claude" && saved) return t("mobile.server.providers.claudeKeyInUse");
+  if (row.id === "muse" && saved) return t("mobile.server.providers.museKeyInUse");
   if (row.id === "codex")
     return t(saved ? "mobile.server.providers.codexKeyInUse" : "mobile.server.providers.codexKeyAlternative");
   if (isKeyOnlyProvider(row.id)) return t("mobile.server.providers.keyHint");
@@ -361,6 +365,15 @@ export function ServerProviderScreen() {
                   })
               : null
           }
+          onPoolStrategyChange={
+            setPool && admin.accounts?.poolStrategy
+              ? (strategy) =>
+                  void run("pool", async () => {
+                    await setPool(provider, true, pool?.leftOut ?? [], strategy);
+                    await accounts.refresh();
+                  })
+              : null
+          }
         />
       ) : null}
       {!off && (modelsShown || admin.defaultProvider) ? (
@@ -431,8 +444,13 @@ export function ServerProviderScreen() {
           </SettingsRow>
         </SettingsSection>
       ) : null}
-      {provider === "claude" && !off && admin.promptCache ? (
+      {(provider === "claude" || (provider === "pi" && admin.promptCache?.appliesToPi)) && !off && admin.promptCache ? (
         <PromptCacheSection serverId={serverId} setting={admin.promptCache} />
+      ) : null}
+      {(provider === "claude" || (provider === "pi" && admin.promptCache?.appliesToPi)) &&
+      !off &&
+      admin.cacheExpiryCompaction ? (
+        <CacheExpiryCompactionSection serverId={serverId} setting={admin.cacheExpiryCompaction} />
       ) : null}
       {provider === "claude" && !off && admin.compactWindow ? (
         <CompactWindowSection serverId={serverId} setting={admin.compactWindow} />
@@ -598,6 +616,42 @@ function PromptCacheSection({
   );
 }
 
+function CacheExpiryCompactionSection({
+  serverId,
+  setting,
+}: {
+  serverId: string;
+  setting: NonNullable<ProviderAdmin["cacheExpiryCompaction"]>;
+}) {
+  const { t, errorMessage } = useText();
+  const { theme } = useUniwind();
+  const queryScope = useQueryScope();
+  const { current, saving, error, save } = useProviderSetting(
+    queryKeys.providerCacheExpiryCompaction(queryScope, serverId),
+    setting,
+  );
+  return (
+    <SettingsSection
+      footer={
+        error ??
+        (current.isError
+          ? errorMessage(current.error, t("mobile.server.providers.cacheExpiryCompactionLoadFailed"))
+          : t("mobile.server.providers.cacheExpiryCompactionHint"))
+      }
+    >
+      <SettingsRow leading={<RowIcon icon={Minimize2} />}>
+        <SettingsSwitch
+          value={current.data?.enabled === true}
+          disabled={saving || !current.isSuccess}
+          label={t("mobile.server.providers.cacheExpiryCompaction")}
+          dark={theme === "dark"}
+          onValueChange={(enabled) => save(enabled)}
+        />
+      </SettingsRow>
+    </SettingsSection>
+  );
+}
+
 type CompactWindowChoice = "default" | `${number}`;
 
 function compactWindowChoice(tokens: number | null): CompactWindowChoice {
@@ -660,6 +714,11 @@ function CompactWindowSection({
   );
 }
 
+const POOL_STRATEGY_KEYS = {
+  fillFirst: "mobile.server.providers.poolFillFirst",
+  spread: "mobile.server.providers.poolSpread",
+} as const;
+
 function ProviderAccountsSection({
   serverId,
   provider,
@@ -672,6 +731,7 @@ function ProviderAccountsSection({
   onAddWithCode,
   pool,
   onPoolChange,
+  onPoolStrategyChange,
 }: {
   serverId: string;
   provider: AgentProviderId;
@@ -684,6 +744,7 @@ function ProviderAccountsSection({
   onAddWithCode: () => void;
   pool: ProviderAccountPool | undefined;
   onPoolChange: ((enabled: boolean) => void) | null;
+  onPoolStrategyChange: ((strategy: ProviderAccountPoolStrategy) => void) | null;
 }) {
   const { t } = useText();
   const { theme } = useUniwind();
@@ -692,6 +753,7 @@ function ProviderAccountsSection({
     (account) => account.id !== CLAUDE_API_KEY_ACCOUNT_ID && !isProviderKeyAccount(provider, account.id),
   );
   const poolOffered = onPoolChange !== null && (planAccounts.length > 1 || Boolean(pool));
+  const poolStrategy = pool?.strategy ?? "fillFirst";
   return (
     <SettingsSection
       title={t("mobile.server.providers.accounts")}
@@ -718,8 +780,33 @@ function ProviderAccountsSection({
           />
         </SettingsRow>
       ) : null}
+      {poolOffered && pool && onPoolStrategyChange ? (
+        <SettingsRow
+          disclosure={false}
+          leading={<RowIcon icon={Scale} />}
+          supportingText={poolStrategy === "spread" ? t("mobile.server.providers.poolSpreadHint") : undefined}
+          trailing={
+            <SettingsPicker<ProviderAccountPoolStrategy>
+              value={poolStrategy}
+              options={PROVIDER_ACCOUNT_POOL_STRATEGIES.map((strategy) => ({
+                value: strategy,
+                label: t(POOL_STRATEGY_KEYS[strategy]),
+              }))}
+              enabled={!busy}
+              dark={theme === "dark"}
+              label={t("mobile.server.providers.poolStrategy")}
+              onChange={(strategy) => {
+                if (strategy === poolStrategy) return;
+                onPoolStrategyChange(strategy);
+              }}
+            />
+          }
+        >
+          <Typography.Paragraph>{t("mobile.server.providers.poolStrategy")}</Typography.Paragraph>
+        </SettingsRow>
+      ) : null}
       {accounts.map((account, index) => {
-        const name = accountName(account, index);
+        const name = accountName(account, index, accounts);
         const member = account.id !== CLAUDE_API_KEY_ACCOUNT_ID && !isProviderKeyAccount(provider, account.id);
         const leftOut = member && pool?.leftOut.includes(account.id) === true;
         const inUse = member && !leftOut && pool?.inUse === account.id;

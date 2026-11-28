@@ -47,6 +47,7 @@ export interface MessagingAllowedSender {
   id: string;
   kind: "contact" | "group";
   name: string;
+  readOnly: boolean;
 }
 
 export interface MessagingPingInput {
@@ -184,18 +185,32 @@ export class MessagingStore {
     return databaseRows(
       this.#database.connection
         .prepare(
-          `SELECT sender_id, kind, name FROM projection_messaging_allowed_senders
+          `SELECT sender_id, kind, name, mode FROM projection_messaging_allowed_senders
            WHERE connection_id = ? ORDER BY created_at, name, sender_id`,
         )
         .all(connectionId),
     ).flatMap((row) => {
       const kind = requiredStringColumn(row, "kind");
       if (kind !== "contact" && kind !== "group") return [];
-      return [{ id: requiredStringColumn(row, "sender_id"), kind, name: requiredStringColumn(row, "name") }];
+      return [
+        {
+          id: requiredStringColumn(row, "sender_id"),
+          kind,
+          name: requiredStringColumn(row, "name"),
+          readOnly: requiredStringColumn(row, "mode") === "read",
+        },
+      ];
     });
   }
 
-  addAllowedSender(connectionId: string, sender: MessagingAllowedSender): void {
+  setAllowedSenderReadOnly(connectionId: string, senderId: string, readOnly: boolean): boolean {
+    const result = this.#database.connection
+      .prepare("UPDATE projection_messaging_allowed_senders SET mode = ? WHERE connection_id = ? AND sender_id = ?")
+      .run(readOnly ? "read" : "reply", connectionId, senderId);
+    return Number(result.changes) > 0;
+  }
+
+  addAllowedSender(connectionId: string, sender: Omit<MessagingAllowedSender, "readOnly">): void {
     this.#database.connection
       .prepare(
         `INSERT INTO projection_messaging_allowed_senders (connection_id, sender_id, kind, name, created_at)
@@ -357,7 +372,12 @@ export class MessagingStore {
         .run(now, historyCursor, linkId);
   }
 
-  deleteForAgent(agentId: string): void {
+  deleteForAgent(agentId: string): string[] {
+    const orchestratorOf = databaseRows(
+      this.#database.connection
+        .prepare("SELECT connection_id FROM projection_messaging_connections WHERE orchestrator_agent_id = ?")
+        .all(agentId),
+    ).map((row) => requiredStringColumn(row, "connection_id"));
     const links = databaseRows(
       this.#database.connection
         .prepare("SELECT link_id, thread_id FROM projection_messaging_threads WHERE agent_id = ?")
@@ -409,6 +429,13 @@ export class MessagingStore {
         return null;
       },
     );
+    return orchestratorOf;
+  }
+
+  restoreOrchestrator(agentId: string, connectionIds: readonly string[]): void {
+    for (const connectionId of connectionIds)
+      if (this.connection(connectionId)?.orchestratorAgentId === null)
+        this.updateConnection(connectionId, { orchestratorAgentId: agentId });
   }
 
   threadIdsForAgent(agentId: string): string[] {

@@ -3,6 +3,7 @@ import { isAvatarMimeType } from "@openbot/contracts/avatar-images";
 import { AVATAR_IMAGE_LIMITS, INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import {
   BROWSER_SECRET_RESPONSE_PATH,
+  type ConversationReadState,
   type CreateAgentInput,
   canAdministerServer,
   type DuplicateAgentResult,
@@ -24,6 +25,10 @@ import {
   PROVIDER_MODEL_SOURCE_ROUTES,
 } from "@openbot/contracts/team-protocol/provider-model-source-v1";
 import { SKILL_PROBLEMS_CAPABILITY } from "@openbot/contracts/team-protocol/skill-problems-v1";
+import {
+  TEAM_USAGE_READ_FAILED_CAPABILITY,
+  usageWithoutReadFailed,
+} from "@openbot/contracts/team-protocol/usage-read-failed-v1";
 import { V5_AGENT_MODEL } from "@openbot/contracts/team-protocol/v5-adapter";
 import { V6_AGENT_MODEL } from "@openbot/contracts/team-protocol/v6-adapter";
 import { WORKFLOWS_CAPABILITY } from "@openbot/contracts/team-protocol/workflows-v1";
@@ -51,7 +56,6 @@ import {
   promptRequestId,
   readBinary,
   readJson,
-  requireAdmin,
   requireAgentLevel,
   stringField,
 } from "./request-helpers";
@@ -68,11 +72,30 @@ export interface AgentRouteDependencies {
   libraryFolders?: Pick<TeamApiLibraryFolders, "removeAgent"> | undefined;
   duplicateAgent: (agentId: string, operationId: string) => Effect.Effect<DuplicateAgentResult, AgentDuplicationFailed>;
   visibleModels?: Pick<ModelVisibility, "picker">;
+  hiddenAgentIds: ReadonlySet<string>;
+}
+
+export function visibleConversationReads(
+  agents: Pick<TeamApiAgents, "listConversationReads">,
+  memberId: string,
+  capabilities: ReadonlySet<string>,
+  hiddenAgentIds: ReadonlySet<string>,
+): Record<string, ConversationReadState> {
+  const reads = agents.listConversationReads(memberId, markerExclusionsForCapabilities(capabilities));
+  return Object.fromEntries(Object.entries(reads).filter(([agentId]) => !hiddenAgentIds.has(agentId)));
 }
 
 export async function routeAgents(
   context: TeamApiRequestContext,
-  { agents, skills, sidebarLayout, libraryFolders, duplicateAgent, visibleModels }: AgentRouteDependencies,
+  {
+    agents,
+    skills,
+    sidebarLayout,
+    libraryFolders,
+    duplicateAgent,
+    visibleModels,
+    hiddenAgentIds,
+  }: AgentRouteDependencies,
 ): Promise<RouteOutcome> {
   const { method, url, request, response, member, capabilities, json, empty } = context;
   const hidden = hiddenProviderAgentIds(agents.listAgents(), context.protocol);
@@ -116,7 +139,7 @@ export async function routeAgents(
       !agents.listAgents().some((agent) => agent.id === input.agentId)
     )
       throw new HttpError(404, sourceText("error.team.agentNotFound"));
-    const { skills: _localOnly, ...report } = agents.getHostAnalytics(input);
+    const { skills: _localOnly, ...report } = await runCauseEffect(agents.getHostAnalytics(input));
     return json(
       200,
       workflows ? report : { ...report, agents: report.agents.filter((row) => row.agentId !== WORKFLOWS_USAGE_ID) },
@@ -186,14 +209,19 @@ export async function routeAgents(
   }
   if (method === "GET" && url.pathname === TEAM_API_ROUTES.agents.usage) {
     const usage = await runCauseEffect(agents.getUsage());
-    return json(200, { ...usage, limits: usage.limits.filter((limit) => limit.accountId === undefined) });
+    const signIns = { ...usage, limits: usage.limits.filter((limit) => limit.accountId === undefined) };
+    return json(200, capabilities.has(TEAM_USAGE_READ_FAILED_CAPABILITY) ? signIns : usageWithoutReadFailed(signIns));
   }
   if (method === "GET" && url.pathname === TEAM_API_ROUTES.agents.models) {
     const modelId = context.protocol < 6 ? V5_AGENT_MODEL : V6_AGENT_MODEL;
     const models = (await agents.listModels())
       .filter((model) => modelId.test(model.id))
       .map(({ steersTurns: _steersTurns, ...model }) => model);
-    if (!visibleModels) return json(200, models);
+    if (!visibleModels)
+      return json(
+        200,
+        models.map(({ listing: _listing, ...model }) => model),
+      );
     const listed = await runCauseEffect(visibleModels.picker(models));
     return json(
       200,
@@ -204,7 +232,7 @@ export async function routeAgents(
     return json(200, agents.listAgents());
   }
   if (method === "GET" && url.pathname === TEAM_API_ROUTES.agents.conversationReads) {
-    return json(200, agents.listConversationReads(member.id, markerExclusionsForCapabilities(capabilities)));
+    return json(200, visibleConversationReads(agents, member.id, capabilities, hiddenAgentIds));
   }
   if (method === "POST" && url.pathname === TEAM_API_ROUTES.agents.all) {
     requireCompatibleDefault();
@@ -332,7 +360,7 @@ export async function routeAgents(
       throw new HttpError(400, sourceText("error.team.secureAuthUnsupported"));
     const input = parseBrowserSecretResponse(await readJson(request));
     requireRequestAgent(input.agentId);
-    await runCauseEffect(agents.respondToBrowserSecret(input));
+    await runCauseEffect(agents.respondToBrowserSecret(input)).catch(inactiveAsConflict);
     return empty(204);
   }
   if (method === "POST" && url.pathname === BROWSER_SECRET_VAULT_ROUTES.respond) {
@@ -340,10 +368,9 @@ export async function routeAgents(
       throw new HttpError(400, sourceText("error.team.secureAuthUnsupported"));
     if (!capabilities.has(BROWSER_SECRET_VAULT_CAPABILITY))
       throw new HttpError(400, sourceText("error.team.vaultUnsupported"));
-    requireAdmin(member);
     const input = parseBrowserSecretResponse({ ...(await readJson(request)), decision: "submit" });
     requireRequestAgent(input.agentId);
-    await runCauseEffect(agents.respondToBrowserSecret({ ...input, saveToVault: true }));
+    await runCauseEffect(agents.respondToBrowserSecret({ ...input, saveToVault: true })).catch(inactiveAsConflict);
     return json(200, {});
   }
   if (method === "POST" && url.pathname === TEAM_API_ROUTES.respond.browserTakeover) {
@@ -393,4 +420,8 @@ function refusedPromptAnswer(error: unknown): never {
   return inactiveAsConflict(error);
 }
 
-const DELETE_REFUSALS = () => [sourceText("error.agent.stopBeforeDelete"), sourceText("error.agent.deletionBusy")];
+const DELETE_REFUSALS = () => [
+  sourceText("error.agent.stopBeforeDelete"),
+  sourceText("error.agent.deletionBusy"),
+  sourceText("error.agent.deleteWhenFolderFree"),
+];

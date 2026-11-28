@@ -27,8 +27,8 @@ import {
   twoStepRemainingMs,
 } from "@openbot/contracts/two-step-code";
 import { type SourceMessages, sourceText } from "@openbot/i18n/source";
-import { registerSecretValues } from "@openbot/logging";
-import { Effect } from "effect";
+import { createOpenBotLogger, replaceSecretValueGroup } from "@openbot/logging";
+import { Effect, Semaphore } from "effect";
 import { type PasswordVault, PasswordVaultError, websiteMatchesOrigin, websiteUrl } from "../backend/password-vault";
 import type {
   VaultAgent,
@@ -55,29 +55,25 @@ function refuse(key: VaultErrorKey): never {
 }
 
 function registerSecrets(record: VaultRecord): void {
-  registerSecretValues(
-    record.logins.map((login) => login.password),
-    { allowShort: true },
-  );
-  registerSecretValues(
-    record.logins.flatMap(({ twoStepKey }) => {
-      const secret = twoStepKey ? twoStepKeySecret(twoStepKey) : null;
-      if (!twoStepKey || !secret) return [];
-      const grouped = secret.replace(/(.{4})(?=.)/gu, "$1 ");
-      return [twoStepKey, secret, secret.toLowerCase(), grouped, grouped.toLowerCase()];
-    }),
-  );
-  registerSecretValues(
-    record.cards.flatMap(({ number }) => [
-      number,
-      number.replace(/(\d{4})(?=\d)/gu, "$1 "),
-      number.replace(/(\d{4})(?=\d)/gu, "$1-"),
-    ]),
-  );
-  registerSecretValues(
-    record.apiKeys.map(({ key }) => key),
-    { allowShort: true },
-  );
+  replaceSecretValueGroup("vault", [
+    { values: record.logins.map((login) => login.password), allowShort: true },
+    {
+      values: record.logins.flatMap(({ twoStepKey }) => {
+        const secret = twoStepKey ? twoStepKeySecret(twoStepKey) : null;
+        if (!twoStepKey || !secret) return [];
+        const grouped = secret.replace(/(.{4})(?=.)/gu, "$1 ");
+        return [twoStepKey, secret, secret.toLowerCase(), grouped, grouped.toLowerCase()];
+      }),
+    },
+    {
+      values: record.cards.flatMap(({ number }) => [
+        number,
+        number.replace(/(\d{4})(?=\d)/gu, "$1 "),
+        number.replace(/(\d{4})(?=\d)/gu, "$1-"),
+      ]),
+    },
+    { values: record.apiKeys.map(({ key }) => key), allowShort: true },
+  ]);
 }
 
 function makeCode(key: TwoStepKey, at: number): Effect.Effect<string, PasswordVaultError> {
@@ -86,6 +82,16 @@ function makeCode(key: TwoStepKey, at: number): Effect.Effect<string, PasswordVa
 
 function loginTitle(website: string): string {
   return websiteUrl(website)?.hostname ?? website;
+}
+
+function sameScheme(left: string, right: string): boolean {
+  return websiteUrl(left)?.protocol === websiteUrl(right)?.protocol;
+}
+
+function typedLoginWebsite(website: string): string {
+  const url = websiteUrl(website);
+  if (!url) return website;
+  return url.protocol === "http:" ? url.origin : url.host;
 }
 
 function loginHost(website: string): string | undefined {
@@ -259,7 +265,13 @@ function sameLoginEdits(
   if (host === undefined) return [];
   const { username, notes, password, twoStepKey, agents } = input;
   return record.logins
-    .filter((login) => allows(login) && login.username === username && loginHost(login.website) === host)
+    .filter(
+      (login) =>
+        allows(login) &&
+        login.username === username &&
+        loginHost(login.website) === host &&
+        sameScheme(login.website, input.website),
+    )
     .map((login, index) => ({
       kind: "login",
       id: login.id,
@@ -282,6 +294,8 @@ function replaceOrAdd<T extends { id: string }>(items: readonly T[], item: T): T
 
 export const VAULT_CSV_LIMIT = 4 * 1024 * 1024;
 
+const logger = createOpenBotLogger("vault");
+
 export interface VaultServiceOptions {
   store: VaultStore;
   canPersist: () => boolean;
@@ -291,6 +305,7 @@ export class VaultService {
   readonly #store: VaultStore;
   readonly #canPersist: () => boolean;
   #status: VaultStatus = "ready";
+  readonly #loading = Semaphore.makeUnsafe(1);
   readonly #listeners = new Set<(state: VaultState) => void>();
 
   constructor(options: VaultServiceOptions) {
@@ -300,12 +315,26 @@ export class VaultService {
 
   readonly load = Effect.fn("VaultService.load")(function* (this: VaultService) {
     if (!this.#canPersist()) {
+      if (this.#status !== "unavailable")
+        logger.warn("The secret storage of this computer is not available, so the Vault is closed.");
       this.#status = "unavailable";
-      return;
+      return this.#status;
     }
     const readable = yield* this.#store.load();
     this.#status = readable ? "ready" : "unreadable";
-    registerSecrets(this.#store.read());
+    if (readable) registerSecrets(this.#store.read());
+    return this.#status;
+  });
+
+  readonly reload = Effect.fn("VaultService.reload")(function* (this: VaultService) {
+    yield* this.#loading.withPermit(
+      Effect.gen({ self: this }, function* () {
+        const before = this.#status;
+        if (before === "ready") return;
+        if ((yield* this.load()) !== before) this.#emit();
+      }),
+    );
+    return this.state();
   });
 
   state(): VaultState {
@@ -384,6 +413,7 @@ export class VaultService {
         const duplicate = logins.findIndex(
           (login) =>
             loginTitle(login.website) === loginTitle(website) &&
+            sameScheme(login.website, website) &&
             login.username === row.username &&
             login.password === row.password,
         );
@@ -414,14 +444,19 @@ export class VaultService {
   });
 
   readonly reset = Effect.fn("VaultService.reset")(function* (this: VaultService) {
-    if (!this.#canPersist()) {
-      this.#status = "unavailable";
-      return this.state();
-    }
-    yield* this.#store.clear();
-    this.#status = "ready";
-    this.#emit();
-    return this.state();
+    return yield* this.#loading.withPermit(
+      Effect.gen({ self: this }, function* () {
+        if (!this.#canPersist()) {
+          this.#status = "unavailable";
+          return this.state();
+        }
+        yield* this.#store.clear();
+        registerSecrets(this.#store.read());
+        this.#status = "ready";
+        this.#emit();
+        return this.state();
+      }),
+    );
   });
 
   readonly codes = Effect.fn("VaultService.codes")(function* (this: VaultService) {
@@ -531,7 +566,9 @@ export class VaultService {
     const outcome: { saved: (VaultAgentResult & { created: boolean; changed: boolean }) | null } = { saved: null };
     yield* this.#change((record) => {
       const matches = (item: StoredLogin) =>
-        item.username === username && websiteMatchesOrigin({ url: item.website, autofill: "anywhere" }, website);
+        item.username === username &&
+        sameScheme(item.website, website) &&
+        websiteMatchesOrigin({ url: item.website, autofill: "anywhere" }, website);
       const usable = record.logins.filter((item) => vaultItemAllows(item, agent.id) && matches(item));
       const existing =
         usable.find((item) => loginHost(item.website) === loginHost(website)) ??
@@ -547,12 +584,11 @@ export class VaultService {
         };
         return record;
       }
-      const host = websiteUrl(website)?.host ?? website;
       const stored: StoredLogin = existing
         ? { ...existing, password: login.password }
         : {
             id: randomUUID(),
-            website: host,
+            website: typedLoginWebsite(website),
             username,
             password: login.password,
             notes: "",
@@ -636,6 +672,8 @@ export class VaultService {
 
   readonly items: VaultItems = {
     ready: () => this.#status === "ready",
+    status: () => this.#status,
+    reload: () => this.reload().pipe(Effect.map(({ status }) => status)),
     apiKeys: (agentId) => {
       if (this.#status !== "ready") return [];
       const keys = new Map<string, { value: string; own: boolean }>();

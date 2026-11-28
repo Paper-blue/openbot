@@ -1,5 +1,12 @@
 import { parseBillingSessionUrl, parseBillingState } from "@openbot/contracts/billing";
 import { parseBillingDetails } from "@openbot/contracts/billing-details";
+import { type CreditMediaCatalog, parseCreditMediaCatalog } from "@openbot/contracts/credit-media";
+import {
+  parseCreditActivity,
+  parseCreditCheckoutUrl,
+  parseCreditRedeemResult,
+  parseCreditsState,
+} from "@openbot/contracts/credits";
 import {
   PRICING_ORDER_PARAMS,
   type PricingOrder,
@@ -13,10 +20,12 @@ import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import type { BillingDetailsCalls } from "@openbot/ui/features/billing/BillingDetailsFields";
 import type { BillingCalls } from "@openbot/ui/features/billing/billing-store";
 import type { LicenseCalls } from "@openbot/ui/features/billing/license-store";
+import type { CreditsCalls } from "@openbot/ui/features/credits/credits-store";
 import type { ReferralCalls } from "@openbot/ui/features/referral/referral-store";
 import { currentText } from "@openbot/ui/text";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+const DETAILS_SAVE_TIMEOUT_MS = 30_000;
 
 export function createWebBillingCalls(
   accountFetch: typeof fetch,
@@ -25,7 +34,13 @@ export function createWebBillingCalls(
   const request = browserRequest(accountFetch);
 
   async function details(body?: string) {
-    const value = await request("v1/me/billing/details", parseBillingDetails, body, "PUT");
+    const value = await request(
+      "v1/me/billing/details",
+      parseBillingDetails,
+      body,
+      "PUT",
+      body === undefined ? REQUEST_TIMEOUT_MS : DETAILS_SAVE_TIMEOUT_MS,
+    );
     if (!value) throw new Error(currentText().sourceText("error.billing.invalidResponse"));
     return value;
   }
@@ -79,6 +94,49 @@ export function createWebLicenseCalls(
   };
 }
 
+export function createWebCreditsCalls(
+  accountFetch: typeof fetch,
+  navigate: (url: string) => void = (url) => window.location.assign(url),
+): CreditsCalls {
+  const request = browserRequest(accountFetch);
+
+  async function state(path: string, body?: string) {
+    const credits = await request(path, parseCreditsState, body);
+    if (!credits) throw new Error(currentText().sourceText("error.billing.invalidResponse"));
+    return credits;
+  }
+
+  return {
+    getState: () => state("v1/me/credits"),
+    async getActivity() {
+      const activity = await request("v1/me/credits/activity", parseCreditActivity);
+      if (!activity) throw new Error(currentText().sourceText("error.billing.invalidResponse"));
+      return activity;
+    },
+    async openCheckout(checkout) {
+      const url = await request("v1/me/credits/checkout", parseCreditCheckoutUrl, JSON.stringify(checkout));
+      if (!url) throw new Error(currentText().sourceText("error.billing.notStripePage"));
+      navigate(url);
+    },
+    transfer: (transfer) => state("v1/me/credits/transfer", JSON.stringify(transfer)),
+    async redeem(redeem) {
+      const result = await request("v1/me/credits/redeem", parseCreditRedeemResult, JSON.stringify(redeem));
+      if (!result) throw new Error(currentText().sourceText("error.billing.invalidResponse"));
+      return result;
+    },
+  };
+}
+
+export async function readCreditCatalog(accountFetch: typeof fetch): Promise<CreditMediaCatalog> {
+  const response = await accountFetch("/v1/media/models", {
+    credentials: "omit",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  const catalog = response.ok ? parseCreditMediaCatalog(await response.json().catch(() => null)) : null;
+  if (!catalog) throw new Error(currentText().sourceText("error.billing.invalidResponse"));
+  return catalog;
+}
+
 export function createWebReferralCalls(accountFetch: typeof fetch): ReferralCalls {
   const request = browserRequest(accountFetch);
   return {
@@ -102,13 +160,14 @@ function browserRequest(accountFetch: typeof fetch) {
     decode: (value: unknown) => T | null,
     body?: string,
     method: "POST" | "PUT" = "POST",
+    timeoutMs = REQUEST_TIMEOUT_MS,
   ): Promise<T | null> => {
     const post = body !== undefined;
     const response = await accountFetch(`/api/browser/${path}`, {
       method: post ? method : "GET",
       credentials: "same-origin",
       cache: "no-store",
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
       headers: post ? { "Content-Type": "application/json", "X-OpenBot-Browser": "1" } : {},
       ...(post ? { body } : {}),
     }).catch(() => {

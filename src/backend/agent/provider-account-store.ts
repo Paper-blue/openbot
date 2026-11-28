@@ -4,8 +4,10 @@ import { join } from "node:path";
 import { AGENT_PROVIDERS, type AgentProviderId } from "@openbot/contracts/agent-providers";
 import {
   DEFAULT_PROVIDER_ACCOUNT_ID,
+  isProviderAccountPoolStrategy,
   MAX_PROVIDER_ACCOUNTS,
   PROVIDER_ACCOUNT_LABEL_MAX_LENGTH,
+  type ProviderAccountPoolStrategy,
 } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect, Schema, Semaphore } from "effect";
@@ -15,6 +17,11 @@ import { isMissingFileError } from "../file-errors";
 
 type AccountProvider = Exclude<AgentProviderId, "acp">;
 
+export interface StoredProviderAccountPool {
+  leftOut: readonly string[];
+  strategy?: ProviderAccountPoolStrategy;
+}
+
 export interface StoredProviderAccount {
   id: string;
   provider: AccountProvider;
@@ -23,6 +30,7 @@ export interface StoredProviderAccount {
 
 const ACCOUNT_ID = /^a[0-9a-f]{16}$/u;
 const POOL_ACCOUNT_ID = /^(?:default|a[0-9a-f]{16})$/u;
+const POOL_STRATEGY_MAX_LENGTH = 64;
 const Provider = Schema.Literals(AGENT_PROVIDERS.filter((provider) => provider !== "acp"));
 const LabelText = Schema.String.check(Schema.isMaxLength(PROVIDER_ACCOUNT_LABEL_MAX_LENGTH));
 const Label = Schema.NullOr(LabelText);
@@ -39,9 +47,11 @@ const ProviderAccountsFile = Schema.Struct({
         leftOut: Schema.Array(Schema.String.check(Schema.isPattern(POOL_ACCOUNT_ID))).check(
           Schema.isMaxLength(MAX_PROVIDER_ACCOUNTS),
         ),
+        strategy: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(POOL_STRATEGY_MAX_LENGTH))),
       }),
     ),
   ),
+  liveVoiceAccount: Schema.optionalKey(Schema.String.check(Schema.isPattern(POOL_ACCOUNT_ID))),
 });
 type ProviderAccountsFile = typeof ProviderAccountsFile.Type;
 const decodeProviderAccountsFile = Schema.decodeUnknownSync(ProviderAccountsFile);
@@ -94,19 +104,47 @@ export class ProviderAccountStore {
     return this.#file.defaultLabels[provider] ?? null;
   }
 
-  pool(provider: AgentProviderId): { leftOut: readonly string[] } | null {
-    return this.#file.pools?.[provider] ?? null;
+  pool(provider: AgentProviderId): StoredProviderAccountPool | null {
+    const pool = this.#file.pools?.[provider];
+    if (!pool) return null;
+    return isProviderAccountPoolStrategy(pool.strategy)
+      ? { leftOut: pool.leftOut, strategy: pool.strategy }
+      : { leftOut: pool.leftOut };
   }
 
   readonly setPool = Effect.fn("ProviderAccountStore.setPool")(function* (
     this: ProviderAccountStore,
     provider: AccountProvider,
-    pool: { leftOut: readonly string[] } | null,
+    pool: StoredProviderAccountPool | null,
   ) {
     return yield* this.#change((file) => {
-      const { [provider]: _previous, ...pools } = file.pools ?? {};
+      const { [provider]: previous, ...pools } = file.pools ?? {};
+      const strategy = pool?.strategy ?? previous?.strategy;
+      const next = pool
+        ? {
+            leftOut: [...new Set(pool.leftOut)],
+            ...(strategy && strategy !== "fillFirst" ? { strategy } : {}),
+          }
+        : null;
       return Effect.succeed({
-        file: { ...file, pools: pool ? { ...pools, [provider]: { leftOut: [...new Set(pool.leftOut)] } } : pools },
+        file: { ...file, pools: next ? { ...pools, [provider]: next } : pools },
+        result: undefined,
+      });
+    });
+  }).bind(this);
+
+  liveVoiceAccount(): string | null {
+    return this.#file.liveVoiceAccount ?? null;
+  }
+
+  readonly setLiveVoiceAccount = Effect.fn("ProviderAccountStore.setLiveVoiceAccount")(function* (
+    this: ProviderAccountStore,
+    accountId: string | null,
+  ) {
+    return yield* this.#change((file) => {
+      const { liveVoiceAccount: _previous, ...rest } = file;
+      return Effect.succeed({
+        file: accountId ? { ...rest, liveVoiceAccount: accountId } : rest,
         result: undefined,
       });
     });
@@ -189,16 +227,18 @@ export class ProviderAccountStore {
     account: StoredProviderAccount,
   ) {
     const home = this.home(account);
-    yield* this.#change((file) =>
-      Effect.succeed({
+    yield* this.#change((file) => {
+      const { liveVoiceAccount, ...rest } = file;
+      return Effect.succeed({
         file: {
-          ...file,
+          ...rest,
           accounts: file.accounts.filter((candidate) => candidate.id !== account.id),
           ...(file.pools ? { pools: withoutPoolAccount(file.pools, account.id) } : {}),
+          ...(liveVoiceAccount && liveVoiceAccount !== account.id ? { liveVoiceAccount } : {}),
         },
         result: undefined,
-      }),
-    );
+      });
+    });
     yield* Effect.tryPromise({
       try: () => rm(home, { recursive: true, force: true }),
       catch: (cause) => new ProviderAccountStoreFailed({ cause }),
@@ -233,7 +273,7 @@ function withoutPoolAccount(
   return Object.fromEntries(
     Object.entries(pools).map(([provider, pool]) => [
       provider,
-      { leftOut: pool.leftOut.filter((id) => id !== accountId) },
+      { ...pool, leftOut: pool.leftOut.filter((id) => id !== accountId) },
     ]),
   );
 }

@@ -33,6 +33,13 @@ import {
   type TelegramUploadAnswer,
 } from "@openbot/contracts/signal-protocol/telegram-route";
 import {
+  decodeWatchRelayHttpRequest,
+  WATCH_RELAY_BODY_BYTES_LIMIT,
+  WATCH_RELAY_PATH,
+  WATCH_RELAY_VERSION,
+  type WatchRelayHttpReply,
+} from "@openbot/contracts/signal-protocol/watch-relay";
+import {
   STANDARD_WEBHOOK_HEADER_SETS,
   STANDARD_WEBHOOK_SIGNATURE_PATTERN,
   STANDARD_WEBHOOKS_FORMAT,
@@ -58,6 +65,8 @@ import {
   type SignalSocket,
   type SignalTokens,
   type SlackDeliveryResponse,
+  type WatchRelayAnswer,
+  type WatchRelayErrorCode,
   WEBHOOK_ANSWER_STATUSES,
   type WebhookAnswerStatus,
   type WebhookDelivery,
@@ -72,6 +81,7 @@ const DISCORD_SESSION_PATTERN = /^Bearer ([A-Za-z0-9_-]{43})$/u;
 const DISCORD_JSON_BODY_BYTES_LIMIT = 512 * 1024;
 const DISCORD_UPLOAD_BODY_BYTES_LIMIT = DISCORD_UPLOAD_BYTES_LIMIT + 64 * 1024;
 const AUTH_EVENT_BODY_BYTES_LIMIT = 64 * 1024;
+const WATCH_TICKET_PATTERN = /^Bearer ([A-Za-z0-9._-]{1,8192})$/u;
 
 const githubRequestSchema = z.object({
   installation: z.object({ id: z.int().positive() }),
@@ -207,7 +217,7 @@ export function createRemoteApiApp(
         signal.revokeTelegramRoute(event.botId, event.chatId, event.through);
       else if (event.type === "discord-route-revoked") signal.revokeDiscordRoute(event.guildId, event.through);
       else if (event.type === "webhook-route-revoked") signal.revokeWebhookRoute(event.routeId, event.through);
-      else signal.revokeSession(event.sessionId);
+      else signal.revokeSession(event.sessionId, event.hostId);
       return new Response(null, { status: 204 });
     })
     .post(
@@ -342,6 +352,36 @@ export function createRemoteApiApp(
       { parse: "none" },
     )
     .post(
+      WATCH_RELAY_PATH,
+      async ({ request, server }) => {
+        const declaredLength = Number(request.headers.get("content-length") ?? "0");
+        if (!Number.isFinite(declaredLength) || declaredLength > WATCH_RELAY_BODY_BYTES_LIMIT) {
+          await request.body?.cancel();
+          return watchError(413, "too_large");
+        }
+        const address = signalClientIp(
+          server?.requestIP(request)?.address,
+          request.headers.get("x-forwarded-for"),
+          config.trustProxy,
+        );
+        if (!signal.acceptWatchRequest(address)) {
+          await request.body?.cancel();
+          return watchError(429, "rate_limited");
+        }
+        const ticket = WATCH_TICKET_PATTERN.exec(request.headers.get("authorization") ?? "")?.[1];
+        if (!ticket) {
+          await request.body?.cancel();
+          return watchError(401, "unauthorized");
+        }
+        const body = await readBounded(request, WATCH_RELAY_BODY_BYTES_LIMIT);
+        if (!body) return watchError(413, "too_large");
+        const relay = watchRelayRequest(body);
+        if (!relay) return watchError(400, "invalid_request");
+        return watchResponse(await runtime.runPromise(signal.relayWatch(ticket, relay), { signal: request.signal }));
+      },
+      { parse: "none" },
+    )
+    .post(
       DISCORD_API_PATH,
       async ({ request }) => {
         const discord = discordApi();
@@ -389,7 +429,15 @@ export function createRemoteApiApp(
         const linked = update.linkCode
           ? await runtime.runPromise(signal.linkTelegramChat(botId, update.chatId, update.linkCode))
           : false;
-        signal.deliverTelegram(botId, update.chatId, body, update.callbackQueryId, linked, update.wakes);
+        signal.deliverTelegram(
+          botId,
+          update.chatId,
+          body,
+          update.callbackQueryId,
+          linked,
+          update.wakes,
+          update.addresses,
+        );
         return emptyResponse(200);
       },
       { parse: "none" },
@@ -667,6 +715,24 @@ async function readBounded(request: Request, limit: number): Promise<Uint8Array<
   return body;
 }
 
+function watchRelayRequest(body: Uint8Array) {
+  try {
+    return decodeWatchRelayHttpRequest(JSON.parse(new TextDecoder().decode(body)));
+  } catch {
+    return null;
+  }
+}
+
+function watchError(status: number, error: WatchRelayErrorCode): Response {
+  return Response.json({ error }, { status, headers: { "Cache-Control": "no-store" } });
+}
+
+function watchResponse(answer: WatchRelayAnswer): Response {
+  if (answer.status !== 200) return watchError(answer.status, answer.error);
+  const reply: WatchRelayHttpReply = { v: WATCH_RELAY_VERSION, sealed: answer.sealed };
+  return Response.json(reply, { headers: { "Cache-Control": "no-store" } });
+}
+
 function discordError(status: number, code: DiscordApiErrorCode, retryAfterMs?: number): Response {
   const body: DiscordApiErrorBody = { error: retryAfterMs === undefined ? { code } : { code, retryAfterMs } };
   return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
@@ -685,9 +751,13 @@ function limitStream(body: ReadableStream<Uint8Array>, limit: number): ReadableS
   );
 }
 
-function telegramUpdate(
-  body: Uint8Array,
-): { chatId: string; callbackQueryId: string | null; linkCode: string | null; wakes: boolean } | null {
+function telegramUpdate(body: Uint8Array): {
+  chatId: string;
+  callbackQueryId: string | null;
+  linkCode: string | null;
+  wakes: boolean;
+  addresses: boolean;
+} | null {
   let value: unknown;
   try {
     value = JSON.parse(new TextDecoder().decode(body));
@@ -711,19 +781,28 @@ function telegramUpdate(
     linkCode: update.message?.text?.match(TELEGRAM_START_PATTERN)?.[1] ?? null,
     wakes:
       update.callback_query !== undefined || (update.message !== undefined && telegramMessageWakes(update.message)),
+    addresses: update.message !== undefined && telegramMessageAddresses(update.message),
   };
 }
 
 const TELEGRAM_ADDRESSING_ENTITIES = new Set(["mention", "text_mention", "bot_command"]);
 
-function telegramMessageWakes(message: NonNullable<z.output<typeof telegramUpdateSchema>["message"]>): boolean {
+type TelegramMessage = NonNullable<z.output<typeof telegramUpdateSchema>["message"]>;
+
+function telegramMessageWakes(message: TelegramMessage): boolean {
   return (
-    message.chat.type === "private" ||
+    telegramMessageAddresses(message) ||
     message.reply_to_message !== undefined ||
     message.message_thread_id !== undefined ||
     message.new_chat_title !== undefined ||
     message.left_chat_member !== undefined ||
-    message.migrate_to_chat_id !== undefined ||
+    message.migrate_to_chat_id !== undefined
+  );
+}
+
+function telegramMessageAddresses(message: TelegramMessage): boolean {
+  return (
+    message.chat.type === "private" ||
     [...(message.entities ?? []), ...(message.caption_entities ?? [])].some((entity) =>
       TELEGRAM_ADDRESSING_ENTITIES.has(entity.type),
     )

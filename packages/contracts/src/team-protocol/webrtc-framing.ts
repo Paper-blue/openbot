@@ -1,4 +1,6 @@
 import { type DynamicRecord, isBoolean, isDynamicRecord, isNumber, isString } from "../runtime-values";
+import { decodeSyncClientMessage, type SyncClientMessage } from "./sync-v1";
+import { type WorkflowSpotControl, workflowSpotControl } from "./workflow-presence-v1";
 
 export const TEAM_PROTOCOL_V2 = 2 as const;
 export const TEAM_PROTOCOL_V2_CHANNELS = {
@@ -56,7 +58,9 @@ export type TeamProtocolV2EventFrame =
       control:
         | { type: "runtime-snapshot-request" }
         | { type: "team-typing"; botId: string | null; typing: boolean }
-        | { type: "team-direct-typing"; recipientMemberId: string; typing: boolean };
+        | { type: "team-direct-typing"; recipientMemberId: string; typing: boolean }
+        | WorkflowSpotControl
+        | SyncClientMessage;
     };
 
 export type TeamProtocolV2FileControlFrame =
@@ -166,6 +170,8 @@ export function decodeTeamProtocolV2EventFrame(value: string | unknown): TeamPro
     return { version: 2, type: "event-reset", nextSequence: frame.nextSequence };
   }
   if (frame.type === "event-control" && isDynamicRecord(frame.control) && isString(frame.control.type)) {
+    const sync = syncControl(frame.control);
+    if (sync) return { version: 2, type: "event-control", control: sync };
     if (frame.control.type === "runtime-snapshot-request") {
       return { version: 2, type: "event-control", control: { type: "runtime-snapshot-request" } };
     }
@@ -195,8 +201,18 @@ export function decodeTeamProtocolV2EventFrame(value: string | unknown): TeamPro
         },
       };
     }
+    const spot = workflowSpotControl(frame.control);
+    if (spot) return { version: 2, type: "event-control", control: spot };
   }
   throw invalid("event frame");
+}
+
+function syncControl(control: DynamicRecord): SyncClientMessage | null {
+  try {
+    return decodeSyncClientMessage(control);
+  } catch {
+    throw invalid("event frame");
+  }
 }
 
 export function decodeTeamProtocolV2FileControlFrame(value: string | unknown): TeamProtocolV2FileControlFrame {

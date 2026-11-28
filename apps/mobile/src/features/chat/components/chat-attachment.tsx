@@ -1,5 +1,10 @@
 import { playableMediaKind } from "@openbot/contracts/attachment-files";
-import { CHAT_VISUAL_PAGE_LIMIT, chatVisualFrameHeight, isChatVisualMimeType } from "@openbot/contracts/chat-visual";
+import {
+  CHAT_VISUAL_DEFAULT_HEIGHT,
+  CHAT_VISUAL_PAGE_LIMIT,
+  chatVisualFrameHeight,
+  isChatVisualMimeType,
+} from "@openbot/contracts/chat-visual";
 import type { AttachmentSummary } from "@openbot/contracts/ipc";
 import { requireOptionalNativeModule } from "expo";
 import { File } from "expo-file-system";
@@ -14,6 +19,7 @@ import ImageOff from "lucide-react-native/icons/image-off";
 import { useEffect, useState } from "react";
 import { Pressable, useWindowDimensions, View } from "react-native";
 import Animated from "react-native-reanimated";
+import { useRemoteChatContent } from "@/features/servers/model/use-remote-chat-content";
 import { useFullVisualPreference } from "@/features/settings/model/visual-preview";
 import { haptics } from "@/shared/lib/haptics";
 import { useText } from "@/shared/lib/text";
@@ -88,6 +94,9 @@ function ChatVisualAttachment(props: ChatAttachmentProps) {
   const settled = useListSettled();
   const historyShown = useHistoryShown();
   const full = useFullVisualPreference((state) => state.enabled);
+  const remoteContent = useRemoteChatContent(serverId);
+  const [pageRun, setPageRun] = useState(false);
+  const scripts = remoteContent || pageRun;
   const [reported, setReported] = useState(() => reportedVisualHeights.get(attachment.id));
   const report = (height: number) => {
     reportedVisualHeights.set(attachment.id, height);
@@ -95,7 +104,8 @@ function ChatVisualAttachment(props: ChatAttachmentProps) {
   };
   const pageHeight = full
     ? chatVisualFrameHeight(reported ?? props.visual?.height)
-    : chatVisualFrameHeight(undefined, props.visual?.height);
+    : chatVisualFrameHeight(reported, props.visual?.height ?? CHAT_VISUAL_DEFAULT_HEIGHT);
+  const cut = reported !== undefined && Math.ceil(reported) > pageHeight;
   const file = useMediaFile(serverId, attachment, true);
   const [page, setPage] = useState<{ uri: string; source: string } | null>(null);
   const [failed, setFailed] = useState(false);
@@ -130,6 +140,7 @@ function ChatVisualAttachment(props: ChatAttachmentProps) {
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={t("mobile.chat.attachment.preview", { name: attachment.name })}
+        accessibilityHint={cut ? t("mobile.chat.attachment.seeAll") : undefined}
         style={{
           width: width - 80,
           maxWidth: "100%",
@@ -141,15 +152,44 @@ function ChatVisualAttachment(props: ChatAttachmentProps) {
         onPress={() => {
           void haptics.impact("soft");
           const local = { uri: page.uri, name: attachment.name, mimeType: attachment.mimeType };
-          const previewId = storeCodePreview({ kind: "html", source: page.source, language: "html", file: local });
+          const previewId = storeCodePreview({
+            kind: "html",
+            source: page.source,
+            language: "html",
+            file: local,
+            remoteContent: scripts,
+          });
           router.push({ pathname: "/code-preview/[previewId]", params: { previewId } });
         }}
       >
         <View pointerEvents="none" style={FILL}>
           {settled && historyShown ? (
-            <HtmlPage source={page.source} title={attachment.name} mode="chat" onHeight={full ? report : undefined} />
+            <HtmlPage source={page.source} title={attachment.name} mode="chat" scripts={scripts} onHeight={report} />
           ) : null}
         </View>
+        {scripts ? null : (
+          <View pointerEvents="box-none" className="absolute inset-x-0 top-2.5 items-center">
+            <Button
+              variant="secondary"
+              size="sm"
+              onPress={() => {
+                void haptics.selection();
+                setPageRun(true);
+              }}
+            >
+              <Button.Label>{t("mobile.chat.preview.runPage")}</Button.Label>
+            </Button>
+          </View>
+        )}
+        {cut ? (
+          <View pointerEvents="none" className="absolute inset-x-0 bottom-2.5 items-center">
+            <View className="rounded-full bg-background/70 px-2.5 py-1">
+              <Typography.Paragraph type="body-xs" className="font-semibold text-foreground">
+                {t("mobile.chat.attachment.seeAll")}
+              </Typography.Paragraph>
+            </View>
+          </View>
+        ) : null}
       </Pressable>
     );
   return (

@@ -94,17 +94,13 @@
 }
 
 .chat-scroll-rail-nav:is(:hover, :has(:focus-visible))
-  :is(.chat-scroll-rail-item[data-open] + * + *, .chat-scroll-rail-item:has(+ * + [data-open]))
+  .chat-scroll-rail-item[data-open-distance="2"]
   .chat-scroll-rail-tick {
   width: 10px;
 }
 
 .chat-scroll-rail-nav:is(:hover, :has(:focus-visible))
-  :is(
-    .chat-scroll-rail-item[data-state="active"],
-    .chat-scroll-rail-item[data-open] + *,
-    .chat-scroll-rail-item:has(+ [data-open])
-  )
+  :is(.chat-scroll-rail-item[data-state="active"], .chat-scroll-rail-item[data-open-distance="1"])
   .chat-scroll-rail-tick {
   width: var(--openbot-space-3);
 }
@@ -128,10 +124,11 @@
   flex-direction: column;
   gap: var(--openbot-space-1);
   padding: var(--openbot-space-3);
-  border: 1px solid color-mix(in srgb, var(--openbot-text-primary) 8%, transparent);
+  border: 1px solid var(--ui-menu-edge);
   border-radius: var(--openbot-radius-lg);
-  background: var(--openbot-bg-glass);
-  backdrop-filter: blur(var(--openbot-space-4));
+  background: var(--ui-popover-frost-bg);
+  -webkit-backdrop-filter: var(--ui-popover-frost-filter);
+  backdrop-filter: var(--ui-popover-frost-filter);
   font-size: var(--openbot-text-md);
   line-height: 18px;
   pointer-events: none;

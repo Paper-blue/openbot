@@ -11,23 +11,29 @@ import {
   type McpSignInState,
   type TestMcpServerInput,
 } from "@openbot/contracts/ipc";
+import { mcpAccountFragment } from "@openbot/contracts/mcp-accounts";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
+import { TEAM_APP_VERSION_HEADER, TEAM_PROTOCOL_VERSION_HEADER } from "@openbot/contracts/team-protocol";
 import {
-  TEAM_APP_VERSION_HEADER,
-  TEAM_CAPABILITIES_HEADER,
-  TEAM_PROTOCOL_VERSION_HEADER,
-} from "@openbot/contracts/team-protocol";
-import { MCP_MEMBER_ACCESS_CAPABILITY, teamCapabilitiesForProtocol } from "@openbot/contracts/team-protocol/current";
+  MCP_MEMBER_ACCESS_CAPABILITY,
+  teamCapabilitiesForProtocol,
+  teamCapabilityHeaders,
+} from "@openbot/contracts/team-protocol/current";
 import { MCP_ACCESS_CAPABILITY, MCP_ACCESS_ROUTES } from "@openbot/contracts/team-protocol/mcp-access-v1";
 import { MCP_SIGN_IN_APP_ROUTES } from "@openbot/contracts/team-protocol/mcp-sign-in-app-v1";
 import { MCP_SIGN_IN_ROUTES } from "@openbot/contracts/team-protocol/mcp-sign-in-v1";
 import { MCP_ROUTES } from "@openbot/contracts/team-protocol/mcp-v1";
+import {
+  PROVIDER_SIGN_IN_RELAY_V2_CAPABILITY,
+  PROVIDER_SIGN_IN_RELAY_V2_ROUTES,
+} from "@openbot/contracts/team-protocol/provider-sign-in-relay-v2";
 import {
   SIGN_IN_RELAY_DEEP_LINK_CAPABILITY,
   SIGN_IN_RELAY_DEEP_LINK_ROUTES,
 } from "@openbot/contracts/team-protocol/sign-in-relay-deep-link-v1";
 import { SIGN_IN_RELAY_ROUTES } from "@openbot/contracts/team-protocol/sign-in-relay-v1";
 import { TEAM_PROTOCOL_V9 } from "@openbot/contracts/team-protocol/v9";
+import { TEAM_PROTOCOL_V10 } from "@openbot/contracts/team-protocol/v10";
 import { sourceText } from "@openbot/i18n/source";
 import { plugin } from "bun";
 import { Effect } from "effect";
@@ -36,6 +42,7 @@ import { AgentService } from "../src/backend/agent-service";
 import { AgentStore } from "../src/backend/agent-store";
 import { runCauseEffect } from "../src/backend/effect-boundary";
 import { MailboxStore } from "../src/backend/mailbox-store";
+import { McpServerStore } from "../src/backend/mcp-server-store";
 import { OpenBotDatabase } from "../src/backend/openbot-database";
 import { SidebarLayoutStore } from "../src/backend/sidebar-layout-store";
 import type { TeamApiBrowser, TeamApiMcpSignIns, TeamApiSignInRelay } from "../src/main/team-api/dependencies";
@@ -121,6 +128,7 @@ async function step<T>(name: string, run: () => Promise<T>): Promise<T> {
 const unused = () => Effect.die(new Error("Not used by this check."));
 const agentBrowser: AgentBrowserHost = {
   listTabs: () => [],
+  toolCanUseTab: () => false,
   beginTakeover: unused,
   endTakeover: () => {},
   userControlTabFor: () => null,
@@ -146,6 +154,7 @@ const teamBrowser: TeamApiBrowser = {
   navigate: unused,
   reload: unused,
   stop: unused,
+  answerPermission: unused,
   takeUserControl: unused,
   startTeach: unused,
   stopTeach: () => [],
@@ -161,7 +170,9 @@ const teamBrowser: TeamApiBrowser = {
   startView: unused,
   dispatchViewInput: unused,
   copyViewSelection: unused,
+  answerViewDialog: unused,
   importSignIn: unused,
+  answerHttpSignIn: unused,
 };
 
 const calls: string[] = [];
@@ -196,7 +207,11 @@ const relay: TeamApiSignInRelay = {
       );
       return { flowId: `flow-${memberId}`, expiresAt: Date.now() + 60_000 };
     }),
-  startProvider: unused,
+  startProvider: (memberId, provider) =>
+    Effect.sync(() => {
+      calls.push(`relay-provider ${provider}`);
+      return { flowId: `flow-${memberId}`, expiresAt: Date.now() + 60_000 };
+    }),
   startProviderAccount: unused,
   startLink: () => assert.fail("Not used by this check."),
   status: () => assert.fail("Not used by this check."),
@@ -282,13 +297,13 @@ const RELEASED = CURRENT.filter(
 async function call(
   method: string,
   path: string,
-  input: { token?: string; body?: unknown; capabilities?: readonly string[] } = {},
+  input: { token?: string; body?: unknown; capabilities?: readonly string[]; protocol?: number } = {},
 ): Promise<{ status: number; body: unknown }> {
   const headers: Record<string, string> = {
     Accept: "application/json",
-    [TEAM_PROTOCOL_VERSION_HEADER]: String(TEAM_PROTOCOL_V9),
+    [TEAM_PROTOCOL_VERSION_HEADER]: String(input.protocol ?? TEAM_PROTOCOL_V9),
     [TEAM_APP_VERSION_HEADER]: HOST_VERSION,
-    [TEAM_CAPABILITIES_HEADER]: (input.capabilities ?? CURRENT).join(","),
+    ...teamCapabilityHeaders(input.protocol ?? TEAM_PROTOCOL_V9, input.capabilities ?? CURRENT),
   };
   if (input.body !== undefined) headers["Content-Type"] = "application/json";
   if (input.token) headers.Authorization = `Bearer ${input.token}`;
@@ -482,20 +497,46 @@ try {
     return Object.fromEntries(Object.entries(tries).map(([label, response]) => [label, response.status]));
   });
 
-  await step("a member's own row on the owner's address cannot sign in or sign out that address", async () => {
-    const shared = await save(memberToken, httpServer("trello-mine", OWNER_URL));
-    const signIn = await call("POST", MCP_SIGN_IN_ROUTES.start, { token: memberToken, body: { config: shared } });
-    refused(signIn, NOT_YOURS, "sign-in");
+  await step("a member's own row on the owner's address signs in its own account", async () => {
+    const own = await save(memberToken, httpServer("trello-mine", OWNER_URL));
+    assert.ok(mcpAccountFragment(own.url), "The member's row on the owner's address has no account of its own.");
+    const signIn = await call("POST", MCP_SIGN_IN_ROUTES.start, { token: memberToken, body: { config: own } });
+    assert.equal(signIn.status, 200, `Sign-in of the member's own account returned ${signIn.status}.`);
     const signOut = await call("POST", MCP_SIGN_IN_ROUTES.signOut, {
       token: memberToken,
-      body: { mcpServerId: shared.id },
+      body: { mcpServerId: own.id },
     });
-    refused(signOut, NOT_YOURS, "sign-out");
-    const removed = await call("POST", MCP_ROUTES.remove, { token: memberToken, body: { mcpServerId: shared.id } });
-    assert.equal(removed.status, 200, `Removing the member's own row returned ${removed.status}.`);
-    assert.deepEqual(calls, [], "A refused call reached the sign-in.");
-    return { signIn: signIn.status, signOut: signOut.status, remove: removed.status };
+    assert.equal(signOut.status, 200, `Sign-out of the member's own account returned ${signOut.status}.`);
+    assert.deepEqual(
+      calls,
+      [`start ${own.url}`, `sign-out ${own.id}`],
+      "The sign-in did not use the member's account.",
+    );
+    calls.length = 0;
+    return { url: own.url, signIn: signIn.status, signOut: signOut.status };
   });
+
+  await step(
+    "an older member row that shares the owner's address cannot sign in or sign out that address",
+    async () => {
+      const own = servers((await call("GET", MCP_ROUTES.list, { token: memberToken })).body).find(
+        (server) => server.name === "trello-mine",
+      );
+      assert.ok(own, "The member's row is missing.");
+      const shared = new McpServerStore(current().database).save({ ...own, url: OWNER_URL });
+      const signIn = await call("POST", MCP_SIGN_IN_ROUTES.start, { token: memberToken, body: { config: shared } });
+      refused(signIn, NOT_YOURS, "sign-in");
+      const signOut = await call("POST", MCP_SIGN_IN_ROUTES.signOut, {
+        token: memberToken,
+        body: { mcpServerId: shared.id },
+      });
+      refused(signOut, NOT_YOURS, "sign-out");
+      const removed = await call("POST", MCP_ROUTES.remove, { token: memberToken, body: { mcpServerId: shared.id } });
+      assert.equal(removed.status, 200, `Removing the member's own row returned ${removed.status}.`);
+      assert.deepEqual(calls, [], "A refused call reached the sign-in.");
+      return { signIn: signIn.status, signOut: signOut.status, remove: removed.status };
+    },
+  );
 
   await step("a provider sign-in stays with owners and admins", async () => {
     const provider = await call("POST", SIGN_IN_RELAY_ROUTES.providerStart, {
@@ -504,6 +545,32 @@ try {
     });
     refused(provider, ADMIN_REQUIRED, "provider");
     return { provider: provider.status };
+  });
+
+  await step("Devin's sign-in is relayed only on the provider-sign-in-relay-v2 route", async () => {
+    calls.length = 0;
+    const devin = { provider: "devin" };
+    const v10 = { protocol: TEAM_PROTOCOL_V10, capabilities: teamCapabilitiesForProtocol(TEAM_PROTOCOL_V10) };
+    const route = PROVIDER_SIGN_IN_RELAY_V2_ROUTES.start;
+    const member = await call("POST", route, { ...v10, token: memberToken, body: devin });
+    refused(member, ADMIN_REQUIRED, "member Devin relay");
+    const v1 = await call("POST", SIGN_IN_RELAY_ROUTES.providerStart, { ...v10, token: ownerToken, body: devin });
+    assert.equal(v1.status, 400, `The v1 route took Devin: ${v1.status}.`);
+    const older = await call("POST", route, {
+      ...v10,
+      token: ownerToken,
+      body: devin,
+      capabilities: v10.capabilities.filter((capability) => capability !== PROVIDER_SIGN_IN_RELAY_V2_CAPABILITY),
+    });
+    assert.equal(older.status, 400, `A client without the capability got ${older.status}.`);
+    const v9 = await call("POST", route, { token: ownerToken, body: devin });
+    assert.equal(v9.status, 400, `A protocol 9 client got ${v9.status}.`);
+    assert.deepEqual(calls, [], "A refused call reached the relay.");
+    const owner = await call("POST", route, { ...v10, token: ownerToken, body: devin });
+    assert.equal(owner.status, 200, `The owner's Devin relay returned ${owner.status}: ${JSON.stringify(owner.body)}.`);
+    assert.deepEqual(calls, ["relay-provider devin"], "The host did not start Devin's sign-in.");
+    calls.length = 0;
+    return { member: member.status, v1: v1.status, older: older.status, v9: v9.status, owner: owner.status };
   });
 
   await step("who added each server stays after a restart; the owner still changes any row", async () => {
@@ -642,6 +709,12 @@ try {
       await call("POST", MCP_SIGN_IN_ROUTES.status, { token: member, body: { url: OWNER_URL } }),
       NOT_YOURS,
       "sign-in status",
+    );
+    const otherAccount = httpServer("trello-other", `${OWNER_URL}#account-other`);
+    refused(
+      await call("POST", MCP_ROUTES.save, { token: member, body: { config: otherAccount } }),
+      NOT_YOURS,
+      "save of another account",
     );
     signedIn = [{ mcpServerId: own.id, signedIn: true }];
     const states = await call("POST", MCP_SIGN_IN_ROUTES.list, { token: member, body: {} });

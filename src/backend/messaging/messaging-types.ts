@@ -20,6 +20,7 @@ export interface MessagingPlace {
   id: string;
   name: string;
   kind: "channel" | "private" | "thread" | "chat";
+  readOnly?: true;
 }
 
 export interface MessagingPlaces {
@@ -140,7 +141,7 @@ export interface MessagingAdapter {
   readonly searchesHistory?: boolean;
   identify(): Effect.Effect<ConnectionIdentity, MessagingAdapterError>;
   post(target: MessageTarget, body: MessageBody): Effect.Effect<string, MessagingAdapterError>;
-  edit(target: MessageTarget, messageId: string, body: MessageBody): Effect.Effect<void, MessagingAdapterError>;
+  edit(target: MessageTarget, messageId: string, body: MessageBody): Effect.Effect<string, MessagingAdapterError>;
   remove?(target: MessageTarget, messageId: string): Effect.Effect<void, MessagingAdapterError>;
   postPrivate(
     target: MessageTarget,
@@ -230,6 +231,8 @@ export interface IngressAnswer {
 
 export type IngressState = "online" | "connecting" | "signed_out" | "no_host" | "unavailable";
 
+export type IngressFailure = "refused" | "certificate";
+
 export type IngressHandler = (
   workspaceId: string,
   delivery: IngressDelivery,
@@ -278,6 +281,7 @@ export class WhatsAppAnswerPartlySent extends Error {
 export interface MessagingIngress {
   acquire(platform: MessagingPlatform): () => void;
   state(): IngressState;
+  failure?(): IngressFailure | null;
   onState(listener: (state: IngressState) => void): () => void;
   handle(handler: IngressHandler | null): void;
   readonly telegram: TelegramGateway;
@@ -309,6 +313,7 @@ export class DiscordApiError extends Error {
 }
 
 export interface MessagingDriverOptions {
+  connectionId: string;
   rateLimited(retryAt: string): void;
 }
 

@@ -9,6 +9,7 @@ import type {
   VoiceServerProbe,
   VoiceServerSettings,
   VoiceSettings,
+  VoiceSettingsState,
   VoiceStream,
   VoiceTranscriptionResult,
 } from "@openbot/contracts/ipc";
@@ -22,6 +23,7 @@ import { sourceText } from "@openbot/i18n/source";
 import type { WebContents } from "electron";
 import type { AgentService } from "../../backend/agent-service";
 import { runCauseEffect } from "../../backend/effect-boundary";
+import { liveVoiceOf } from "../live-voice-choice";
 import { acceptEmpty } from "../remote-host-decoding";
 import type { RemoteServerManager } from "../remote-server-manager";
 import { voiceLiveEventFromWire } from "../team-api/route-live-voice";
@@ -133,7 +135,7 @@ export function voiceIpcHandlers({
         parseVoiceModelRequest,
         ({ modelId }): Promise<VoiceModelStatus> => runCauseEffect(voice.removeModel(modelId)),
       ),
-      getSettings: handler((): VoiceSettings => voice.getSettings()),
+      getSettings: handler((): VoiceSettingsState => voice.getSettings()),
       setSettings: payloadHandler(
         parseVoiceSettings,
         (settings): Promise<VoiceSettings> => runCauseEffect(voice.setSettings(settings)),
@@ -199,8 +201,9 @@ export function voiceIpcHandlers({
       startLive: eventPayloadHandler(
         agentRequest(parseVoiceLiveStart),
         async (event, { serverId, payload: input }): Promise<VoiceLiveSession> => {
-          const { codexLive, codexLiveVoice } = speech.getSettings();
-          if (!codexLive) throw new Error(sourceText("error.voice.live.off"));
+          const settings = speech.getSettings();
+          if (!settings.codexLive) throw new Error(sourceText("error.voice.live.off"));
+          const codexLiveVoice = liveVoiceOf(settings);
           const session = await routeToServer(serverId, {
             local: () => runCauseEffect(service.startLiveVoice(input, codexLiveVoice)),
             remote: async (target) => {

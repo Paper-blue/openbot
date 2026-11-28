@@ -23,12 +23,22 @@ export function mcpServerConfig(draft: McpServerDraft, id: string, enabled: bool
 export function mcpServerDraftChanged(draft: McpServerDraft, saved: McpServerConfig | undefined): boolean {
   const config = mcpServerConfig(draft, saved?.id ?? "", saved?.enabled ?? true);
   if (!saved) return JSON.stringify(config) !== JSON.stringify(mcpServerConfig(mcpServerDraft(undefined), "", true));
-  return JSON.stringify(config) !== JSON.stringify(normalizeMcpConfig(saved));
+  return JSON.stringify(config) !== JSON.stringify(mcpServerConfig(mcpServerDraft(saved), saved.id, saved.enabled));
 }
 
-export function mcpServerDraftErrors(config: McpServerConfig): { name: boolean; command: boolean; url: boolean } {
+export function mcpServerDraftErrors(config: McpServerConfig): {
+  name: boolean;
+  command: boolean;
+  url: boolean;
+  headers: string | null;
+} {
   const errors = mcpConfigErrors(config);
-  return { name: Boolean(errors.name), command: Boolean(errors.command), url: Boolean(errors.url) };
+  return {
+    name: Boolean(errors.name),
+    command: Boolean(errors.command),
+    url: Boolean(errors.url),
+    headers: errors.headers ?? null,
+  };
 }
 
 export function mcpServerDetail(config: McpServerConfig): string {

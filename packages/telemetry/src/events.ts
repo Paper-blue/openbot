@@ -87,10 +87,10 @@ export type Report = typeof Report.Type;
 export type ReportContext = Pick<Report, "surface" | "app_version" | "platform" | "event_schema_version">;
 
 export const ANALYTICS_GENERATIONS = {
-  desktop_host: 19,
-  desktop: 13,
+  desktop_host: 22,
+  desktop: 14,
   web: 2,
-  mobile: 4,
+  mobile: 5,
 } as const satisfies Record<Report["surface"], number>;
 
 const FAILURE_CODES = new Set([
@@ -238,7 +238,7 @@ export function classifyFailure(error: unknown): CauseCode {
   )
     return "billing";
   if (
-    /\b(?:usage limit|hit your (?:weekly |session |\d+-hour )?limit|(?:hit|reached) your (?:weekly|session|\d+-hour) (?!(?:spend|rate|context|tokens?|requests?)\b)[\w-]+ limit|hit your (?:[\w']+ ){0,2}spend limit|quota (?:exceeded|reached|exhausted)|free[ _-]usage[ _-]exhausted|key limit exceeded|credits? balance (?:is )?too low)\b/iu.test(
+    /\b(?:usage limit|hit your (?:weekly |session |\d+-hour )?limit|(?:hit|reached) your (?:weekly|session|\d+-hour) (?!(?:spend|rate|context|tokens?|requests?)\b)[\w-]+ limit|hit your (?:[\w']+ ){0,2}spend limit|quota (?:exceeded|reached|exhausted)|(?:daily|weekly|monthly) usage quota has been exhausted|free[ _-]usage[ _-]exhausted|key limit exceeded|credits? balance (?:is )?too low)\b/iu.test(
       message,
     )
   )
@@ -262,7 +262,7 @@ export function classifyFailure(error: unknown): CauseCode {
   )
     return "provider_unavailable";
   if (
-    /\b(?:context[ _-]?(?:length|window)[ _-]?exceeded|context[ _-]overflow|maximum context length|prompt is too long|too many (?:input )?tokens(?![^.]{0,40}\b(?:wait|per (?:minute|second|day)))|input token count\b.{0,80}\bexceeds)\b/iu.test(
+    /\b(?:context[ _-]?(?:length|window)[ _-]?exceeded|context[ _-]overflow|exceeds the context window|maximum context length|prompt is too long|too many (?:input )?tokens(?![^.]{0,40}\b(?:wait|per (?:minute|second|day)))|input token count\b.{0,80}\bexceeds)\b/iu.test(
       message,
     )
   )
@@ -270,7 +270,10 @@ export function classifyFailure(error: unknown): CauseCode {
   if (/\b(?:content[ _-]?filter(?:ed)?|requires moderation|was flagged|safety (?:filter|block))\b/iu.test(message))
     return "content_blocked";
   if (
-    /\b(?:model[ _]not[ _]found|unknown model|no such model|not a valid model|no endpoints found|model\b[^.,;:\n]{0,60}\b(?:not found|does not exist|is not supported))\b/iu.test(
+    /\b(?:model[ _]not[ _]found|unknown model|no such model|not a valid model|no endpoints found|model\b(?![.:]\S)(?:[^.,;:\n]|[.:](?=\S)){0,60}\b(?:not found|does not exist|is not supported))\b/iu.test(
+      message,
+    ) ||
+    /\bmodels\/\S+ is not found\b|\bmodel\b(?:\s+\S+)?\s+(?:(?:was|is|has been) retired|is no longer (?:available|supported))\b/iu.test(
       message,
     )
   )
@@ -293,6 +296,7 @@ export function httpStatusCause(status: number): CauseCode | null {
   if (status === 404) return "not_found";
   if (status === 408 || status === 504) return "timeout";
   if (status === 409) return "conflict";
+  if (status === 410) return "model_not_found";
   if (status === 413) return "context_too_long";
   if (status === 429) return "rate_limit";
   return status >= 500 && status <= 599 ? "provider_unavailable" : null;

@@ -31,10 +31,14 @@ import { ChatGlassButton, ChatGlassIconButton } from "@/features/chat/components
 import {
   useAgentBrowserTab,
   useAgentBrowserTabs,
+  useBrowserHttpSignIn,
   useBrowserRequests,
   useBrowserTabsLoaded,
 } from "@/features/workspace/components/use-live-workspace";
-import { useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
+import {
+  useMobileWorkspaceActions,
+  useMobileWorkspaceSelector,
+} from "@/features/workspace/context/mobile-workspace-context";
 import type { MobileAgent, MobileBrowserViewSupport } from "@/features/workspace/model/workspace-types";
 import { type MenuAction, type MenuComponentRef, MenuView } from "@/shared/components/menu-view";
 import { toolbarMenuItems } from "@/shared/components/toolbar-menu-items";
@@ -47,12 +51,15 @@ import { MIRROR_IN_RTL } from "@/shared/lib/text-direction";
 import { useAppForeground } from "@/shared/lib/use-app-foreground";
 import { useCloseScreen } from "@/shared/lib/use-close-screen";
 import { useLiquidGlass } from "@/shared/lib/use-liquid-glass";
+import { BrowserHttpSignInCard } from "../components/browser-http-sign-in-card";
 import { BrowserLiveStage, type BrowserLiveStageHandle } from "../components/browser-live-stage";
 import { useBrowserFeature } from "../components/use-browser-feature";
 import { useBrowserLiveView } from "../components/use-browser-live-view";
+import { useBrowserLocationRequest } from "../components/use-browser-location-request";
 import { useUnseenBrowserTabs } from "../components/use-unseen-browser-tabs";
 import { namedKeyInputs, pasteInput, selectAllInputs, textChangeInputs, typedTextInputs } from "../model/browser-keys";
 import { useProvideBrowserSheetControls } from "../model/browser-sheet-bridge";
+import { urlHost } from "../model/browser-tabs";
 import type { LiveViewMode } from "../model/live-view-gestures";
 
 const CONTROL_SIZE = 48;
@@ -68,12 +75,29 @@ const FADE: CSSTransitionProperties = {
   transitionDuration: 200,
   transitionTimingFunction: cubicBezier(0.23, 1, 0.32, 1),
 };
+
+const BROWSER_SUPPORT_FIELDS: { [Field in keyof MobileBrowserViewSupport]: Field } = {
+  view: "view",
+  clipboard: "clipboard",
+  contextMenu: "contextMenu",
+  viewport: "viewport",
+  navigation: "navigation",
+  permissions: "permissions",
+  httpSignIn: "httpSignIn",
+};
+
+function sameBrowserSupport(previous: MobileBrowserViewSupport, next: MobileBrowserViewSupport): boolean {
+  return Object.values(BROWSER_SUPPORT_FIELDS).every((field) => previous[field] === next[field]);
+}
+
 const NO_SUPPORT: MobileBrowserViewSupport = {
   view: false,
   clipboard: false,
   contextMenu: false,
   viewport: false,
   navigation: false,
+  permissions: false,
+  httpSignIn: false,
 };
 
 let rememberedMode: LiveViewMode = "trackpad";
@@ -85,7 +109,7 @@ export function BrowserScreen() {
     tabId?: string;
     agentIds?: string;
   }>();
-  const { agents } = useMobileWorkspace();
+  const agents = useMobileWorkspaceSelector((workspace) => workspace.agents);
   const [selectedId, setSelectedId] = useState(agentId);
   const onServer = (id: string) =>
     agents.find((candidate) => candidate.id === id && (!serverId || candidate.serverId === serverId));
@@ -139,15 +163,25 @@ function BrowserView({
   const { theme } = useUniwind();
   const appearance = theme === "dark" ? "dark" : "light";
   const iconColor = String(foreground);
-  const { servers, browserViewSupport, respondToBrowserTakeover, controlBrowserTab, conversationStore } =
-    useMobileWorkspace();
-  const server = servers.find((candidate) => candidate.id === agent.serverId);
-  const online = server?.state === "online";
-  const support = online ? browserViewSupport(agent.serverId) : NO_SUPPORT;
+  const { respondToBrowserTakeover, controlBrowserTab, answerBrowserHttpSignIn } = useMobileWorkspaceActions();
+  const online = useMobileWorkspaceSelector(
+    (workspace) => workspace.servers.find((candidate) => candidate.id === agent.serverId)?.state === "online",
+  );
+  const support = useMobileWorkspaceSelector(
+    (workspace) => (online ? workspace.browserViewSupport(agent.serverId) : NO_SUPPORT),
+    sameBrowserSupport,
+  );
   const allowed = useBrowserFeature();
-  const threadId = conversationStore.get(agent.id)?.threadId ?? null;
+  const threadId = useMobileWorkspaceSelector(
+    (workspace) => workspace.conversationStore.get(agent.id)?.threadId ?? null,
+  );
   const tabs = useAgentBrowserTabs(agent.serverId, agent.id, threadId);
   const tab = useAgentBrowserTab(agent.serverId, agent.id, preferredTabId, threadId);
+  const livePrompt = useBrowserHttpSignIn(agent.serverId, tab?.id ?? null);
+  const [answering, setAnswering] = useState<{ tabId: string; origin: string } | null>(null);
+  const [signInUsername, setSignInUsername] = useState({ key: "", value: "" });
+  const httpSignIn =
+    livePrompt ?? (tab && answering?.tabId === tab.id ? { origin: answering.origin, refused: false } : undefined);
   const appForeground = useAppForeground();
   const contextMenu = useRef<(menu: BrowserViewContextMenu) => void>(() => undefined);
   const live = useBrowserLiveView(
@@ -172,6 +206,12 @@ function BrowserView({
     at: { x: number; y: number };
   } | null>(null);
   const pageMenuView = useRef<MenuComponentRef>(null);
+  useBrowserLocationRequest({
+    serverId: agent.serverId,
+    tabId: tab?.id ?? null,
+    enabled: allowed && online && support.permissions,
+    notify: setNotice,
+  });
   const takeover = useBrowserRequests(agent.serverId).find(
     (request) => request.agentId === agent.id && (!request.secret || request.secret.requiresReload),
   );
@@ -579,6 +619,37 @@ function BrowserView({
             >
               <Typography.Paragraph type="body-sm">{notice}</Typography.Paragraph>
             </Animated.View>
+          ) : null}
+          {allowed && support.httpSignIn && tab && httpSignIn ? (
+            <View
+              pointerEvents="box-none"
+              className="absolute inset-x-0"
+              style={{
+                bottom: controlBottom + CONTROL_SIZE + 12,
+                paddingLeft: insets.left + 16,
+                paddingRight: insets.right + 16,
+              }}
+            >
+              <BrowserHttpSignInCard
+                key={`${tab.id}\n${httpSignIn.origin}`}
+                site={urlHost(httpSignIn.origin) || httpSignIn.origin}
+                refused={httpSignIn.refused}
+                initialUsername={signInUsername.key === `${tab.id}\n${httpSignIn.origin}` ? signInUsername.value : ""}
+                onUsernameChange={(value) => setSignInUsername({ key: `${tab.id}\n${httpSignIn.origin}`, value })}
+                answer={async (value) => {
+                  const prompt = { tabId: tab.id, origin: httpSignIn.origin };
+                  if (value) setAnswering(prompt);
+                  try {
+                    await answerBrowserHttpSignIn(
+                      agent.serverId,
+                      value ? { tabId: tab.id, ...value } : { tabId: tab.id, cancel: true },
+                    );
+                  } finally {
+                    if (value) setAnswering((current) => (current === prompt ? null : current));
+                  }
+                }}
+              />
+            </View>
           ) : null}
           <View
             pointerEvents="box-none"

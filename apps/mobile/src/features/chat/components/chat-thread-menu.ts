@@ -27,6 +27,8 @@ export interface ChatThreadMenu {
   onPressAction: (id: string) => void;
   attention: number;
   color: string;
+  inThread: boolean;
+  threadCount: number;
 }
 
 export function useChatThreadMenu(
@@ -93,7 +95,8 @@ export function useChatThreadMenu(
     const onPressAction = (id: string) => {
       void haptics.selection();
       if (id === MAIN_THREAD_ID) {
-        if (inThread) router.dismissTo({ pathname: "/chat/[agentId]", params: { agentId: agent.id } });
+        if (inThread)
+          router.dismissTo({ pathname: "/chat/[agentId]", params: { agentId: agent.id, serverId: agent.serverId } });
       } else if (id === DRAFT_THREAD_ID) openThread(DRAFT_THREAD_ID);
       else if (id === "all")
         router.push({ pathname: "/server-tasks", params: { serverId: agent.serverId, agentId: agent.id } });
@@ -105,6 +108,6 @@ export function useChatThreadMenu(
       }
     };
     const attention = tasks.filter((task) => task.id !== activeId && unread(task.id)).length;
-    return { actions, onPressAction, attention, color: agentColor };
+    return { actions, onPressAction, attention, color: agentColor, inThread, threadCount: tasks.length };
   }, [supported, tasks, reads, agentColor, activeId, agent.id, agent.serverId, t]);
 }

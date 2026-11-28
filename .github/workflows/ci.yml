@@ -95,12 +95,12 @@ jobs:
           else
             echo "docs=false" >> "$GITHUB_OUTPUT"
           fi
-          lane_unless desktop '^(apps/(auth-api|mobile|mobile-updates|site-router|status)|docker|remote)/'
+          lane_unless desktop '^(apps/(auth-api|browser-extension|mobile|mobile-updates|site-router|status)|docker|remote)/'
           lane api '^(apps/(auth-api|site-router)|src/renderer|resources)/|^(apps/mobile/)?CHANGELOG\.md$'
           lane remote '^(remote|scripts)/'
           lane storybook '^(src|apps/(auth-api|status)|\.storybook|resources|marketplace|build)/'
           lane schema '^(src/backend/|scripts/released-schema-fixtures\.ts$)'
-          lane surfaces '^(apps/(mobile|mobile-updates|site-router|status)|remote|scripts)/'
+          lane surfaces '^(apps/(browser-extension|mobile|mobile-updates|site-router|status)|remote|scripts)/'
           cat "$GITHUB_OUTPUT"
 
   check:
@@ -134,6 +134,10 @@ jobs:
       - name: Check image asset directories
         if: env.CODE == 'true'
         run: bun run check:assets
+
+      - name: Check plugin catalog
+        if: env.CODE == 'true'
+        run: bun run marketplace:build:plugins -- --check
 
       - name: Check Markdown links and anchors
         run: bun run check:doc-links
@@ -216,6 +220,9 @@ jobs:
       - name: Run the browser dialogs E2E
         run: xvfb-run -a bun run test:browser-dialogs
 
+      - name: Run the browser idle freeze E2E
+        run: xvfb-run -a bun run test:browser-idle-freeze
+
       - name: Run the browser fingerprint E2E
         run: xvfb-run -a bun run test:browser-fingerprint
 
@@ -269,12 +276,31 @@ jobs:
       - name: Run the Signal E2E test
         run: bun run test:signal
 
+      - name: Run the direct remote protocol E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:remote-protocol
+
+      - name: Run the account service server list E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:host-list-batch
+
+      - name: Run the account service database replica E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:d1-replica-reads
+
+      - name: Run the account service request session E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:d1-request-session
+
       - name: Upload the Signal E2E report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: signal-security-e2e
-          path: .openbot-build/signal-security-e2e/
+          path: |
+            .openbot-build/signal-security-e2e/
+            .openbot-build/remote-protocol-e2e/
+            .openbot-build/d1-request-session-e2e/
           if-no-files-found: ignore
 
   automation-cli-e2e:
@@ -326,9 +352,33 @@ jobs:
       - name: Run the Team API routes E2E test
         run: bun run test:team-api-routes
 
+      - name: Run the Apple Watch relay host E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:watch-relay-host
+
       - name: Run the CRM Team API E2E test
         if: ${{ !cancelled() }}
         run: bun run test:crm-team-api
+
+      - name: Run the sync collections E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:sync
+
+      - name: Run the sync message logs E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:sync-log
+
+      - name: Run the joined-server sync E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:remote-sync
+
+      - name: Run the joined-server sync over WebRTC E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:remote-sync-webrtc
+
+      - name: Run the account activity reporter E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:account-activity-reporter
 
       - name: Run the release version comparator E2E test
         if: ${{ !cancelled() }}
@@ -342,6 +392,10 @@ jobs:
           path: |
             .openbot-build/team-api-routes-e2e/
             .openbot-build/crm-team-api-e2e/
+            .openbot-build/watch-relay-host-e2e/
+            .openbot-build/sync/
+            .openbot-build/remote-server-sync-e2e/
+            .openbot-build/remote-server-sync-webrtc-e2e/
             .openbot-build/release-version-comparator-e2e.json
           if-no-files-found: ignore
 
@@ -372,6 +426,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun run test:team-protocol-v10
 
+      - name: Run the Team protocol decoder E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:team-protocol-decoders
+
+      - name: Run the conversation ownership E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:conversation-ownership
+
       - name: Run the Team WebRTC wire parity E2E test
         if: ${{ !cancelled() }}
         run: bun run test:team-webrtc-wire-parity
@@ -398,6 +460,10 @@ jobs:
       - name: Run the MCP member access E2E test
         if: ${{ !cancelled() }}
         run: bun run test:mcp-member-access
+
+      - name: Run the shared plugin catalog E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:plugin-catalog
 
       - name: Run the server mute and unmute E2E test
         if: ${{ !cancelled() }}
@@ -439,6 +505,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun run test:agent-waits-tools
 
+      - name: Run the side-thread open-wait E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:agent-waits-side-thread
+
+      - name: Run the browser takeover deadline E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:browser-takeover-deadline
+
       - name: Run the agent hide and restore E2E test
         if: ${{ !cancelled() }}
         run: bun run test:agent-hide-restore
@@ -450,6 +524,14 @@ jobs:
       - name: Run the update host takeover E2E test
         if: ${{ !cancelled() }}
         run: bun run test:update-host-takeover
+
+      - name: Run the hosted update idle wait E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:hosted-update-idle-wait
+
+      - name: Run the hosted watchdog E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:hosted-watchdog
 
       - name: Run the messaging pause and resume E2E test
         if: ${{ !cancelled() }}
@@ -491,9 +573,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun run test:provider-update-busy
 
-      - name: Run the provider update after an app upgrade E2E test
+      - name: Run the automatic provider update E2E test
         if: ${{ !cancelled() }}
-        run: bun run test:provider-update-after-app-upgrade
+        run: bun run test:provider-update-automatic
 
       - name: Run the provider CLI removal E2E test
         if: ${{ !cancelled() }}
@@ -559,6 +641,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun run test:routine-report-failure
 
+      - name: Run the routine skipped runs report E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:routine-skipped-runs-report
+
       - name: Run the agent webhook routine E2E test
         if: ${{ !cancelled() }}
         run: bun run test:agent-webhook-routine
@@ -574,6 +660,10 @@ jobs:
       - name: Run the Library folders agent tool E2E test
         if: ${{ !cancelled() }}
         run: bun run test:library-folders
+
+      - name: Run the workflow folders E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-folders
 
       - name: Run the agent workflow gate E2E test
         if: ${{ !cancelled() }}
@@ -622,6 +712,18 @@ jobs:
       - name: Run the Claude late steer E2E test
         if: ${{ !cancelled() }}
         run: bun run test:claude-late-steer
+
+      - name: Run the Claude steer during a tool call E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:claude-steer-now
+
+      - name: Run the Claude message during a question E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:question-steer-order
+
+      - name: Run the steer before the turn id E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:steer-before-turn-id
 
       - name: Run the provider session reuse E2E test
         if: ${{ !cancelled() }}
@@ -675,10 +777,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun run test:agent-update-agents
 
-      - name: Run the Gemini usage E2E test
-        if: ${{ !cancelled() }}
-        run: bun run test:antigravity-usage
-
       - name: Run the Gemini accounts E2E test
         if: ${{ !cancelled() }}
         run: bun run test:antigravity-accounts
@@ -695,6 +793,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun run test:antigravity-failing-session
 
+      - name: Run the Gemini account verification link E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:antigravity-verification-link
+
       - name: Run the Gemini Windows zip E2E test
         if: ${{ !cancelled() }}
         run: bun run test:antigravity-windows-zip
@@ -702,6 +804,26 @@ jobs:
       - name: Run the workflow model steps E2E test
         if: ${{ !cancelled() }}
         run: bun run test:workflow-model-steps
+
+      - name: Run the credit media workflow E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:credit-media-workflow
+
+      - name: Run the credit media agent tools E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:credit-media-agent-tools
+
+      - name: Run the credit media analytics E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:credit-media-analytics
+
+      - name: Run the workflow paid media E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-paid-media
+
+      - name: Run the credit media payer switch E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:credit-media-payer-switch
 
       - name: Run the workflow Discord E2E test
         if: ${{ !cancelled() }}
@@ -726,6 +848,50 @@ jobs:
       - name: Run the workflow join E2E test
         if: ${{ !cancelled() }}
         run: bun run test:workflow-join
+
+      - name: Run the workflow agent step E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-agent-step
+
+      - name: Run the workflow answers E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-answers
+
+      - name: Run the workflow output templates E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-output-templates
+
+      - name: Run the workflow trigger fields E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-trigger-fields
+
+      - name: Run the workflow file codec E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-file-codec
+
+      - name: Run the workflow format E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-format
+
+      - name: Run the workflow schedule E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-schedule
+
+      - name: Run the provider image MIME E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:provider-image-mime
+
+      - name: Run the workflow step settings E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-step-settings
+
+      - name: Run the workflow Team API E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:workflow-team-api
+
+      - name: Run the instance transfer E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:instance-transfer
 
       - name: Run the Discord files to GitHub E2E test
         if: ${{ !cancelled() }}
@@ -771,6 +937,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun run test:remote-connect-analytics
 
+      - name: Run the mobile reconnect E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:mobile-reconnect
+
+      - name: Run the mobile agent list E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:mobile-agent-list
+
       - name: Run the memory review E2E test
         if: ${{ !cancelled() }}
         run: bun run test:memory-review
@@ -808,9 +982,13 @@ jobs:
             .openbot-build/routine-timezone-move-e2e/
             .openbot-build/routine-overnight-window-e2e/
             .openbot-build/agent-waits-tools-e2e/
+            .openbot-build/agent-waits-side-thread-e2e/
+            .openbot-build/browser-takeover-deadline-e2e/
             .openbot-build/agent-hide-restore-e2e/
             .openbot-build/agent-create-retry-e2e/
             .openbot-build/update-host-takeover-e2e/
+            .openbot-build/hosted-update-idle-wait-e2e/
+            .openbot-build/hosted-watchdog-e2e/
             .openbot-build/messaging-pause-resume-e2e/
             .openbot-build/messaging-discord-access-e2e/
             .openbot-build/messaging-discord-embeds-e2e/
@@ -820,7 +998,7 @@ jobs:
             .openbot-build/turn-input-e2e/
             .openbot-build/zero-filled-settings-e2e/
             .openbot-build/provider-update-busy-e2e/
-            .openbot-build/provider-update-after-app-upgrade-e2e/
+            .openbot-build/provider-update-automatic-e2e/
             .openbot-build/provider-runtime-remove-e2e/
             .openbot-build/provider-exit-session-e2e/
             .openbot-build/acp-subagents-e2e/
@@ -837,10 +1015,12 @@ jobs:
             .openbot-build/usage-read-pacing-e2e/
             .openbot-build/routine-fresh-session-e2e/
             .openbot-build/routine-report-failure-e2e/
+            .openbot-build/routine-skipped-runs-report-e2e/
             .openbot-build/agent-webhook-routine-e2e/
             .openbot-build/agent-channel-manage-e2e/
             .openbot-build/agent-channel-create-e2e/
             .openbot-build/library-folders-e2e/
+            .openbot-build/workflow-folders-e2e/
             .openbot-build/agent-workflow-gate-e2e/
             .openbot-build/pinned-message-agent-tool-e2e/
             .openbot-build/messaging-owner-card-e2e/
@@ -853,6 +1033,9 @@ jobs:
             .openbot-build/claude-background-hold-e2e/
             .openbot-build/claude-turn-context-e2e/
             .openbot-build/claude-late-steer-e2e/
+            .openbot-build/claude-steer-now-e2e/
+            .openbot-build/question-steer-order-e2e/
+            .openbot-build/steer-before-turn-id-e2e/
             .openbot-build/provider-session-reuse-e2e/
             .openbot-build/backup-model-failover-e2e/
             .openbot-build/codex-empty-lead-turn-e2e/
@@ -863,18 +1046,33 @@ jobs:
             .openbot-build/agent-mcp-tools-e2e/
             .openbot-build/mcp-server-unreadable-row-e2e/
             .openbot-build/agent-update-agents-e2e/
-            .openbot-build/antigravity-usage-e2e/
             .openbot-build/antigravity-accounts-e2e/
             .openbot-build/antigravity-usage-metering-e2e/
             .openbot-build/antigravity-quota-failover-e2e/
             .openbot-build/antigravity-failing-session-e2e/
+            .openbot-build/antigravity-verification-link-e2e/
             .openbot-build/workflow-model-steps-e2e/
+            .openbot-build/credit-media-workflow-e2e/
+            .openbot-build/credit-media-agent-tools-e2e/
+            .openbot-build/credit-media-analytics-e2e/
+            .openbot-build/workflow-paid-media-e2e/
+            .openbot-build/credit-media-payer-switch-e2e/
             .openbot-build/workflow-discord-e2e/
             .openbot-build/workflow-telegram-e2e/
             .openbot-build/workflow-slack-e2e/
             .openbot-build/workflow-channel-output-e2e/
             .openbot-build/workflow-agent-tools-e2e/
             .openbot-build/workflow-join-e2e/
+            .openbot-build/workflow-agent-step-e2e/
+            .openbot-build/workflow-answers-e2e/
+            .openbot-build/workflow-output-templates-e2e/
+            .openbot-build/workflow-trigger-fields-e2e/
+            .openbot-build/workflow-file-codec-e2e/
+            .openbot-build/workflow-format-e2e/
+            .openbot-build/provider-image-mime-e2e/
+            .openbot-build/workflow-step-settings-e2e/
+            .openbot-build/workflow-team-api-e2e/
+            .openbot-build/instance-transfer-everything-e2e/
             .openbot-build/discord-github-files-e2e/
             .openbot-build/opencode-usage-metering-e2e/
             .openbot-build/claude-api-key-e2e/
@@ -886,6 +1084,8 @@ jobs:
             .openbot-build/provider-launch-order-e2e/
             .openbot-build/agent-api-keys-e2e/
             .openbot-build/remote-connect-analytics-e2e/
+            .openbot-build/mobile-reconnect-e2e/
+            .openbot-build/mobile-agent-list-e2e/
             .openbot-build/memory-review-e2e/
             .openbot-build/skill-revision-e2e.json
           if-no-files-found: ignore
@@ -1149,6 +1349,12 @@ jobs:
           - name: Typecheck status page
             run: bun run typecheck:status
 
+          - name: Typecheck browser extension
+            run: bun run typecheck:extension
+
+      - name: Build browser extension
+        run: bun run --cwd apps/browser-extension build
+
       - parallel:
           - name: Typecheck logging
             run: bun run typecheck:logging
@@ -1191,6 +1397,18 @@ jobs:
         with:
           name: mobile-share-sender-e2e
           path: .openbot-build/mobile-share-sender-e2e/report.json
+          if-no-files-found: ignore
+
+      - name: Run the mobile stream reconcile E2E test
+        if: ${{ !cancelled() }}
+        run: bun run test:mobile-stream-reconcile
+
+      - name: Upload the mobile stream reconcile E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-stream-reconcile-e2e
+          path: .openbot-build/mobile-stream-reconcile-e2e/report.json
           if-no-files-found: ignore
 
   mobile-ota-e2e:
@@ -1461,6 +1679,9 @@ jobs:
         shell: bash
         env:
           EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_SMTP_OVERFLOW_PASSWORD: ${{ secrets.EMAIL_SMTP_OVERFLOW_PASSWORD }}
+          EMAIL_SMTP_OVERFLOW_2_PASSWORD: ${{ secrets.EMAIL_SMTP_OVERFLOW_2_PASSWORD }}
+          EMAIL_SMTP_OVERFLOW_3_PASSWORD: ${{ secrets.EMAIL_SMTP_OVERFLOW_3_PASSWORD }}
           SKILLS_ADMIN_TOKEN: ${{ secrets.SKILLS_ADMIN_TOKEN }}
           SITE_OPERATIONS_ADMIN_TOKEN: ${{ secrets.SITE_OPERATIONS_ADMIN_TOKEN }}
           SERVER_CLAIMS_ADMIN_TOKEN: ${{ secrets.SERVER_CLAIMS_ADMIN_TOKEN }}
@@ -1481,6 +1702,9 @@ jobs:
           APNS_KEY_ID: ${{ secrets.APNS_KEY_ID }}
           FCM_SERVICE_ACCOUNT: ${{ secrets.FCM_SERVICE_ACCOUNT }}
           COMPANY_SIGN_IN_SECRET: ${{ secrets.COMPANY_SIGN_IN_SECRET }}
+          HOSTED_ARCHIVE_KEY_SECRET: ${{ secrets.HOSTED_ARCHIVE_KEY_SECRET }}
+          B2_WORKER_KEY_ID_EU: ${{ secrets.B2_WORKER_KEY_ID_EU }}
+          B2_WORKER_APPLICATION_KEY_EU: ${{ secrets.B2_WORKER_APPLICATION_KEY_EU }}
         run: |
           secrets_path="$RUNNER_TEMP/openbot-worker-secrets.json"
           umask 077
@@ -1518,11 +1742,15 @@ jobs:
               ["BOAT_API_KEY", "BOAT_WEBHOOK_SECRET"],
               // The Live Activity relay stays off until both are set.
               ["APNS_PRIVATE_KEY", "APNS_KEY_ID"],
+              ["HOSTED_ARCHIVE_KEY_SECRET", "B2_WORKER_KEY_ID_EU", "B2_WORKER_APPLICATION_KEY_EU"],
             ]) {
               const present = names.filter((name) => process.env[name]?.trim());
               if (present.length === 0) continue;
               if (present.length !== names.length) throw new Error(`Set ${names.join(" and ")} together.`);
               for (const name of names) optional[name] = process.env[name].trim();
+            }
+            for (const name of ["EMAIL_SMTP_OVERFLOW_PASSWORD", "EMAIL_SMTP_OVERFLOW_2_PASSWORD", "EMAIL_SMTP_OVERFLOW_3_PASSWORD"]) {
+              if (process.env[name]) optional[name] = process.env[name];
             }
             const githubAppKey = process.env.OPENBOT_GITHUB_APP_PRIVATE_KEY?.trim();
             if (githubAppKey) optional.GITHUB_APP_PRIVATE_KEY = githubAppKey;

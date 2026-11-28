@@ -5,6 +5,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { resolve } from "node:path";
+import { createHostGrantKeyPair } from "@openbot/contracts/host-grant";
 import {
   GITHUB_DELIVERY_BODY_BYTES_LIMIT,
   GITHUB_DELIVERY_HEADER,
@@ -26,6 +27,18 @@ import {
   type RemoteTicketClaims,
 } from "@openbot/contracts/signal-protocol/ticket";
 import {
+  openWatchReply,
+  openWatchRequest,
+  sealWatchReply,
+  sealWatchRequest,
+  WATCH_RELAY_BODY_BYTES_LIMIT,
+  WATCH_RELAY_PATH,
+  WATCH_TICKET_AUDIENCE,
+  type WatchTicketClaims,
+  watchProofMessage,
+  watchSealedDigest,
+} from "@openbot/contracts/signal-protocol/watch-relay";
+import {
   STANDARD_WEBHOOKS_FORMAT,
   WEBHOOK_DELIVERY_ID_HEADER,
   WEBHOOK_EVENTS_PATH,
@@ -33,8 +46,10 @@ import {
   WEBHOOK_SIGNATURE_HEADER,
   WEBHOOK_TIMESTAMP_HEADER,
 } from "@openbot/contracts/signal-protocol/webhook-route";
+import type { WatchCommand } from "@openbot/contracts/watch-protocol";
+import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger } from "@openbot/logging";
-import { exportJWK, type JWTPayload, SignJWT } from "jose";
+import { decodeJwt, exportJWK, type JWTPayload, SignJWT } from "jose";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const OUT = resolve(ROOT, ".openbot-build/signal-security-e2e");
@@ -62,13 +77,23 @@ const GITHUB_REPOSITORY = 77;
 const LINK_HOST_ID = "host-link-e2e";
 const LINK_CHAT = "-500";
 const LINK_CODE = randomBytes(32).toString("base64url");
+const OFFLINE_LINKED_CHAT = "-700";
+const FAILED_LOOKUP_CHAT = "-701";
+const UNLINKED_CHAT = "-702";
+const LAST_UNLINKED_CHAT = "-709";
 const UNAVAILABLE_HOST_ID = "host-unavailable-e2e";
 const INACTIVE_HOST_ID = "host-inactive-e2e";
 const BURST_HOST_PREFIX = "host-burst-e2e-";
 const BURST_PEERS = 100;
 const BURST_CHECK_MILLISECONDS = 300;
 const RESUME_CHECK_CONCURRENCY = 64;
+const RESUME_BATCH_LIMIT = 100;
+const SIGNAL_START_CLOCK_SKEW_MILLISECONDS = 60_000;
+const FRESH_HOST_ID = "host-fresh-e2e";
+const OLD_HOST_ID = "host-old-e2e";
 const burstChecks = { active: 0, maximum: 0 };
+const resumeBatches: number[] = [];
+let resumeBatchSupported = true;
 const LIVE_RELAYS = ["127.0.0.1", "localhost"];
 const DOWN_RELAY = "turn-down.invalid";
 const RELAY_HOST_IDS = Array.from({ length: 12 }, (_, index) => `host-relay-e2e-${index}`);
@@ -78,6 +103,13 @@ const ENTRY_HOST = "signal.entry.test";
 const ENTRY_IPV4 = "192.0.2.1";
 const OTHER_IPV4 = "192.0.2.2";
 const entryDns = { address: ENTRY_IPV4 };
+const WATCH_HOST_ID = "host-watch-e2e";
+const WATCH_SILENT_HOST_ID = "host-watch-silent-e2e";
+const WATCH_OFFLINE_HOST_ID = "host-watch-offline-e2e";
+const WATCH_SLEEPING_HOST_ID = "host-watch-sleeping-e2e";
+const WATCH_REVOKED_HOST_ID = "host-watch-revoked-e2e";
+const WATCH_COMMAND_TEXT = `watch-plaintext-${randomBytes(12).toString("hex")}`;
+const WATCH_REPLY_TEXT = `watch-reply-${randomBytes(12).toString("hex")}`;
 
 interface Check {
   name: string;
@@ -189,8 +221,10 @@ function hmac(secret: string, text: string, encoding: "hex" | "base64url") {
   return createHmac("sha256", secret).update(text).digest(encoding);
 }
 
-const controlPlaneCalls: Array<{ path: string; signed: boolean }> = [];
+const controlPlaneCalls: Array<{ path: string; signed: boolean; hostIds: string[] }> = [];
+const callsFor = (hostId: string) => controlPlaneCalls.filter((call) => call.hostIds.includes(hostId));
 const routeWakes: Array<{ chatId: string; wake: boolean }> = [];
+const botApiCalls: Array<{ method: string; body: string; chatId: number | null }> = [];
 const SLEEPING_WEBHOOK_ROUTES: Record<string, string> = {
   "route-sleeping-a1": "host-sleeping-a",
   "route-sleeping-a2": "host-sleeping-a",
@@ -200,6 +234,7 @@ const SLEEPING_WEBHOOK_ROUTES: Record<string, string> = {
 const STARTING_WEBHOOK_ROUTES: Record<string, string> = { "route-starting-d": "host-starting-d" };
 let failNextWebhookWake = "route-sleeping-c";
 const webhookWakes: Array<{ routeId: string; wake: boolean }> = [];
+const hostWakes: Array<{ hostId: string; wake: boolean }> = [];
 function readBody(request: IncomingMessage): Promise<string> {
   return new Promise((resolveBody, reject) => {
     const chunks: Buffer[] = [];
@@ -217,13 +252,26 @@ function startControlPlane(port: number): Promise<Server> {
       signature === hmac(AUTH_WEBHOOK_SECRET, `${timestamp}.${body}`, "base64url") &&
       Math.abs(Date.now() / 1_000 - Number(timestamp)) < 300;
     const path = request.url ?? "";
-    controlPlaneCalls.push({ path, signed });
     const payload = body ? JSON.parse(body) : {};
+    const claims: Array<{ hostId: string }> = Array.isArray(payload.claims) ? payload.claims : [];
+    controlPlaneCalls.push({
+      path,
+      signed,
+      hostIds: typeof payload.hostId === "string" ? [payload.hostId] : claims.map((claim) => String(claim.hostId)),
+    });
     const answer = (status: number, value?: unknown) => {
       response.writeHead(status, { "Content-Type": "application/json" });
       response.end(value === undefined ? "" : JSON.stringify(value));
     };
     if (!signed) return answer(401);
+    if (path === "/v2/remote/resume/validate-batch") {
+      if (!resumeBatchSupported) return answer(404);
+      resumeBatches.push(claims.length);
+      if (claims.some((claim) => claim.hostId === UNAVAILABLE_HOST_ID)) return answer(503);
+      if (claims.some((claim) => String(claim.hostId).startsWith(BURST_HOST_PREFIX)))
+        await new Promise((wake) => setTimeout(wake, BURST_CHECK_MILLISECONDS));
+      return answer(200, { valid: claims.map((claim) => claim.hostId !== INACTIVE_HOST_ID) });
+    }
     if (path === "/v2/remote/resume/validate") {
       if (payload.hostId === UNAVAILABLE_HOST_ID) return answer(503);
       if (String(payload.hostId).startsWith(BURST_HOST_PREFIX)) {
@@ -239,7 +287,11 @@ function startControlPlane(port: number): Promise<Server> {
     if (path === "/v2/remote/telegram-route/link")
       return payload.code === LINK_CODE ? answer(200, { hostId: LINK_HOST_ID, linkedAt: Date.now() }) : answer(404);
     if (path === "/v2/remote/route-wake") {
-      if (payload.route?.platform === "telegram") routeWakes.push({ chatId: payload.route.chatId, wake: payload.wake });
+      if (payload.route?.platform === "telegram") {
+        routeWakes.push({ chatId: payload.route.chatId, wake: payload.wake });
+        if (payload.route.chatId === OFFLINE_LINKED_CHAT) return answer(200, { hostId: HOST_ID, state: "not_hosted" });
+        if (payload.route.chatId === FAILED_LOOKUP_CHAT) return answer(500);
+      }
       if (payload.route?.platform === "webhook") {
         webhookWakes.push({ routeId: payload.route.routeId, wake: payload.wake });
         const hostId = SLEEPING_WEBHOOK_ROUTES[payload.route.routeId];
@@ -253,9 +305,31 @@ function startControlPlane(port: number): Promise<Server> {
       }
       return answer(200, { hostId: null, state: "not_hosted" });
     }
+    if (path === "/v2/remote/host-wake") {
+      hostWakes.push({ hostId: payload.hostId, wake: payload.wake });
+      if (payload.hostId === WATCH_SLEEPING_HOST_ID)
+        return answer(200, { hostId: WATCH_SLEEPING_HOST_ID, state: payload.wake ? "starting" : "sleeping" });
+      return answer(200, { hostId: null, state: "not_hosted" });
+    }
     if (path === "/v2/remote/webhook-route/validate")
       return answer(200, { routes: payload.routes.map((route: { id: string }) => route.id) });
     return answer(404);
+  });
+  return new Promise((resolveServer) => server.listen(port, "127.0.0.1", () => resolveServer(server)));
+}
+
+type MessageFields = { text: string; entities?: Array<{ type: string; offset: number; length: number }> };
+
+function startBotApi(port: number): Promise<Server> {
+  const server = createServer(async (request, response) => {
+    const body = await readBody(request);
+    const method = (request.url ?? "").match(/^\/bot([^/]+)\/([A-Za-z]+)$/u);
+    response.writeHead(200, { "Content-Type": "application/json" });
+    if (method?.[1] !== BOT_TOKEN)
+      return response.end(JSON.stringify({ ok: false, error_code: 401, description: "Unauthorized" }));
+    const chatId = body.match(/"chat_id":(-?[0-9]+)/u)?.[1];
+    botApiCalls.push({ method: method[2] ?? "", body, chatId: chatId === undefined ? null : Number(chatId) });
+    response.end(JSON.stringify({ ok: true, result: { message_id: botApiCalls.length } }));
   });
   return new Promise((resolveServer) => server.listen(port, "127.0.0.1", () => resolveServer(server)));
 }
@@ -264,12 +338,12 @@ const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256
 const { privateKey: foreignKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
 const publicJwk = { ...(await exportJWK(publicKey)), kid: "e2e-1", alg: "ES256", use: "sig" };
 
-async function sign(claims: JWTPayload, audience: string, key = privateKey) {
+async function sign(claims: JWTPayload, audience: string, key = privateKey, issuedAt?: number) {
   const now = Math.floor(Date.now() / 1_000);
   return new SignJWT(claims)
     .setProtectedHeader({ alg: "ES256", kid: "e2e-1" })
     .setAudience(audience)
-    .setIssuedAt(now - 5)
+    .setIssuedAt(issuedAt ?? now - 5)
     .setExpirationTime(now + 300)
     .sign(key);
 }
@@ -282,6 +356,7 @@ function remoteTicket(
     >
   > = {},
   key = privateKey,
+  issuedAt?: number,
 ) {
   const now = Math.floor(Date.now() / 1_000);
   return sign(
@@ -300,7 +375,67 @@ function remoteTicket(
     },
     REMOTE_TICKET_AUDIENCE,
     key,
+    issuedAt,
   );
+}
+
+interface WatchKeys {
+  privateKey: CryptoKey;
+  publicKey: string;
+}
+
+async function watchKeys(): Promise<WatchKeys> {
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  return { privateKey: pair.privateKey, publicKey: Buffer.from(raw).toString("base64url") };
+}
+
+function watchTicket(
+  hostId: string,
+  keys: WatchKeys,
+  overrides: Partial<Pick<WatchTicketClaims, "authEpoch" | "watchSessionId">> = {},
+  audience: string = WATCH_TICKET_AUDIENCE,
+) {
+  return sign(
+    {
+      jti: randomUUID(),
+      watchSessionId: `watch-${randomUUID()}`,
+      hostId,
+      userId: "member-e2e",
+      membershipId: `${hostId}:member`,
+      role: "member",
+      authEpoch: 1,
+      clientPublicKey: keys.publicKey,
+      ...overrides,
+    },
+    audience,
+  );
+}
+
+async function watchProof(keys: WatchKeys, hostId: string, ticket: string, sealed: string, ts: number) {
+  const message = watchProofMessage(hostId, String(decodeJwt(ticket).jti), await watchSealedDigest(sealed), ts);
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    keys.privateKey,
+    new TextEncoder().encode(message),
+  );
+  return Buffer.from(signature).toString("base64url");
+}
+
+async function watchBody(
+  hostWatchKey: string,
+  hostId: string,
+  ticket: string,
+  keys: WatchKeys,
+  command: WatchCommand,
+  ts = Date.now(),
+) {
+  const id = randomUUID().replaceAll("-", "");
+  const responseKey = randomBytes(32).toString("base64url");
+  const jti = String(decodeJwt(ticket).jti);
+  const sealed = await sealWatchRequest(hostWatchKey, hostId, jti, { id, ts, responseKey, command });
+  const proof = await watchProof(keys, hostId, ticket, sealed, ts);
+  return { id, responseKey, sealed, proof, body: JSON.stringify({ v: 1, ts, sealed, proof }) };
 }
 
 interface Peer {
@@ -372,10 +507,17 @@ async function waitForReady(url: string, child: ChildProcess) {
   throw new Error("Signal did not become ready.");
 }
 
-const [signalPort, healthPort, controlPlanePort] = await Promise.all([freePort(), freePort(), freePort()]);
+const [signalPort, healthPort, controlPlanePort, botApiPort] = await Promise.all([
+  freePort(),
+  freePort(),
+  freePort(),
+  freePort(),
+]);
 const controlPlane = await startControlPlane(controlPlanePort);
+const botApi = await startBotApi(botApiPort);
 const turnServer = await startTurnServer();
 const serviceOutput: string[] = [];
+const ISSUED_BEFORE_START = Math.floor(Date.now() / 1_000) - 5;
 const child = spawn("bun", [resolve(ROOT, "remote/api/src/index.ts")], {
   cwd: resolve(ROOT, "remote/api"),
   env: {
@@ -399,7 +541,8 @@ const child = spawn("bun", [resolve(ROOT, "remote/api/src/index.ts")], {
     GITHUB_WEBHOOK_SECRET,
     TELEGRAM_BOT_TOKENS: BOT_TOKEN,
     TELEGRAM_WEBHOOK_SECRET,
-    REMOTE_MAX_CONNECTIONS_PER_IP: String(BURST_PEERS * 2),
+    TELEGRAM_TEST_API_ORIGIN: `http://127.0.0.1:${botApiPort}`,
+    REMOTE_MAX_CONNECTIONS_PER_IP: String(BURST_PEERS * 3),
     REMOTE_MAX_MESSAGES_PER_MINUTE: String(BURST_PEERS * 20),
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -523,6 +666,7 @@ async function helloFails(name: string, ticket: string) {
 
 try {
   await waitForReady(`${base}/health/ready`, child);
+  const signalReadyAt = Date.now();
   logger.info(`Signal is ready on port ${signalPort}.`);
 
   const ingress = await connect(signalUrl);
@@ -704,6 +848,55 @@ try {
     );
     return "plain text and caption: wake=false; mention, caption mention, reply, thread, direct, rename, button: wake=true";
   });
+
+  await check(
+    "A Telegram chat with no link gets one notice; a linked chat, a failed lookup and plain text get none",
+    async () => {
+      const message = (chatId: string, fields: MessageFields) => ({
+        update_id: 1,
+        message: { message_id: 1, from: { id: 5 }, chat: { id: Number(chatId), type: "group" }, ...fields },
+      });
+      const mention = { text: "@bot hi", entities: [{ type: "mention", offset: 0, length: 4 }] };
+      const silent = [
+        message(OFFLINE_LINKED_CHAT, mention),
+        message(FAILED_LOOKUP_CHAT, mention),
+        message("-703", { text: "hi" }),
+      ];
+      for (const body of silent) expect((await postUpdate(JSON.stringify(body))).status === 200, "update refused");
+      const asked = ["-700", "-701", "-703"];
+      const deadline = Date.now() + 5_000;
+      while (asked.some((chatId) => !routeWakes.some((call) => call.chatId === chatId)) && Date.now() < deadline)
+        await new Promise((next) => setTimeout(next, 20));
+      for (const fields of [
+        mention,
+        mention,
+        { text: "/start@bot true", entities: [{ type: "bot_command", offset: 0, length: 10 }] },
+      ])
+        expect((await postUpdate(JSON.stringify(message(UNLINKED_CHAT, fields)))).status === 200, "update refused");
+      const noticeOf = (chatId: string) =>
+        botApiCalls.filter((call) => call.method === "sendMessage" && call.chatId === Number(chatId));
+      while (noticeOf(UNLINKED_CHAT).length === 0 && Date.now() < deadline)
+        await new Promise((next) => setTimeout(next, 20));
+      expect((await postUpdate(JSON.stringify(message(LAST_UNLINKED_CHAT, mention)))).status === 200, "update refused");
+      while (noticeOf(LAST_UNLINKED_CHAT).length === 0 && Date.now() < deadline)
+        await new Promise((next) => setTimeout(next, 20));
+      const notice = noticeOf(UNLINKED_CHAT);
+      expect(notice.length === 1, `${notice.length} notices in the unlinked chat`);
+      expect(
+        notice[0]?.body ===
+          JSON.stringify({ chat_id: Number(UNLINKED_CHAT), text: sourceText("status.messaging.telegramNotLinked") }),
+        `notice: ${notice[0]?.body}`,
+      );
+      const noticed = [...new Set(botApiCalls.map((call) => String(call.chatId)))].sort();
+      const expected = ["-602", "-603", "606", UNLINKED_CHAT, LAST_UNLINKED_CHAT].sort();
+      expect(JSON.stringify(noticed) === JSON.stringify(expected), `notices in ${noticed.join(", ")}`);
+      expect(
+        botApiCalls.every((call) => call.method === "sendMessage"),
+        "Signal made another Bot API call",
+      );
+      return `one notice in ${expected.join(", ")}; none for a linked chat, a failed lookup, plain text, a reply, a thread, a rename, a button or a link`;
+    },
+  );
 
   await check("An account event with a bad or stale signature gets 401; a signed one revokes the route", async () => {
     const body = JSON.stringify({ type: "telegram-route-revoked", botId: BOT_ID, chatId: ROUTED_CHAT, through: 2_000 });
@@ -1033,6 +1226,300 @@ try {
     return "account event 413, Slack 413";
   });
 
+  const hostWatchKey = await createHostGrantKeyPair();
+  const postWatch = (ticket: string, body: string) =>
+    fetch(`${base}${WATCH_RELAY_PATH}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ticket}`, "Content-Type": "application/json" },
+      body,
+    });
+  const watchIngress = async (hostId: string) => {
+    const peer = await connect(signalUrl);
+    peer.socket.send(
+      JSON.stringify({
+        type: "hello",
+        version: 1,
+        peer: "ingress",
+        token: await remoteTicket({ hostId, membershipId: `${hostId}:host` }),
+        watchRelay: true,
+      }),
+    );
+    const ready = JSON.parse(await peer.next((frame) => frame.includes('"type":"ready"'), `ready of ${hostId}`));
+    return { peer, ready };
+  };
+  const watchHost = await watchIngress(WATCH_HOST_ID);
+  const watchDeliveries: string[] = [];
+  watchHost.peer.socket.addEventListener("message", (event) => {
+    const frame = String(event.data);
+    const message = JSON.parse(frame);
+    if (message.type !== "watch-delivery") return;
+    watchDeliveries.push(frame);
+    void (async () => {
+      const jti = String(decodeJwt(message.ticket).jti);
+      const request = await openWatchRequest(hostWatchKey.privateKey, WATCH_HOST_ID, jti, message.sealed);
+      const reply = JSON.stringify({ ok: true, snapshot: `${WATCH_REPLY_TEXT}:${JSON.stringify(request.command)}` });
+      const sealed = await sealWatchReply(request.responseKey, request.id, reply);
+      watchHost.peer.socket.send(
+        JSON.stringify({
+          type: "watch-delivery-result",
+          version: 1,
+          requestId: message.requestId,
+          status: 200,
+          sealed,
+        }),
+      );
+    })();
+  });
+  const silentHost = await watchIngress(WATCH_SILENT_HOST_ID);
+  const sendCommand: WatchCommand = {
+    type: "send",
+    serverId: WATCH_HOST_ID,
+    agentId: "agent-e2e",
+    text: WATCH_COMMAND_TEXT,
+  };
+  const watchSecrets: string[] = [];
+
+  await check(
+    "An ingress hello with only the watch relay is admitted and names the watch-relay capability",
+    async () => {
+      expect(
+        watchHost.ready.capabilities?.includes("watch-relay") === true,
+        `ready: ${JSON.stringify(watchHost.ready).slice(0, 200)}`,
+      );
+      return `capabilities: ${watchHost.ready.capabilities.join(", ")}`;
+    },
+  );
+
+  await check("A watch request goes to the host and back, and Signal sees only ciphertext", async () => {
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_HOST_ID, keys);
+    const request = await watchBody(hostWatchKey.publicKey, WATCH_HOST_ID, ticket, keys, sendCommand);
+    watchSecrets.push(ticket, request.proof, request.sealed, request.responseKey);
+    const response = await postWatch(ticket, request.body);
+    const text = await response.text();
+    expect(response.status === 200, `status ${response.status}: ${text.slice(0, 200)}`);
+    const reply = JSON.parse(text);
+    expect(reply.v === 1 && typeof reply.sealed === "string", `reply: ${text.slice(0, 200)}`);
+    watchSecrets.push(reply.sealed);
+    const opened = JSON.parse(await openWatchReply(request.responseKey, request.id, reply.sealed));
+    expect(
+      opened.ok === true &&
+        String(opened.snapshot).includes(WATCH_REPLY_TEXT) &&
+        opened.snapshot.includes(WATCH_COMMAND_TEXT),
+      `opened: ${JSON.stringify(opened).slice(0, 200)}`,
+    );
+    const delivered = JSON.parse(watchDeliveries.at(-1) ?? "{}");
+    expect(
+      delivered.sealed === request.sealed && delivered.proof === request.proof && delivered.ticket === ticket,
+      "Signal changed the sealed request, the proof or the ticket.",
+    );
+    const forwarded = [...watchDeliveries, text].join("\n");
+    expect(!forwarded.includes(WATCH_COMMAND_TEXT), "The command text crossed Signal in clear.");
+    expect(!forwarded.includes(WATCH_REPLY_TEXT), "The reply text crossed Signal in clear.");
+    expect(!forwarded.includes(request.responseKey), "The response key crossed Signal in clear.");
+    return `200; the watch opened the reply; ${watchDeliveries.length} delivery frame held only the sealed request`;
+  });
+
+  await check("A watch request with a ticket of another audience gets 401 and reaches no host", async () => {
+    const before = watchDeliveries.length;
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_HOST_ID, keys, {}, REMOTE_TICKET_AUDIENCE);
+    const request = await watchBody(hostWatchKey.publicKey, WATCH_HOST_ID, ticket, keys, sendCommand);
+    const response = await postWatch(ticket, request.body);
+    const body = await response.json();
+    expect(response.status === 401 && body.error === "unauthorized", `${response.status} ${JSON.stringify(body)}`);
+    expect(watchDeliveries.length === before, "The host got the request.");
+    return `${response.status} ${JSON.stringify(body)}`;
+  });
+
+  await check("A remote ticket on the watch route gets 401", async () => {
+    const before = watchDeliveries.length;
+    const keys = await watchKeys();
+    const ticket = await remoteTicket({ hostId: WATCH_HOST_ID, membershipId: `${WATCH_HOST_ID}:host` });
+    const request = await watchBody(hostWatchKey.publicKey, WATCH_HOST_ID, ticket, keys, sendCommand);
+    const response = await postWatch(ticket, request.body);
+    const body = await response.json();
+    expect(response.status === 401 && body.error === "unauthorized", `${response.status} ${JSON.stringify(body)}`);
+    expect(watchDeliveries.length === before, "The host got the request.");
+    return `${response.status} ${JSON.stringify(body)}`;
+  });
+
+  await check("A watch ticket at hello is refused", async () => {
+    const ticket = await watchTicket(WATCH_HOST_ID, await watchKeys());
+    const peer = await connect(signalUrl);
+    peer.socket.send(JSON.stringify({ type: "hello", version: 1, peer: "ingress", token: ticket, watchRelay: true }));
+    const code = await withDeadline(peer.closed, "close after a hello with a watch ticket");
+    expect(code === 1008, `close code: ${code}`);
+    expect(!peer.frames.some((frame) => frame.includes('"type":"ready"')), "Signal sent ready.");
+    return `closed with ${code}`;
+  });
+
+  await check("A watch request with a bad proof gets 401 and reaches no host", async () => {
+    const before = watchDeliveries.length;
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_HOST_ID, keys);
+    const request = await watchBody(hostWatchKey.publicKey, WATCH_HOST_ID, ticket, keys, sendCommand);
+    const otherProof = await watchProof(await watchKeys(), WATCH_HOST_ID, ticket, request.sealed, Date.now());
+    const otherSealed = await watchBody(hostWatchKey.publicKey, WATCH_HOST_ID, ticket, keys, sendCommand);
+    const results = await Promise.all([
+      postWatch(ticket, JSON.stringify({ ...JSON.parse(request.body), proof: otherProof })),
+      postWatch(ticket, JSON.stringify({ ...JSON.parse(request.body), sealed: otherSealed.sealed })),
+    ]);
+    const statuses = results.map((response) => response.status);
+    expect(
+      statuses.every((status) => status === 401),
+      `statuses: ${statuses.join(", ")}`,
+    );
+    expect(watchDeliveries.length === before, "The host got the request.");
+    return `proof of another key: ${statuses[0]}; proof of another sealed request: ${statuses[1]}`;
+  });
+
+  await check("A watch request with a stale timestamp gets 401", async () => {
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_HOST_ID, keys);
+    const request = await watchBody(
+      hostWatchKey.publicKey,
+      WATCH_HOST_ID,
+      ticket,
+      keys,
+      sendCommand,
+      Date.now() - 10 * 60_000,
+    );
+    const response = await postWatch(ticket, request.body);
+    const body = await response.json();
+    expect(response.status === 401 && body.error === "unauthorized", `${response.status} ${JSON.stringify(body)}`);
+    return `${response.status} ${JSON.stringify(body)}`;
+  });
+
+  await check("A watch request of a revoked auth epoch gets 401", async () => {
+    const event = JSON.stringify({ type: "remote-auth-changed", hostId: WATCH_REVOKED_HOST_ID, authEpoch: 2 });
+    const timestamp = nowSeconds();
+    const revoked = await postAuthEvent(
+      event,
+      timestamp,
+      hmac(AUTH_WEBHOOK_SECRET, `${timestamp}.${event}`, "base64url"),
+    );
+    expect(revoked.status === 204, `auth event: ${revoked.status}`);
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_REVOKED_HOST_ID, keys, { authEpoch: 1 });
+    const request = await watchBody(hostWatchKey.publicKey, WATCH_REVOKED_HOST_ID, ticket, keys, sendCommand);
+    const response = await postWatch(ticket, request.body);
+    const body = await response.json();
+    expect(response.status === 401 && body.error === "unauthorized", `${response.status} ${JSON.stringify(body)}`);
+    return `${response.status} ${JSON.stringify(body)}`;
+  });
+
+  await check("A watch request larger than the limit gets 413", async () => {
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_HOST_ID, keys);
+    const response = await postWatch(ticket, JSON.stringify({ v: 1, pad: "x".repeat(WATCH_RELAY_BODY_BYTES_LIMIT) }));
+    const body = await response.json();
+    expect(response.status === 413 && body.error === "too_large", `${response.status} ${JSON.stringify(body)}`);
+    return `${response.status} ${JSON.stringify(body)}`;
+  });
+
+  await check("A watch request for a host with no socket gets 503 host_offline", async () => {
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_OFFLINE_HOST_ID, keys);
+    const request = await watchBody(hostWatchKey.publicKey, WATCH_OFFLINE_HOST_ID, ticket, keys, sendCommand);
+    const response = await postWatch(ticket, request.body);
+    const body = await response.json();
+    expect(response.status === 503 && body.error === "host_offline", `${response.status} ${JSON.stringify(body)}`);
+    expect(
+      hostWakes.some((wake) => wake.hostId === WATCH_OFFLINE_HOST_ID),
+      "Signal did not ask the account service about the host.",
+    );
+    return `${response.status} ${JSON.stringify(body)}`;
+  });
+
+  await check("A watch request for a sleeping hosted server wakes it and gets 503 waking", async () => {
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_SLEEPING_HOST_ID, keys);
+    const request = await watchBody(hostWatchKey.publicKey, WATCH_SLEEPING_HOST_ID, ticket, keys, sendCommand);
+    const response = await postWatch(ticket, request.body);
+    const body = await response.json();
+    expect(response.status === 503 && body.error === "waking", `${response.status} ${JSON.stringify(body)}`);
+    expect(
+      hostWakes.some((wake) => wake.hostId === WATCH_SLEEPING_HOST_ID && wake.wake),
+      "Signal did not ask the account service to wake the host.",
+    );
+    return `${response.status} ${JSON.stringify(body)}`;
+  });
+
+  await check("A host that does not answer gets 504, and a ninth request in flight gets 429", async () => {
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_SILENT_HOST_ID, keys);
+    const requests = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        watchBody(hostWatchKey.publicKey, WATCH_SILENT_HOST_ID, ticket, keys, sendCommand),
+      ),
+    );
+    const pending = requests.map((request) => postWatch(ticket, request.body));
+    await silentHost.peer.next(
+      () => silentHost.peer.frames.filter((frame) => frame.includes('"type":"watch-delivery"')).length === 8,
+      "eight watch deliveries",
+    );
+    const ninth = await watchBody(hostWatchKey.publicKey, WATCH_SILENT_HOST_ID, ticket, keys, sendCommand);
+    const refused = await postWatch(ticket, ninth.body);
+    const refusedBody = await refused.json();
+    expect(
+      refused.status === 429 && refusedBody.error === "rate_limited",
+      `ninth: ${refused.status} ${JSON.stringify(refusedBody)}`,
+    );
+    const answers = await Promise.all(
+      pending.map(async (response) => {
+        const answer = await response;
+        return { status: answer.status, error: (await answer.json()).error };
+      }),
+    );
+    expect(
+      answers.every((answer) => answer.status === 504 && answer.error === "timeout"),
+      `answers: ${JSON.stringify(answers)}`,
+    );
+    return `ninth ${refused.status}; eight answers ${answers.map((answer) => answer.status).join(",")}`;
+  });
+
+  await check("A watch session gets 429 after 60 requests in a minute", async () => {
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_OFFLINE_HOST_ID, keys);
+    const statuses: number[] = [];
+    for (let index = 0; index < 61; index += 1) {
+      const request = await watchBody(hostWatchKey.publicKey, WATCH_OFFLINE_HOST_ID, ticket, keys, sendCommand);
+      const response = await postWatch(ticket, request.body);
+      await response.body?.cancel();
+      statuses.push(response.status);
+    }
+    expect(
+      statuses.slice(0, 60).every((status) => status === 503) && statuses[60] === 429,
+      `statuses: ${statuses.join(",")}`,
+    );
+    return `60 answers 503, the 61st ${statuses[60]}`;
+  });
+
+  await check("An address gets 429 after 120 watch requests in a minute", async () => {
+    let attempts = 0;
+    let last = 0;
+    while (attempts < 130 && last !== 429) {
+      const response = await postWatch("not-a-ticket", "{}");
+      await response.body?.cancel();
+      last = response.status;
+      attempts += 1;
+    }
+    expect(last === 429, `last status ${last} after ${attempts} requests`);
+    return `429 after ${attempts} more requests`;
+  });
+
+  await check("No frame and no log line holds a watch ticket, proof or sealed value", async () => {
+    const logs = serviceOutput.join("\n");
+    const leaked = watchSecrets.filter((secret) => logs.includes(secret));
+    expect(watchSecrets.length >= 5, "No watch secret was captured.");
+    expect(leaked.length === 0, `${leaked.length} watch values are in the log.`);
+    expect(!logs.includes(WATCH_COMMAND_TEXT) && !logs.includes(WATCH_REPLY_TEXT), "A plaintext is in the log.");
+    return `${watchSecrets.length} values checked against ${serviceOutput.length} log chunks`;
+  });
+  watchHost.peer.socket.close();
+  silentHost.peer.socket.close();
+
   await helloFails("A ticket signed by another key is refused", await remoteTicket({}, foreignKey));
   await helloFails(
     "A ticket of an expired remote session is refused",
@@ -1052,7 +1539,11 @@ try {
         type: "hello",
         version: 1,
         peer: "host",
-        token: await remoteTicket({ hostId: UNAVAILABLE_HOST_ID, membershipId: `${UNAVAILABLE_HOST_ID}:host` }),
+        token: await remoteTicket(
+          { hostId: UNAVAILABLE_HOST_ID, membershipId: `${UNAVAILABLE_HOST_ID}:host` },
+          privateKey,
+          ISSUED_BEFORE_START,
+        ),
       }),
     );
     const code = await withDeadline(peer.closed, "close after an unchecked hello");
@@ -1075,7 +1566,11 @@ try {
         type: "hello",
         version: 1,
         peer: "host",
-        token: await remoteTicket({ hostId: UNAVAILABLE_HOST_ID, membershipId: `${UNAVAILABLE_HOST_ID}:host` }),
+        token: await remoteTicket(
+          { hostId: UNAVAILABLE_HOST_ID, membershipId: `${UNAVAILABLE_HOST_ID}:host` },
+          privateKey,
+          ISSUED_BEFORE_START,
+        ),
       }),
     );
     const code = await withDeadline(peer.closed, "close after a revoked unchecked hello");
@@ -1093,7 +1588,11 @@ try {
         type: "hello",
         version: 1,
         peer: "host",
-        token: await remoteTicket({ hostId: INACTIVE_HOST_ID, membershipId: `${INACTIVE_HOST_ID}:host` }),
+        token: await remoteTicket(
+          { hostId: INACTIVE_HOST_ID, membershipId: `${INACTIVE_HOST_ID}:host` },
+          privateKey,
+          ISSUED_BEFORE_START,
+        ),
       }),
     );
     const code = await withDeadline(peer.closed, "close after an inactive hello");
@@ -1104,31 +1603,66 @@ try {
     );
     return `closed with ${code} and an authentication_required error`;
   });
-  await check(
-    `A burst of hellos sends at most ${RESUME_CHECK_CONCURRENCY} account service checks at a time`,
-    async () => {
-      const tickets = await Promise.all(
-        Array.from({ length: BURST_PEERS }, (_, index) => {
-          const hostId = `${BURST_HOST_PREFIX}${index}`;
-          return remoteTicket({ hostId, membershipId: `${hostId}:host`, userId: `owner-burst-${index}` });
-        }),
-      );
-      const peers = await Promise.all(tickets.map(() => connect(signalUrl)));
-      try {
-        for (const [index, peer] of peers.entries()) {
-          peer.socket.send(JSON.stringify({ type: "hello", version: 1, peer: "host", token: tickets[index] }));
-        }
-        await Promise.all(
-          peers.map((peer) => peer.next((frame) => frame.includes('"type":"ready"'), "ready after a burst hello")),
+  const burst = async (prefix: string) => {
+    const tickets = await Promise.all(
+      Array.from({ length: BURST_PEERS }, (_, index) => {
+        const hostId = `${prefix}${index}`;
+        return remoteTicket(
+          { hostId, membershipId: `${hostId}:host`, userId: `owner-${hostId}` },
+          privateKey,
+          ISSUED_BEFORE_START,
         );
-        expect(
-          burstChecks.maximum === RESUME_CHECK_CONCURRENCY,
-          `${burstChecks.maximum} checks at a time, expected ${RESUME_CHECK_CONCURRENCY}`,
-        );
-        return `${BURST_PEERS} peers ready; at most ${burstChecks.maximum} checks at a time`;
-      } finally {
-        for (const peer of peers) peer.socket.close();
+      }),
+    );
+    const peers = await Promise.all(tickets.map(() => connect(signalUrl)));
+    try {
+      for (const [index, peer] of peers.entries()) {
+        peer.socket.send(JSON.stringify({ type: "hello", version: 1, peer: "host", token: tickets[index] }));
       }
+      await Promise.all(
+        peers.map((peer) => peer.next((frame) => frame.includes('"type":"ready"'), "ready after a burst hello")),
+      );
+    } finally {
+      for (const peer of peers) peer.socket.close();
+      await Promise.all(peers.map((peer) => peer.closed));
+    }
+    return controlPlaneCalls.filter((call) => call.hostIds.some((hostId) => hostId.startsWith(prefix)));
+  };
+  await check(
+    `A burst of ${BURST_PEERS} hellos after a Signal start sends a few account service batch requests`,
+    async () => {
+      const batchesBefore = resumeBatches.length;
+      const calls = await burst(`${BURST_HOST_PREFIX}batch-`);
+      const batches = calls.filter((call) => call.path === "/v2/remote/resume/validate-batch");
+      const single = calls.filter((call) => call.path === "/v2/remote/resume/validate");
+      const sizes = resumeBatches.slice(batchesBefore);
+      expect(single.length === 0, `${single.length} single checks`);
+      expect(
+        batches.length >= 1 && batches.length <= 3,
+        `${batches.length} batch requests, expected 1 to 3 for ${BURST_PEERS} peers`,
+      );
+      expect(
+        sizes.every((size) => size <= RESUME_BATCH_LIMIT) && sizes.reduce((sum, size) => sum + size, 0) === BURST_PEERS,
+        `batch sizes: ${sizes.join(", ")}`,
+      );
+      return `${BURST_PEERS} peers ready with ${batches.length} batch requests (sizes ${sizes.join(", ")}) and no single check`;
+    },
+  );
+  await check(
+    `With no batch route, a burst of hellos sends at most ${RESUME_CHECK_CONCURRENCY} single checks at a time`,
+    async () => {
+      resumeBatchSupported = false;
+      burstChecks.maximum = 0;
+      const calls = await burst(`${BURST_HOST_PREFIX}single-`);
+      const batches = calls.filter((call) => call.path === "/v2/remote/resume/validate-batch");
+      const single = calls.filter((call) => call.path === "/v2/remote/resume/validate");
+      expect(batches.length === 1, `${batches.length} refused batch requests, expected 1`);
+      expect(single.length === BURST_PEERS, `${single.length} single checks, expected ${BURST_PEERS}`);
+      expect(
+        burstChecks.maximum === RESUME_CHECK_CONCURRENCY,
+        `${burstChecks.maximum} checks at a time, expected ${RESUME_CHECK_CONCURRENCY}`,
+      );
+      return `${BURST_PEERS} peers ready after one 404; ${single.length} single checks, at most ${burstChecks.maximum} at a time`;
     },
   );
   await check("An ingress hello without a route ticket is refused", async () => {
@@ -1174,6 +1708,51 @@ try {
     expect(second !== "" && firstRefresh === second, "Signal made new TURN credentials for each turn-refresh.");
     return "both answers have the same TURN username";
   });
+
+  await check(
+    "After the clock skew margin, only tickets and route tickets issued before the Signal start are checked",
+    async () => {
+      await new Promise((wake) =>
+        setTimeout(wake, Math.max(0, signalReadyAt + SIGNAL_START_CLOCK_SKEW_MILLISECONDS + 8_000 - Date.now())),
+      );
+      const hello = async (hostId: string, issuedAt?: number) =>
+        JSON.stringify({
+          type: "hello",
+          version: 1,
+          peer: "ingress",
+          token: await remoteTicket({ hostId, membershipId: `${hostId}:host` }, privateKey, issuedAt),
+          webhookRoute: await sign(
+            { hid: hostId, routes: [{ id: `route-${hostId}`, linkedAt: 1_000 }] },
+            WEBHOOK_ROUTE_AUDIENCE,
+            privateKey,
+            issuedAt,
+          ),
+        });
+      const peers: Peer[] = [];
+      try {
+        for (const [hostId, issuedAt] of [
+          [FRESH_HOST_ID, undefined],
+          [OLD_HOST_ID, ISSUED_BEFORE_START],
+        ] as const) {
+          const peer = await connect(signalUrl);
+          peers.push(peer);
+          peer.socket.send(await hello(hostId, issuedAt));
+          await peer.next((frame) => frame.includes('"type":"ready"'), `ingress ready for ${hostId}`);
+        }
+      } finally {
+        for (const peer of peers) peer.socket.close();
+      }
+      const fresh = callsFor(FRESH_HOST_ID).map((call) => call.path);
+      const old = callsFor(OLD_HOST_ID).map((call) => call.path);
+      expect(fresh.length === 0, `new tickets: ${fresh.join(", ")}`);
+      expect(
+        old.some((path) => path.startsWith("/v2/remote/resume/validate")) &&
+          old.includes("/v2/remote/webhook-route/validate"),
+        `old tickets: ${old.join(", ")}`,
+      );
+      return `${Math.round((Date.now() - signalReadyAt) / 1_000)} s after the start: new tickets no check; old tickets ${old.join(", ")}`;
+    },
+  );
 
   await check("Signal signs each request to the account service", async () => {
     expect(controlPlaneCalls.length > 0, "Signal made no account service request.");
@@ -1346,6 +1925,19 @@ try {
     expect(health.status === 200, `health status: ${health.status}`);
     return `webhook ${webhook.status}; health ${health.status}`;
   });
+  await check("A Signal that is not the entry answers a watch request without a signal claim with 503", async () => {
+    const keys = await watchKeys();
+    const ticket = await watchTicket(WATCH_HOST_ID, keys);
+    const request = await watchBody(hostWatchKey.publicKey, WATCH_HOST_ID, ticket, keys, sendCommand);
+    const response = await fetch(`${entryBase}${WATCH_RELAY_PATH}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ticket}`, "Content-Type": "application/json" },
+      body: request.body,
+    });
+    const body = await response.json();
+    expect(response.status === 503 && body.error === "host_offline", `${response.status} ${JSON.stringify(body)}`);
+    return `${response.status} ${JSON.stringify(body)}`;
+  });
   homedPeer.socket.close();
   entryDns.address = ENTRY_IPV4;
   await check("When the entry name names the Signal again, it is the entry again", async () => {
@@ -1370,6 +1962,7 @@ try {
   entryChild?.kill("SIGTERM");
   entryDnsServer?.close();
   controlPlane.close();
+  botApi.close();
   turnServer.close();
 }
 

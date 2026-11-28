@@ -24,6 +24,7 @@ import {
   toAgentMessages,
 } from "../../app-message-projection";
 import { createStoredMessage, updateStored } from "../../app-stored-values";
+import { rendererPerfCount } from "../../perf-count";
 import { usePlatform } from "../../platform";
 import { createScopeGuard } from "../../scope-lifetime";
 import { createSimpleContext } from "../../simple-context";
@@ -50,11 +51,16 @@ import { mergeConversationPage, missingReplyOriginals, windowedSnapshotMessages 
 import { conversationPort } from "./conversation-port";
 import {
   decideAgentAutoRead,
+  heldUnreadState,
+  isIncomingAgentMessage,
   latestIncomingConversationMessage,
   latestVisibleAgentMessageId,
+  markedReadState,
+  markedUnreadState,
   preserveKnownAgentUnread,
   readStateForMessages,
   retainedAutoReadState,
+  sameReadState,
 } from "./conversation-read-state";
 import type { ConversationMessagePins, SendMessageResult } from "./conversation-types";
 import { useDirectMessages } from "./direct-messages-context";
@@ -64,6 +70,7 @@ import { noteSocialFollowMessageSent } from "./social-follow-prompt";
 type ConversationDeltaEvent = Extract<AgentEvent, { type: "conversation-delta" }>;
 
 const LATEST_PAGE_SIZE = 50;
+const REMOTE_LATEST_PAGE_SIZE = 24;
 const INACTIVE_SNAPSHOT_TAIL = LATEST_PAGE_SIZE * 4;
 
 function trimToLatestPage(conversation: ConversationState): void {
@@ -135,6 +142,7 @@ const Conversation = createSimpleContext({
       setUiErrors,
     } = useAgents();
     const {
+      activeTurns,
       completedTurnByAgent,
       pendingPrompts,
       setPendingPrompts,
@@ -147,13 +155,15 @@ const Conversation = createSimpleContext({
     } = useTurns();
     const { clearUiErrors } = useUiErrors();
     const { centralAuth } = useAuth();
+    const prefetchedConversationPages = new Map<string, ConversationPage>();
     const signedInAccount = createMemo(() => {
       const auth = centralAuth();
       return auth.status === "signed_in" ? auth.user.id : null;
     });
     createEffect(signedInAccount, (account, previous) => {
-      if (account && previous !== undefined && account !== previous)
-        clearUiErrors(currentText().t("chat.errorStatus.readState"));
+      if (previous === undefined || account === previous) return;
+      prefetchedConversationPages.clear();
+      if (account) clearUiErrors(currentText().t("chat.errorStatus.readState"));
     });
 
     const [conversations, writeConversations] = createStore<Record<string, ConversationState>>({});
@@ -171,6 +181,11 @@ const Conversation = createSimpleContext({
         current[agentId] ??= { messages: [] };
         update(current[agentId]);
       });
+    }
+
+    function latestPageSize(agentId: string, remote: boolean) {
+      if (!remote || (conversations[agentId]?.read?.unreadCount ?? 0) > 0) return LATEST_PAGE_SIZE;
+      return REMOTE_LATEST_PAGE_SIZE;
     }
 
     const unreadReplies = createMemo(() =>
@@ -251,12 +266,25 @@ const Conversation = createSimpleContext({
         conversationPageRequests.set(agentId, pageRequest);
         const server = untrack(activeServer);
         if (server?.kind === "remote" && server.state !== "online") return;
+        const prefetched = prefetchedConversationPages.get(agentId);
+        if (prefetched) {
+          prefetchedConversationPages.delete(agentId);
+          if (untrack(() => prefetchedPageIsCurrent(prefetched)))
+            applyConversationPage(prefetched, "replace", "latest");
+        }
         updateConversation(agentId, (conversation) => {
           conversation.loading = true;
           conversation.loadError = null;
         });
         void conversationPort()
-          .agent.readConversationPage({ agentId, anchor: { type: "latest" }, limit: 50 }, serverId)
+          .agent.readConversationPage(
+            {
+              agentId,
+              anchor: { type: "latest" },
+              limit: untrack(() => latestPageSize(agentId, server?.kind === "remote")),
+            },
+            serverId,
+          )
           .then((page) => {
             if (!scopeIsCurrent() || conversationPageRequests.get(agentId) !== pageRequest) return;
             updateConversation(agentId, (conversation) => {
@@ -301,6 +329,85 @@ const Conversation = createSimpleContext({
       },
     );
 
+    function prefetchedPageIsCurrent(page: ConversationPage): boolean {
+      const conversation = conversations[page.agentId];
+      if (conversation?.loaded) return false;
+      const pageMessageIds = new Set(page.messages.map((message) => message.id));
+      if (conversation?.messages.some((message) => !pageMessageIds.has(message.id))) return false;
+      const pageTurnId = completedTurnByAgent.get(page.agentId) === page.activeTurnId ? null : page.activeTurnId;
+      if ((activeTurns()[page.agentId] ?? null) !== pageTurnId) return false;
+      const read = conversation?.read;
+      return (
+        !read ||
+        !page.readState ||
+        (read.unreadCount === page.readState.unreadCount &&
+          read.firstUnreadMessageId === page.readState.firstUnreadMessageId)
+      );
+    }
+
+    const prefetchKey = createMemo(() => {
+      const server = activeServer();
+      const agentId = activeAgentId();
+      const account = signedInAccount();
+      if (!account || server?.kind !== "remote" || server.state !== "online" || !agentId) return "";
+      if (conversations[agentId]?.loaded !== true) return "";
+      const ids = agentList()
+        .map((agent) => agent.id)
+        .join("\0");
+      return `${account}\n${server.id}\n${agentId}\n${ids}`;
+    });
+
+    createEffect(prefetchKey, (key) => {
+      if (!key || typeof window.requestIdleCallback !== "function") return;
+      const [, serverId, agentId, ids = ""] = key.split("\n");
+      if (!serverId || !agentId || !ids) return;
+
+      const listedIds = ids.split("\0");
+      const listed = new Set(listedIds);
+      for (const cachedId of prefetchedConversationPages.keys()) {
+        if (!listed.has(cachedId) || untrack(() => conversations[cachedId]?.loaded))
+          prefetchedConversationPages.delete(cachedId);
+      }
+      const freeSlots = Math.max(0, 20 - prefetchedConversationPages.size);
+      if (freeSlots === 0) return;
+
+      const candidates = listedIds
+        .filter(
+          (id) => id !== agentId && !prefetchedConversationPages.has(id) && !untrack(() => conversations[id]?.loaded),
+        )
+        .slice(0, freeSlots);
+      let stopped = false;
+      let idle: number | undefined;
+
+      function next(): void {
+        const id = candidates.shift();
+        if (stopped || !id) return;
+        idle = window.requestIdleCallback(() => {
+          const request = conversationPageRequests.get(id);
+          void conversationPort()
+            .agent.readConversationPage({ agentId: id, anchor: { type: "latest" }, limit: 24 }, serverId)
+            .then((page) => {
+              if (
+                !stopped &&
+                scopeIsCurrent() &&
+                conversationPageRequests.get(id) === request &&
+                !untrack(() => conversations[id]?.loaded)
+              ) {
+                prefetchedConversationPages.set(id, page);
+              }
+            })
+            .catch(() => undefined)
+            .finally(next);
+        });
+      }
+
+      next();
+      return () => {
+        stopped = true;
+        if (idle !== undefined) window.cancelIdleCallback(idle);
+      };
+    });
+
     function initializeConversation(agentId: string): void {
       updateConversation(agentId, (conversation) => {
         conversation.loaded = true;
@@ -314,6 +421,7 @@ const Conversation = createSimpleContext({
       deleteAgentMessageBodies(rawAgentMessageBodies, agentId);
       pendingConversationSnapshots.delete(agentId);
       conversationPageRequests.delete(agentId);
+      prefetchedConversationPages.delete(agentId);
       agentChatsRetriedOnOpen.delete(agentId);
     }
 
@@ -556,6 +664,7 @@ const Conversation = createSimpleContext({
     }
 
     function applyDeltaNow(event: ConversationDeltaEvent) {
+      rendererPerfCount("conversation.applyDelta");
       if (event.revision <= (conversations[event.agentId]?.revision ?? -1)) return;
       const pendingSnapshot = pendingConversationSnapshots.get(event.agentId);
       if (pendingSnapshot) {
@@ -581,17 +690,19 @@ const Conversation = createSimpleContext({
             (thinkingItemIndex >= 0 ? thinking?.items?.[thinkingItemIndex] : "") ??
             "") + event.delta;
         rawAgentMessageBodies.set(messageKey, rawBody);
+        const cleanedBody = cleanAgentMessageText(rawBody);
+        rendererPerfCount("conversation.cleanTextChars", rawBody.length);
         if (existing) {
           updateStored(existing, {
             ...existing,
-            body: cleanAgentMessageText(rawBody),
+            body: cleanedBody,
             streaming: true,
           });
           return;
         }
         if (thinking && thinkingItemIndex >= 0) {
           const items = [...(thinking.items ?? [])];
-          items[thinkingItemIndex] = cleanAgentMessageText(rawBody);
+          items[thinkingItemIndex] = cleanedBody;
           updateStored(thinking, { ...thinking, items, streaming: true });
           return;
         }
@@ -599,7 +710,7 @@ const Conversation = createSimpleContext({
           id: event.messageId,
           turnId: event.turnId,
           author: "agent",
-          body: cleanAgentMessageText(rawBody),
+          body: cleanedBody,
           time: formatMessageTime(event.createdAt),
           createdAt: event.createdAt,
           streaming: true,
@@ -695,10 +806,9 @@ const Conversation = createSimpleContext({
         setPresentedPromptResolutions((current) => ({ ...current, [agentId]: undefined }));
         setSubmittedPromptRequests((current) => ({ ...current, [agentId]: undefined }));
       }
-      setActiveTurns((current) => ({
-        ...current,
-        [agentId]: activeTurnId,
-      }));
+      setActiveTurns((current) =>
+        current[agentId] === activeTurnId ? current : { ...current, [agentId]: activeTurnId },
+      );
       setTurnProgress((current) => {
         const progress = current[agentId];
         if (progress && progress.turnId !== snapshot.activeTurnId) delete current[agentId];
@@ -764,7 +874,7 @@ const Conversation = createSimpleContext({
         const tail = merge === "latest" && page.pageInfo.hasOlder && !trimmed;
         const keepsWindow = tail && conversation.windowMode === "around";
         const apart = tail && !keepsWindow && !currentMessages.some((message) => mappedIds.has(message.id));
-        const kept = currentMessages.filter((message) => !pageItemIds.has(message.id));
+        const kept = currentMessages.filter((message) => mappedIds.has(message.id) || !pageItemIds.has(message.id));
         conversation.messages = keepsWindow
           ? windowedSnapshotMessages(currentMessages, pageMessages, { mode: "around", capped: true }).filter(
               (message) => mappedIds.has(message.id) || !pageItemIds.has(message.id),
@@ -788,10 +898,10 @@ const Conversation = createSimpleContext({
       if (merge === "latest")
         for (const messageId of openExchangesOutside(conversations[page.agentId]?.messages ?? [], page.messages))
           refreshOpenExchange(page.agentId, messageId);
-      setActiveTurns((current) => ({
-        ...current,
-        [page.agentId]: completedTurnByAgent.get(page.agentId) === page.activeTurnId ? null : page.activeTurnId,
-      }));
+      const pageActiveTurnId = completedTurnByAgent.get(page.agentId) === page.activeTurnId ? null : page.activeTurnId;
+      setActiveTurns((current) =>
+        current[page.agentId] === pageActiveTurnId ? current : { ...current, [page.agentId]: pageActiveTurnId },
+      );
       if (page.readState && merge !== "older") {
         const trackedAutoRead = autoReadAgentMessages.get(agentConversationKey(activeServerId(), page.agentId));
         const latestIncomingMessage = latestIncomingConversationMessage(page.messages);
@@ -918,7 +1028,7 @@ const Conversation = createSimpleContext({
       const page = await conversationPort().agent.readConversationPage({
         agentId,
         anchor: { type: "latest" },
-        limit: 50,
+        limit: latestPageSize(agentId, activeServer()?.kind === "remote"),
       });
       if (!scopeIsCurrent() || conversationPageRequests.get(agentId) !== request) return;
       applyConversationPage(page, "replace", "latest");
@@ -1111,13 +1221,53 @@ const Conversation = createSimpleContext({
       }
     }
 
+    function holdReadState(agentId: string, serverId: string, optimistic: ConversationReadState): () => void {
+      if (!scopeIsCurrent() || serverId !== activeServerId()) return () => undefined;
+      let restore: ConversationReadState | undefined;
+      updateConversation(agentId, (conversation) => {
+        restore = conversation.read ? { ...conversation.read } : undefined;
+        conversation.read = optimistic;
+      });
+      return () => {
+        if (!scopeIsCurrent() || serverId !== activeServerId()) return;
+        updateConversation(agentId, (conversation) => {
+          if (sameReadState(conversation.read, optimistic)) conversation.read = restore;
+        });
+      };
+    }
+
+    function loadedLatestMessages(agentId: string): AgentMessage[] | undefined {
+      flushConversationDeltas();
+      const conversation = conversations[agentId];
+      if (!conversation || conversation.loading || conversation.windowMode === "around") return undefined;
+      const messages = conversation.messages.filter(
+        (message) =>
+          !message.streaming &&
+          !message.id.startsWith("thinking:") &&
+          !message.id.startsWith("ui-") &&
+          !message.id.startsWith("pending:"),
+      );
+      return messages.length > 0 ? messages : undefined;
+    }
+
     async function markAgentMessagesUnread(
       agentId: string,
       fromMessageId: string,
       serverId = activeServerId(),
     ): Promise<void> {
+      await markUnreadFromMessage(agentId, fromMessageId, serverId);
+    }
+
+    async function markUnreadFromMessage(agentId: string, fromMessageId: string, serverId: string): Promise<boolean> {
+      flushConversationDeltas();
       const requestKey = agentConversationKey(serverId, agentId);
       heldUnreadAgentChats.add(requestKey);
+      const conversation = conversations[agentId];
+      const rollback = holdReadState(
+        agentId,
+        serverId,
+        markedUnreadState(conversation?.messages ?? [], fromMessageId, isIncomingAgentMessage, conversation?.read),
+      );
       const operation: Promise<void> = (conversationReadOperations.get(requestKey) ?? Promise.resolve())
         .catch(() => undefined)
         .then(async () => {
@@ -1128,9 +1278,12 @@ const Conversation = createSimpleContext({
       conversationReadOperations.set(requestKey, operation);
       try {
         await operation;
+        return true;
       } catch (error) {
         heldUnreadAgentChats.delete(requestKey);
+        rollback();
         appendUiError(agentId, error, currentText().t("chat.errorStatus.readState"), serverId);
+        return false;
       } finally {
         if (conversationReadOperations.get(requestKey) === operation) conversationReadOperations.delete(requestKey);
       }
@@ -1178,12 +1331,27 @@ const Conversation = createSimpleContext({
       const reportFailure = (error: unknown) =>
         appendUiError(agentId, error, currentText().t("chat.errorStatus.readState"), serverId);
       const readOwnChat = async () => {
-        const page = await conversationPort().agent.readConversationPage(
-          { agentId, anchor: { type: "latest" }, limit: 1 },
+        const loadedMessageId = serverId === activeServerId() ? loadedLatestMessages(agentId)?.at(-1)?.id : undefined;
+        const rollback = holdReadState(
+          agentId,
           serverId,
+          markedReadState(loadedMessageId ?? conversations[agentId]?.read?.throughMessageId ?? null),
         );
-        const latestMessageId = page.messages.at(-1)?.id;
-        if (latestMessageId) await markAgentMessagesRead(agentId, latestMessageId, serverId);
+        try {
+          const latestMessageId =
+            loadedMessageId ??
+            (
+              await conversationPort().agent.readConversationPage(
+                { agentId, anchor: { type: "latest" }, limit: 1 },
+                serverId,
+              )
+            ).messages.at(-1)?.id;
+          if (latestMessageId) await markAgentMessagesRead(agentId, latestMessageId, serverId);
+          else rollback();
+        } catch (error) {
+          rollback();
+          throw error;
+        }
       };
       await Promise.all([
         (unreadReplies()[agentId] ?? 0) > 0 ? readOwnChat().catch(reportFailure) : undefined,
@@ -1199,14 +1367,22 @@ const Conversation = createSimpleContext({
     }
 
     async function markAgentChatUnread(agentId: string, serverId = activeServerId()): Promise<void> {
+      const loaded = serverId === activeServerId() ? loadedLatestMessages(agentId) : undefined;
+      const loadedReply = loaded?.findLast(isIncomingAgentMessage);
+      if (loadedReply) {
+        await markUnreadFromMessage(agentId, loadedReply.id, serverId);
+        return;
+      }
+      const rollback = holdReadState(agentId, serverId, heldUnreadState(conversations[agentId]?.read));
       try {
         const page = await conversationPort().agent.readConversationPage(
           { agentId, anchor: { type: "latest" }, limit: LATEST_PAGE_SIZE },
           serverId,
         );
         const latestReply = latestIncomingConversationMessage(page.messages);
-        if (latestReply) await markAgentMessagesUnread(agentId, latestReply.id, serverId);
+        if (!latestReply || !(await markUnreadFromMessage(agentId, latestReply.id, serverId))) rollback();
       } catch (error) {
+        rollback();
         appendUiError(agentId, error, currentText().t("chat.errorStatus.readState"), serverId);
       }
     }

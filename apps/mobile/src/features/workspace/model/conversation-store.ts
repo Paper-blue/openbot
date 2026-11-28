@@ -23,10 +23,14 @@ export class MobileConversationStore {
   #deltas = new Map<string, Delta[]>();
   #cancelFrame: (() => void) | null = null;
   #olderLoads = new Map<string, symbol>();
-  #loads = new Map<string, { promise: Promise<ConversationPage>; dirty: boolean; attach: boolean }>();
+  #loads = new Map<string, { promise: Promise<ConversationPage>; dirty: boolean; stale: boolean; attach: boolean }>();
   #latestPages = new Map<string, { firstId: string; pageInfo: ConversationPage["pageInfo"] }>();
   #upToDate = new Set<string>();
+  #missedLatest = new Set<string>();
+  #latestReads = new Map<string, number>();
+  #latestLoads = 0;
   #cached = new Set<string>();
+  #journals = new Map<string, { base: number; deltas: Delta[] }>();
 
   constructor(private schedule: (flush: () => void) => () => void) {}
 
@@ -44,7 +48,26 @@ export class MobileConversationStore {
 
   holdsRevision(agentId: string, revision: number, threadId?: string | null) {
     const entry = this.get(agentId);
-    return Boolean(entry && entry.revision >= revision && (threadId === undefined || entry.threadId === threadId));
+    if (!entry || (threadId !== undefined && entry.threadId !== threadId)) return false;
+    return entry.revision >= revision || this.#queuedRevision(agentId, entry.threadId) >= revision;
+  }
+
+  #queuedRevision(agentId: string, threadId: string | null) {
+    let revision = 0;
+    for (const delta of this.#deltas.get(agentId) ?? []) {
+      if ((threadId === null || delta.threadId === threadId) && delta.revision > revision) revision = delta.revision;
+    }
+    return revision;
+  }
+
+  missedLatest(agentId: string) {
+    return this.#missedLatest.has(agentId);
+  }
+
+  #markMissedLatest(agentId: string, load: number) {
+    if ((this.#latestReads.get(agentId) ?? 0) > load) return;
+    this.#upToDate.delete(agentId);
+    this.#missedLatest.add(agentId);
   }
 
   markStale() {
@@ -54,6 +77,8 @@ export class MobileConversationStore {
   invalidate(agentId: string) {
     if (this.isObserved(agentId)) return true;
     this.#upToDate.delete(agentId);
+    const pending = this.#loads.get(agentId);
+    if (pending) pending.stale = true;
     return false;
   }
 
@@ -79,10 +104,13 @@ export class MobileConversationStore {
     this.#entries.delete(agentId);
     this.#latestPages.delete(agentId);
     this.#upToDate.delete(agentId);
+    this.#missedLatest.delete(agentId);
+    this.#latestReads.delete(agentId);
     this.#cached.delete(agentId);
     this.#indices.delete(agentId);
     this.#deltas.delete(agentId);
     this.#loads.delete(agentId);
+    this.#journals.delete(agentId);
     this.#olderLoads.delete(agentId);
     for (const listener of this.#listeners.get(agentId) ?? []) listener();
   }
@@ -99,7 +127,9 @@ export class MobileConversationStore {
 
   cancelRequests() {
     this.markStale();
+    for (const agentId of this.#loads.keys()) this.#missedLatest.add(agentId);
     this.#loads.clear();
+    this.#journals.clear();
     this.#olderLoads.clear();
     for (const [id, entry] of this.#entries) {
       if (entry.olderLoading) this.#publish(id, { ...entry, olderLoading: false }, false);
@@ -160,7 +190,16 @@ export class MobileConversationStore {
     if (cursor) this.flush();
     const current = this.get(page.agentId);
     if (cursor && (!current || current.threadId !== page.threadId || current.pageInfo.olderCursor !== cursor)) return;
-    if (!cursor && current && page.revision < current.revision && !this.#cached.has(page.agentId)) return;
+    const journal = cursor ? undefined : this.#journals.get(page.agentId);
+    const heldRevision = journal ? journal.base : current?.revision;
+    if (
+      !cursor &&
+      current &&
+      heldRevision !== undefined &&
+      page.revision < heldRevision &&
+      !this.#cached.has(page.agentId)
+    )
+      return;
     if (!cursor) this.#cached.delete(page.agentId);
     const sameThread = current?.threadId === page.threadId;
     const indices = sameThread ? this.#indices.get(page.agentId) : undefined;
@@ -201,7 +240,14 @@ export class MobileConversationStore {
     });
     const firstId = page.messages[0]?.id;
     if (!cursor && firstId) this.#latestPages.set(page.agentId, { firstId, pageInfo: page.pageInfo });
-    this.#publish(page.agentId, next);
+    if (!journal) {
+      this.#publish(page.agentId, next);
+      return;
+    }
+    journal.deltas = journal.deltas.filter((delta) => delta.revision > page.revision);
+    journal.base = page.revision;
+    const replayed = streamDeltas(next, indexOf(next.messages), journal.deltas);
+    this.#publish(page.agentId, replayed?.entry ?? next);
   }
 
   openExchangesBeforeLatest(agentId: string): string[] {
@@ -259,30 +305,45 @@ export class MobileConversationStore {
       if (attach) pending.attach = true;
       return pending.promise;
     }
-    const load: { promise: Promise<ConversationPage>; dirty: boolean; attach: boolean } = {
+    const serial = ++this.#latestLoads;
+    const load: { promise: Promise<ConversationPage>; dirty: boolean; stale: boolean; attach: boolean } = {
       dirty: false,
+      stale: false,
       attach,
       promise: Promise.resolve()
         .then(async () => {
           let page: ConversationPage;
           do {
             load.dirty = false;
+            load.stale = false;
             page = await read();
             if (page.agentId !== agentId) throw new Error("The server returned a page for another conversation.");
-            if (!isCurrent() || this.#loads.get(agentId) !== load) return page;
+            if (!isCurrent() || this.#loads.get(agentId) !== load) {
+              this.#markMissedLatest(agentId, serial);
+              return page;
+            }
             this.applyPage(page, undefined, load.attach);
-          } while (load.dirty);
+          } while (load.dirty || (load.stale && this.isObserved(agentId)));
+          if (load.stale) return page;
           this.#upToDate.add(agentId);
+          this.#missedLatest.delete(agentId);
+          this.#latestReads.set(agentId, serial);
           return page;
+        })
+        .catch((error: unknown) => {
+          this.#markMissedLatest(agentId, serial);
+          throw error;
         })
         .finally(() => {
           if (this.#loads.get(agentId) === load) {
             this.#loads.delete(agentId);
+            this.#journals.delete(agentId);
             if (this.#deltas.has(agentId)) this.flush();
           }
         }),
     };
     this.#loads.set(agentId, load);
+    this.#journals.set(agentId, { base: this.get(agentId)?.revision ?? 0, deltas: [] });
     return load.promise;
   }
 
@@ -327,56 +388,58 @@ export class MobileConversationStore {
     const pending = this.#deltas;
     this.#deltas = new Map();
     for (const [agentId, deltas] of pending) {
-      if (this.#loads.has(agentId)) {
-        const later = this.#deltas.get(agentId);
-        this.#deltas.set(agentId, later ? [...deltas, ...later] : deltas);
-        continue;
-      }
+      this.#journals.get(agentId)?.deltas.push(...deltas);
       const current = this.get(agentId);
       const indices = this.#indices.get(agentId);
       if (!current || !indices) continue;
-      let revision = current.revision;
-      let threadId = current.threadId;
-      let activeTurnId = current.activeTurnId;
-      const updates = new Map<string, { event: Delta; parts: string[] }>();
-      for (const event of deltas) {
-        if (event.revision <= revision || (threadId !== null && event.threadId !== threadId)) continue;
-        threadId = event.threadId;
-        const update = updates.get(event.messageId);
-        if (update) update.parts.push(event.delta);
-        else updates.set(event.messageId, { event, parts: [event.delta] });
-        revision = event.revision;
-        activeTurnId = event.turnId;
-      }
-      if (!updates.size) continue;
-      const messages = [...current.messages];
-      let added = false;
-      for (const [messageId, { event, parts }] of updates) {
-        const text = parts.join("");
-        const index = indices.get(messageId);
-        if (index === undefined) {
-          if (current.detached) continue;
-          added = true;
-          messages.push({
-            id: messageId,
-            turnId: event.turnId,
-            author: "assistant",
-            source: "assistant",
-            text,
-            createdAt: event.createdAt,
-            status: "streaming",
-          });
-        } else {
-          const message = messages[index];
-          if (!message) throw new Error("The streamed message is missing.");
-          messages[index] = { ...message, text: message.text + text, status: "streaming" };
-        }
-      }
-      if (added) {
-        this.#publish(agentId, { ...current, messages, revision, activeTurnId, threadId });
-      } else {
-        this.#publish(agentId, { ...current, messages, revision, activeTurnId, threadId }, false);
-      }
+      const streamed = streamDeltas(current, indices, deltas);
+      if (!streamed) continue;
+      this.#publish(agentId, streamed.entry, streamed.added);
     }
   }
+}
+
+function indexOf(messages: ConversationMessage[]) {
+  return new Map(messages.map((message, index) => [message.id, index]));
+}
+
+function streamDeltas(current: MobileConversation, indices: Map<string, number>, deltas: Delta[]) {
+  let revision = current.revision;
+  let threadId = current.threadId;
+  let activeTurnId = current.activeTurnId;
+  const updates = new Map<string, { event: Delta; parts: string[] }>();
+  for (const event of deltas) {
+    if (event.revision <= revision || (threadId !== null && event.threadId !== threadId)) continue;
+    threadId = event.threadId;
+    const update = updates.get(event.messageId);
+    if (update) update.parts.push(event.delta);
+    else updates.set(event.messageId, { event, parts: [event.delta] });
+    revision = event.revision;
+    activeTurnId = event.turnId;
+  }
+  if (!updates.size) return undefined;
+  const messages = [...current.messages];
+  let added = false;
+  for (const [messageId, { event, parts }] of updates) {
+    const text = parts.join("");
+    const index = indices.get(messageId);
+    if (index === undefined) {
+      if (current.detached) continue;
+      added = true;
+      messages.push({
+        id: messageId,
+        turnId: event.turnId,
+        author: "assistant",
+        source: "assistant",
+        text,
+        createdAt: event.createdAt,
+        status: "streaming",
+      });
+    } else {
+      const message = messages[index];
+      if (!message) throw new Error("The streamed message is missing.");
+      messages[index] = { ...message, text: message.text + text, status: "streaming" };
+    }
+  }
+  return { entry: { ...current, messages, revision, activeTurnId, threadId }, added };
 }

@@ -17,7 +17,7 @@ import {
   onSettled,
   untrack,
 } from "solid-js";
-import { isGlobalSearchShortcut } from "../../global-search-shortcut";
+import { matchesShortcut } from "../../keyboard-shortcut-preference";
 import { useNavigation } from "../../navigation";
 import { createSimpleContext } from "../../simple-context";
 import { useAuth } from "../account/account-context";
@@ -27,6 +27,7 @@ import { useBrowserTabs } from "../browser/browser-context";
 import { useChannels } from "../channels/channels-context";
 import { useConversation } from "../conversation/conversation-context";
 import { useDirectMessages } from "../conversation/direct-messages-context";
+import { clearStorageUsageCache } from "../files/storage-usage";
 import { useSetup } from "../onboarding/onboarding-context";
 import { useSidebar } from "../sidebar/sidebar-context";
 import { usePresence } from "../team/team-context";
@@ -303,7 +304,7 @@ const ServerScope = createSimpleContext({
     onSettled(() => {
       const handleGlobalSearchShortcut = (event: KeyboardEvent) => {
         if (
-          !isGlobalSearchShortcut(event) ||
+          !matchesShortcut(event, "globalSearch") ||
           centralAuth().status !== "signed_in" ||
           setupState()?.completed !== true
         ) {
@@ -328,6 +329,8 @@ const ServerScope = createSimpleContext({
         });
       };
       window.addEventListener("focus", handleWindowFocus);
+      const handleNetworkRestored = () => recovery.networkRestored();
+      window.addEventListener("online", handleNetworkRestored);
 
       void initialServersReady.then(() => {
         if (scopeIsCurrent()) setBootstrapReady(true);
@@ -338,6 +341,7 @@ const ServerScope = createSimpleContext({
         recovery.dispose();
         window.removeEventListener("keydown", handleGlobalSearchShortcut);
         window.removeEventListener("focus", handleWindowFocus);
+        window.removeEventListener("online", handleNetworkRestored);
       };
     });
 
@@ -391,6 +395,7 @@ const ServerScope = createSimpleContext({
         if (!signedOut) return;
         deleteRemoteWorkspaceFrames(null);
         keepCachedWorkflows(null);
+        clearStorageUsageCache();
       },
     );
     createEffect(
@@ -438,11 +443,16 @@ const ServerScope = createSimpleContext({
       }),
     );
 
+    let wasReady = false;
+    let readyServerId: ReturnType<typeof activeServerId> | undefined;
     createEffect(
       () => ({ ready: bootstrapReady() && serversLoaded() && transportReady(), id: activeServerId() }),
-      ({ ready }) => {
+      ({ ready, id }) => {
         if (!ready) loadGeneration += 1;
         recovery.setActive(ready);
+        if (ready && (!wasReady || id !== readyServerId)) recovery.resetBackoff();
+        wasReady = ready;
+        readyServerId = id;
       },
     );
 

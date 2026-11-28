@@ -135,8 +135,24 @@ export function claudeHistoryReader(options: ClaudeHistoryOptions = {}): ReadPro
     });
 }
 
+export const CLAUDE_NO_RESPONSE_TEXT = "No response requested.";
+
+export function isClaudeNoResponsePlaceholder(message: unknown): boolean {
+  if (!isRecord(message) || message.model !== "<synthetic>" || !Array.isArray(message.content)) return false;
+  const [block, ...rest] = message.content;
+  return rest.length === 0 && isRecord(block) && block.type === "text" && block.text === CLAUDE_NO_RESPONSE_TEXT;
+}
+
 export function claudeTaskTurnId(sessionId: string, taskId: string, runId: string): string {
-  const hex = createHash("sha256").update(`claude-task-turn\n${sessionId}\n${taskId}\n${runId}`).digest("hex");
+  return claudeDerivedTurnId(`claude-task-turn\n${sessionId}\n${taskId}\n${runId}`);
+}
+
+export function claudeWakeTurnId(sessionId: string, apiMessageId: string): string {
+  return claudeDerivedTurnId(`claude-wake-turn\n${sessionId}\n${apiMessageId}`);
+}
+
+function claudeDerivedTurnId(seed: string): string {
+  const hex = createHash("sha256").update(seed).digest("hex");
   const variant = ((Number.parseInt(hex.slice(16, 17), 16) & 0x3) | 0x8).toString(16);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
@@ -559,7 +575,7 @@ async function findFinalAnswer(
     if (signal.aborted) throw signal.reason;
     const row = decodeTranscriptRow(raw);
     const message = await readMessage(file, row);
-    if (message?.type !== "assistant") continue;
+    if (message?.type !== "assistant" || isClaudeNoResponsePlaceholder(message.message)) continue;
     const text = messageText(message.message);
     const thinking = messageThinking(message.message);
     const endsStep = messageToolCalls(message.message).length > 0;
@@ -697,6 +713,7 @@ async function emitTurnFragments(
   let itemOffset = 0;
   let stopped = false;
   let liveTurnId: string | null = null;
+  let wakeWithoutRun = false;
   const flush = async (complete: boolean): Promise<boolean> => {
     if (signal.aborted) throw signal.reason;
     const count = items.length;
@@ -752,7 +769,10 @@ async function emitTurnFragments(
           if (stopped) break;
           continue;
         }
-        if (row.seq === turn.startSeq && isClaudeTaskNotification(text)) liveTurnId = taskNotificationTurnId(message);
+        if (row.seq === turn.startSeq && isClaudeTaskNotification(text)) {
+          liveTurnId = taskNotificationTurnId(message);
+          wakeWithoutRun = liveTurnId === null && text.startsWith("<task-notification>");
+        }
         if (
           row.seq !== turn.startSeq ||
           !text ||
@@ -772,7 +792,12 @@ async function emitTurnFragments(
           break;
         continue;
       }
-      if (message.type !== "assistant") continue;
+      if (message.type !== "assistant" || isClaudeNoResponsePlaceholder(message.message)) continue;
+      const apiMessageId = getString(message.message, "id");
+      if (wakeWithoutRun && apiMessageId && message.session_id) {
+        wakeWithoutRun = false;
+        liveTurnId = claudeWakeTurnId(message.session_id, apiMessageId);
+      }
       const thinking = messageThinking(message.message);
       const endsStep = messageToolCalls(message.message).length > 0;
       if (!thinking && !text && !endsStep) continue;
@@ -923,7 +948,7 @@ function historyFragments(messages: readonly ClaudeSessionMessage[], includeItem
         });
       continue;
     }
-    if (message.type !== "assistant" || skippingCompaction) continue;
+    if (message.type !== "assistant" || skippingCompaction || isClaudeNoResponsePlaceholder(message.message)) continue;
     const thinking = messageThinking(message.message);
     const endsStep = messageToolCalls(message.message).length > 0;
     if (!thinking && !text && !endsStep) continue;

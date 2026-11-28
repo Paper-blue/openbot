@@ -28,6 +28,7 @@ import { Effect, Result } from "effect";
 import { isHeldTargetError } from "./atomic-json-file";
 import { type AttachmentOperationError, attachmentCall, attachmentFailure, attachmentSync } from "./attachment-effects";
 import { sha256File } from "./file-hash";
+import { ImageSizeMemory } from "./image-header-size";
 import { isWithin } from "./workspace-paths";
 
 const MAX_ATTACHMENTS = INPUT_LIMITS.attachments;
@@ -94,6 +95,7 @@ export interface AttachmentFilesOptions {
 export class AttachmentFiles {
   readonly #draftsRoot: string;
   readonly #transfersRoot: string;
+  readonly imageSizes = new ImageSizeMemory();
 
   constructor(options: AttachmentFilesOptions) {
     this.#draftsRoot = join(options.userDataPath, "attachment-drafts");
@@ -218,11 +220,15 @@ export class AttachmentFiles {
           );
           yield* attachmentCall(() => copyFile(source.path, targetPath)).pipe(Effect.uninterruptible);
           const copied = yield* attachmentCall(() => stat(targetPath));
-          if (copied.size > MAX_FILE_BYTES) {
+          if (copied.size === 0 || copied.size > MAX_FILE_BYTES) {
             yield* attachmentCall(() => rm(targetDirectory, { recursive: true, force: true })).pipe(
               Effect.uninterruptible,
             );
-            throw new Error(sourceText("error.attachment.namedFileTooLarge", { name }));
+            throw new Error(
+              copied.size === 0
+                ? sourceText("error.attachment.emptyFile", { name })
+                : sourceText("error.attachment.namedFileTooLarge", { name }),
+            );
           }
           total += copied.size;
           if (total > MAX_TOTAL_BYTES) {
@@ -245,6 +251,8 @@ export class AttachmentFiles {
         }
         for (const item of data) {
           const bytes = normalizeBytes(item.bytes);
+          const name = sanitizeName(item.name || "pasted-image.png");
+          if (bytes.byteLength === 0) throw new Error(sourceText("error.attachment.emptyFile", { name }));
           if (bytes.byteLength > MAX_FILE_BYTES) {
             throw new Error(sourceText("error.attachment.namedFileTooLarge", { name: item.name }));
           }
@@ -253,7 +261,6 @@ export class AttachmentFiles {
           const id = randomUUID();
           const targetDirectory = join(this.#draftsRoot, id);
           preparedRoots.push(targetDirectory);
-          const name = sanitizeName(item.name || "pasted-image.png");
           const mimeType = heifSafeMimeType(
             name,
             bytes,
@@ -367,6 +374,7 @@ export class AttachmentFiles {
           if (wait === undefined || !isHeldTargetError(renamed.failure.cause)) return yield* renamed.failure;
           yield* Effect.sleep(wait);
         }
+        yield* this.imageSizes.measure(attachments);
         completed = true;
         return attachments;
       } catch (error) {
@@ -448,6 +456,7 @@ export class AttachmentFiles {
           yield* writeGeneratedManifestEffect(attachment);
           attachments.push(attachment);
         }
+        yield* this.imageSizes.measure(attachments);
         completed = true;
         return attachments;
       } catch (error) {
@@ -520,6 +529,7 @@ export class AttachmentFiles {
           ...(input.ownerThreadId !== undefined ? { ownerThreadId: input.ownerThreadId } : {}),
         };
         yield* writeGeneratedManifestEffect(generatedAttachment);
+        yield* this.imageSizes.measure([generatedAttachment]);
         completed = true;
         return generatedAttachment;
       } catch (error) {
@@ -654,7 +664,7 @@ const inspectSourceEffect = Effect.fn("Attachments.inspectSource")(function* (
 
 function sanitizeName(path: string): string {
   const value = basename(path)
-    .replace(/[^\p{L}\p{N}._ -]+/gu, "-")
+    .replace(/[^\p{L}\p{M}\p{N}._ -]+/gu, "-")
     .replace(/^\.+/, "")
     .trim();
   if (!value) return "attachment";
@@ -667,7 +677,7 @@ function sanitizeName(path: string): string {
 function safeArchiveSegment(value: string): string {
   return (
     basename(value)
-      .replace(/[^\p{L}\p{N}._ -]+/gu, "-")
+      .replace(/[^\p{L}\p{M}\p{N}._ -]+/gu, "-")
       .replace(/^\.+/, "")
       .slice(0, 120) || "item"
   );

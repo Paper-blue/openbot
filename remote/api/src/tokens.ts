@@ -24,6 +24,11 @@ import {
   type TelegramRouteChat,
 } from "@openbot/contracts/signal-protocol/telegram-route";
 import {
+  WATCH_TICKET_AUDIENCE,
+  WATCH_TICKET_TTL_SECONDS,
+  type WatchTicketClaims,
+} from "@openbot/contracts/signal-protocol/watch-relay";
+import {
   WEBHOOK_ROUTE_AUDIENCE,
   WEBHOOK_ROUTES_LIMIT,
   type WebhookRoute,
@@ -73,6 +78,20 @@ const remoteTicketClaimsSchema = z.object({
   iat: z.number().int().nonnegative(),
   exp: z.number().int().nonnegative(),
 });
+const watchTicketClaimsSchema = z.object({
+  aud: z.literal(WATCH_TICKET_AUDIENCE),
+  jti: z.string().min(1).max(256),
+  watchSessionId: z.string().min(1).max(256),
+  hostId: z.string().min(1).max(256),
+  userId: z.string().min(1).max(256),
+  membershipId: z.string().min(1).max(256),
+  role: z.enum(["owner", "admin", "member"]),
+  authEpoch: z.number().int().nonnegative(),
+  clientPublicKey: z.string().min(1).max(256),
+  signal: z.string().min(1).max(64).optional(),
+  iat: z.number().int().nonnegative(),
+  exp: z.number().int().nonnegative(),
+}) satisfies z.ZodType<WatchTicketClaims>;
 const identifierSchema = z
   .string()
   .min(1)
@@ -80,18 +99,21 @@ const identifierSchema = z
   .regex(/^[A-Za-z0-9_-]+$/u);
 const slackRouteClaimsSchema = z.object({
   hid: identifierSchema,
+  iat: z.number().int().nonnegative().optional(),
   teams: z
     .array(z.object({ id: identifierSchema, appId: identifierSchema, linkedAt: z.number().int().nonnegative() }))
     .max(SLACK_ROUTE_TEAMS_LIMIT),
 });
 const discordRouteClaimsSchema = z.object({
   hid: identifierSchema,
+  iat: z.number().int().nonnegative().optional(),
   guilds: z
     .array(z.object({ id: z.string().regex(/^[0-9]{1,20}$/u), linkedAt: z.number().int().nonnegative() }))
     .max(DISCORD_ROUTE_GUILDS_LIMIT),
 });
 const webhookRouteClaimsSchema = z.object({
   hid: identifierSchema,
+  iat: z.number().int().nonnegative().optional(),
   routes: z
     .array(z.object({ id: identifierSchema, linkedAt: z.number().int().nonnegative() }))
     .max(WEBHOOK_ROUTES_LIMIT),
@@ -104,6 +126,7 @@ const githubRouteClaimsSchema = z.object({
 });
 const telegramRouteClaimsSchema = z.object({
   hid: identifierSchema,
+  iat: z.number().int().nonnegative().optional(),
   chats: z
     .array(
       z.object({
@@ -249,6 +272,29 @@ export class RemoteTokenService {
     }),
   );
 
+  readonly verifyWatchTicket = Effect.fn("RemoteTokens.verifyWatchTicket")((token: string, now = new Date()) =>
+    Effect.gen({ self: this }, function* () {
+      const { payload } = yield* tokenCall(() =>
+        jwtVerify(token, this.#ticketKey, {
+          audience: WATCH_TICKET_AUDIENCE,
+          algorithms: ["ES256"],
+          requiredClaims: ["exp", "iat", "jti"],
+          currentDate: now,
+        }),
+      );
+      const claims = yield* tokenDecode(() => watchTicketClaimsSchema.parse(payload));
+      if (this.#signalId && claims.signal !== undefined && claims.signal !== this.#signalId)
+        return yield* new RemoteTokenError({ message: "The ticket belongs to another Signal." });
+      if (
+        claims.iat > Math.floor(now.getTime() / 1_000) + 60 ||
+        claims.exp <= claims.iat ||
+        claims.exp - claims.iat > WATCH_TICKET_TTL_SECONDS
+      )
+        return yield* new RemoteTokenError({ message: "The watch ticket timestamps are invalid." });
+      return claims;
+    }),
+  );
+
   readonly verifySlackRoute = Effect.fn("RemoteTokens.verifySlackRoute")(
     (token: string, hostId: string, now = new Date()) =>
       Effect.gen({ self: this }, function* () {
@@ -263,7 +309,7 @@ export class RemoteTokenService {
         const claims = yield* tokenDecode(() => slackRouteClaimsSchema.parse(payload));
         if (claims.hid !== hostId)
           return yield* new RemoteTokenError({ message: "The Slack route belongs to another host." });
-        return { teams: claims.teams };
+        return { teams: claims.teams, issuedAt: claims.iat };
       }),
   );
 
@@ -285,7 +331,7 @@ export class RemoteTokenService {
         const claims = yield* tokenDecode(() => discordRouteClaimsSchema.parse(payload));
         if (claims.hid !== hostId)
           return yield* new RemoteTokenError({ message: "The Discord route belongs to another host." });
-        return { guilds: claims.guilds };
+        return { guilds: claims.guilds, issuedAt: claims.iat };
       }),
   );
 
@@ -307,7 +353,7 @@ export class RemoteTokenService {
         const claims = yield* tokenDecode(() => webhookRouteClaimsSchema.parse(payload));
         if (claims.hid !== hostId)
           return yield* new RemoteTokenError({ message: "The webhook route belongs to another host." });
-        return { routes: claims.routes };
+        return { routes: claims.routes, issuedAt: claims.iat };
       }),
   );
 
@@ -347,7 +393,7 @@ export class RemoteTokenService {
         const claims = yield* tokenDecode(() => telegramRouteClaimsSchema.parse(payload));
         if (claims.hid !== hostId)
           return yield* new RemoteTokenError({ message: "The Telegram route belongs to another host." });
-        return { chats: claims.chats };
+        return { chats: claims.chats, issuedAt: claims.iat };
       }),
   );
 

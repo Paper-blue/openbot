@@ -107,6 +107,10 @@ in a terminal, for the same reason.
 
 - `POST /v2/admin/server-claims` needs the `SERVER_CLAIMS_ADMIN_TOKEN` of the account service. It
   makes the account of the email when there is none, and answers `{"claim", "expiresAt"}`.
+- When the account service has Cloudflare Access on its admin routes, add the two lines
+  `CF-Access-Client-Id: <id>` and `CF-Access-Client-Secret: <secret>` of the Access service token to
+  `server-claims.header`. Without them the request gets 401. The
+  [account service setup](../apps/auth-api/README.md) tells how Access protects the admin routes.
 - The claim works once, for 15 minutes. The account service keeps only its hash.
 - The server sends it to `POST /v2/server-claims/redeem` and gets a session of the owner. The owner
   is then the only owner of the server. The operator does not need the owner's email or password.
@@ -297,11 +301,14 @@ already in its server list. Remove a phone from the account in the desktop app, 
 `sudo openbot uninstall` signs out, then removes the service, the units, the AppArmor profile, the
 `openbot` command and the server files in `/opt/OpenBot`. It keeps the home folder of the service user
 and the keyring in `/srv/openbot-hosted`. The keyring has the key of the encrypted data in that home
-folder, so keep or delete the two together. An install with the same `--user` uses them again. To
-delete the data too:
+folder, so keep or delete the two together. `/srv/openbot-keyring` has a copy of the keyring that only
+root can read: the server restores it when an agent damages the keyring (see
+[Keyring guard](hosted-servers.md#keyring-guard)). An install with the same `--user` uses them again.
+Before you put the data of another server on this computer, delete `/srv/openbot-keyring`. To delete
+the data too:
 
 ```sh
-sudo userdel --remove openbot && sudo rm -rf /srv/openbot-hosted
+sudo userdel --remove openbot && sudo rm -rf /srv/openbot-hosted /srv/openbot-keyring
 ```
 
 The server stays in the server list of the account, offline. Remove it there.
@@ -315,9 +322,20 @@ install steps always match the build that they install. A release before this fe
 file, and the install stops with a message.
 
 `openbot-server-setup` uses the install steps of a hosted server (`openbot-hosted-update`): it
-installs the packages in `packages.txt`, copies the release to `/opt/OpenBot/app`, and installs the
-scripts, the AppArmor profile and the units. It writes `self` to `/opt/OpenBot/hosted/mode` and
-links `/usr/local/bin/openbot`.
+installs the packages in `packages.txt` and `optional-packages.txt`, copies the release to
+`/opt/OpenBot/app`, and installs the scripts, the AppArmor profile and the units. It writes `self`
+to `/opt/OpenBot/hosted/mode` and links `/usr/local/bin/openbot`.
+
+apt never removes a package of the computer for OpenBot (`--no-remove`). When a package in
+`packages.txt` needs a removal, the install stops. A package in `optional-packages.txt` is skipped
+when a command with its name already exists, or when it needs a removal. For example, on Raspberry
+Pi OS `pcmanfm-pi` gives the `pcmanfm` command, and the `pcmanfm` package would remove the desktop
+of the Pi.
+
+The AppArmor profile (`/etc/apparmor.d/openbot-hosted`) needs AppArmor 4 (`abi <abi/4.0>` and the
+`userns` rule). When `/etc/apparmor.d/abi/4.0` does not exist and `apparmor_parser` cannot read the
+profile, for example on Debian 12 with AppArmor 3.0, the install does not write the profile and
+removes an old copy. These systems do not restrict user namespaces by default, so OpenBot does not need it.
 
 When Ubuntu's `bwrap-userns-restrict` profile is loaded (the default on Ubuntu 26.04), the install
 and each start of OpenBot add one rule to `/etc/apparmor.d/local/bwrap-userns-restrict`:
@@ -329,7 +347,9 @@ the computer. `sudo openbot uninstall` removes the rule.
 With `mode` set to `self`, `openbot-hosted-server` does not wait for a claim or for a boat desktop.
 It starts a D-Bus session with an unlocked keyring, as on a hosted server, and runs OpenBot under
 Xvfb with `OPENBOT_SERVER=1`. Main (`src/main/server-mode.ts`) then opens the control socket
-`/run/openbot/control.sock` and publishes the host after each sign-in.
+`/run/openbot/control.sock` and publishes the host after each sign-in. The
+[watchdog](hosted-servers.md#watchdog) also runs: when main stops updating its heartbeat file for 10
+minutes, the watchdog stops OpenBot and systemd starts it again.
 
 The server has two Xvfb displays, one in each of two nested `xvfb-run` commands that share one
 authority file. The outer one starts the agent display, at the [display size](#display-size), and
@@ -362,6 +382,27 @@ Threat model:
   never removes a file at the socket path that is not a socket.
 - Only the service user and root can connect. Agents run as the service user and already have full
   access to its files, its keyring and the OpenBot database, so the socket gives them nothing new.
+- When root runs `openbot` on a systemd host, the command checks the program that holds the socket
+  before it sends a request. It hard links the socket into a new root-only folder in `/run`, so that
+  the file cannot change during the request. Then it finds the processes that hold that socket with
+  `ss -xlHe src <path>` and `/proc/*/fd`, and it does not read process names. The oldest holder must
+  run `/opt/OpenBot/app/openbot`, be in the cgroup of `openbot.service`, and no other process of
+  that binary in that cgroup can have started before it. Each other holder must be a child of it
+  that runs the same binary: the app holds that state for a short time when it starts a process.
+  Otherwise the command stops with "A program that is not OpenBot holds the control socket".
+  `sudo openbot restart` starts all processes of the service again. The check needs `ss` from
+  `iproute2`, which is in the package list.
+- In a container, root does not get this check: the root file system can be read-only, and root
+  has no `CAP_SYS_PTRACE` to read the files of the app process in `/proc`. The documented commands
+  run as the user `openbot`.
+- The socket is not a systemd socket unit. Electron 45 does not mark a socket that it gets from
+  systemd as close-on-exec, so each process that the app starts would get a copy of it. The
+  `runAsNode` fuse is off, so no Node helper can give the app a close-on-exec copy.
+- The command does arithmetic only on values that are 1 to 18 digits. It replaces control characters
+  in the text of an answer with `?`, and it refuses a Mobile Connect code with control characters
+  other than the colors of the QR code renderer.
+- Limit: when `kernel.yama.ptrace_scope` is 0, a process can trace the other processes of its user,
+  also the app process. The check does not cover that case.
 - The socket answers a closed list of requests. It never sends the session token, the sign-in
   code or the claim back, and a value cannot add a line to an answer. A body is at most 4 KiB.
 - Server mode starts only in a packaged Linux build with `OPENBOT_SERVER=1`, and never on a hosted

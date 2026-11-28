@@ -1,6 +1,9 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import {
   BROWSER_TAKEOVER_REASONS,
+  isNearRecipient,
+  isNearRuleDomain,
+  NEAR_WALLET_LIMITS,
   VAULT_PASSWORD_LIMIT,
   VAULT_TEXT_LIMIT,
   type VaultContactFields,
@@ -207,7 +210,10 @@ export const BROWSER_TOOL_DEFINITIONS = [
   browserTool({
     name: "open",
     description: "Open an HTTP(S) URL in a new persistent private-browser tab; returns its first snapshot.",
-    shape: { url: requiredString(INPUT_LIMITS.browserUrl) },
+    shape: {
+      url: requiredString(INPUT_LIMITS.browserUrl),
+      browser: z.literal("chrome").optional(),
+    },
   }),
   browserTool({
     name: "list_tabs",
@@ -229,7 +235,7 @@ export const BROWSER_TOOL_DEFINITIONS = [
   browserTool({
     name: "submit_secret",
     description:
-      "Request the secret card for the active authentication step found in a fresh page snapshot. Identify password, email/SMS code, or authenticator-app code from the page. Select any login-method option first. The user authorizes one fill-and-submit action to the shown HTTPS origin. Never pass a secret as an argument. Use takeover if the method or (without loginId) code length is unclear, for nonnumeric/recovery codes, CAPTCHA, passkeys, or bank app approval. Fill saved cards with fill_card.",
+      "Request the secret card for the active authentication step found in a fresh page snapshot. Identify password, email/SMS code, or authenticator-app code from the page. Select any login-method option first. The user authorizes one fill-and-submit action to the shown origin. Never pass a secret as an argument. Use takeover if the method or (without loginId) code length is unclear, for nonnumeric/recovery codes, CAPTCHA, passkeys, or bank app approval. Fill saved cards with fill_card.",
     shape: {
       tabId,
       method: z
@@ -283,7 +289,7 @@ export const BROWSER_TOOL_DEFINITIONS = [
   browserTool({
     name: "list_logins",
     description:
-      "List password manager and OpenBot Vault logins for the tab's HTTPS site: id, title, username and hasOneTimePassword. No passwords or codes. Type the username, then call submit_secret with loginId.",
+      "List password manager and OpenBot Vault logins for the tab's site: id, title, username and hasOneTimePassword. No passwords or codes. Type the username, then call submit_secret with loginId.",
     shape: { tabId },
   }),
   browserTool({
@@ -301,7 +307,7 @@ export const BROWSER_TOOL_DEFINITIONS = [
       id: identifier.optional().describe("The item to change. Omit it to add a contact or a login."),
       label: vaultText.describe("Contact or card: a short name, such as Home or Work card."),
       ...vaultContactShape,
-      website: vaultText.describe("New login: the HTTPS website."),
+      website: vaultText.describe("New login: the website URL."),
       username: vaultText.describe("Login: the username or email."),
       password: z.string().max(VAULT_PASSWORD_LIMIT).optional().describe("Login: the password."),
       twoStepKey: z
@@ -331,7 +337,7 @@ export const BROWSER_TOOL_DEFINITIONS = [
       ),
       label: vaultText.describe("Contact or card: a short name, such as Home or Work card."),
       ...vaultContactShape,
-      website: vaultText.describe("Login: the HTTPS website, such as example.com."),
+      website: vaultText.describe("Login: the website URL."),
       username: vaultText.describe("Login: the username or email."),
       nameOnCard: vaultText.describe("Card: the name on the card."),
       expMonth: z.number().int().min(1).max(12).optional().describe("Card: the expiry month."),
@@ -392,6 +398,33 @@ export const BROWSER_TOOL_DEFINITIONS = [
         .min(100)
         .max(2000)
         .describe("What you buy, the quantity, and why. The user reads it in Link."),
+    },
+  }),
+  browserTool({
+    name: "request_near_payment",
+    description:
+      "Pay with the user's NEAR Intents wallet, for a site or service that takes crypto. The owner approves the payment in the chat, unless a rule of the owner allows this recipient for this domain; the call waits for the answer. Call it once per payment. Never call it again after status uncertain: OpenBot finishes that payment.",
+    shape: {
+      domain: z
+        .string()
+        .refine(isNearRuleDomain, { message: "Use the lowercase host name of the site, such as api.example.com." })
+        .describe("The host name of the site or service that asks for the payment."),
+      recipient: z
+        .string()
+        .refine(isNearRecipient, { message: "Use a NEAR account id, or chain:address." })
+        .describe("The NEAR account that the site gives, or chain:address for another chain, such as base:0xab…"),
+      asset: requiredString(NEAR_WALLET_LIMITS.asset).describe("The token symbol, such as USDC, or its asset id."),
+      amount: z
+        .string()
+        .max(NEAR_WALLET_LIMITS.amount)
+        .regex(/^(0|[1-9]\d*)(\.\d+)?$/u)
+        .describe("The amount in whole tokens, as decimal text, such as 1.5."),
+      reason: z
+        .string()
+        .trim()
+        .min(10)
+        .max(NEAR_WALLET_LIMITS.reason)
+        .describe("What the payment buys. The owner reads it."),
     },
   }),
   browserTool({
@@ -543,7 +576,7 @@ export const BROWSER_TOOL_DEFINITIONS = [
   browserTool({
     name: "run_script",
     description:
-      "Run a short JavaScript program that drives one tab in one call and returns a final snapshot. Use it for a known sequence, such as typing a search, pressing Enter, and waiting for results, or a loop, such as paging. It runs in a sandbox, not in the page, with no network, files, require, or process. It can await these helpers: navigate(url), click(target, options?), type(target, text, options?), press(key, target?), hover(target), scroll(deltaY, target?), selectOption(target, values), setChecked(target, checked), waitFor(text, condition, or page function), sleep(ms), evaluate(expression or function) (runs in the page; returns JSON), snapshot(), and step({ action, ...fields }), where action names one of these tools. A target is a CSS selector string, role(role, name?), text(text), or a target object; .nth(i), from 0, picks one of several matches, as in text('Delete').nth(1). A failed helper throws; try/catch works. Steps before a failure stay done. log(...values) adds to a short log. Return a JSON value. At most 200 steps and timeoutMs (default 60 s) per call.",
+      "Run a short JavaScript program that drives one tab in one call and returns a final snapshot. Use it for a known sequence, such as typing a search, pressing Enter, and waiting for results, or a loop, such as paging. It runs in a sandbox, not in the page, with no network, files, require, or process. It can await these helpers: navigate(url), click(target, options?), type(target, text, options?), press(key, target?), hover(target), scroll(deltaY, target?), selectOption(target, values), setChecked(target, checked), waitFor(text, condition, or page function), sleep(ms), evaluate(expression or function) (runs in the page; returns JSON), snapshot(), and step({ action, ...fields }) with action as a helper in snake_case. A target is a CSS selector string, role(role, name?), text(text), or a target object; .nth(i), from 0, picks one of several matches, as in text('Delete').nth(1). A failed helper throws; try/catch works. Steps before a failure stay done. log(...values) adds to a short log. Return a JSON value. At most 200 steps and timeoutMs (default 60 s) per call.",
     shape: {
       tabId,
       script: requiredString(BROWSER_SCRIPT_MAX_CHARS).describe(

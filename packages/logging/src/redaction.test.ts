@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  containsSecret,
   createOpenBotLogger,
   type LogValue,
   redactPostText,
   redactSecrets,
   redactText,
   redactValue,
+  registerPublicValues,
   registerSecretValue,
+  replaceSecretValueGroup,
   resolveLogLevel,
   toLogValue,
 } from "./index";
@@ -41,6 +44,8 @@ describe("redactText", () => {
       `rk_test_${run(24)}`,
       `whsec_${run(32)}`,
       `whsec_${run(10)}+${run(10)}/${run(10)}=`,
+      `ya29.${run(60)}`,
+      `1//0${run(40)}`,
     ]) {
       expect(redactText(`key ${key} leaked`)).toBe("key [redacted] leaked");
     }
@@ -166,18 +171,18 @@ describe("redactText", () => {
     expect(redactSecrets('{"jan@example.com":"Bearer abcdef123456"}')).toBe('{"jan@example.com":"[redacted]"}');
   });
 
-  it("keeps emails and redacts secrets in a chat app post", () => {
-    expect(redactPostText("Write to jan@example.com, password=hunter2")).toBe(
-      "Write to jan@example.com, password=[redacted]",
+  it("masks only key formats in a chat app post", () => {
+    expect(redactPostText("Write to jan@example.com, password=hunter2, key sk-ant-api03-abcdefgh")).toBe(
+      "Write to jan@example.com, password=hunter2, key [redacted]",
     );
     expect(redactPostText("postgres://admin:s3cretpw@db.example.com/app")).toBe(
       "postgres://admin:[redacted]@db.example.com/app",
     );
     expect(redactText("https://user:s3cretpw@db.example.com/x")).toBe("https://user:[redacted]@db.example.com/x");
     expect(redactSecrets("redis://:s3cretpw@cache:6379")).toBe("redis://:[redacted]@cache:6379");
-    expect(redactPostText(`${"{} ".repeat(16)}{"headers":{"X-Tenant":"tenant-secret"}}`)).toContain(
-      "[redacted-unscanned]",
-    );
+    const code = `${"{} ".repeat(16)}{"headers":{"X-Tenant":"tenant"}}`;
+    expect(redactPostText(code)).toBe(code);
+    expect(redactPostText("Authorization: Bearer abcdef123456")).toBe("Authorization: [redacted]");
   });
 
   it("redacts secrets inside a payload that arrives as one string", () => {
@@ -291,6 +296,46 @@ describe("redactText", () => {
     expect(redactSecrets(`${code}\n{"apiKey":"abcdef123456"}`)).toBe(`${code}\n{"apiKey":"[redacted]"}`);
   });
 
+  it("finds no secret in code that the scan does not read", () => {
+    const code = Array.from({ length: 20 }, (_, index) => `function f${index}() { return [${index}]; }`).join("\n");
+    const links = Array.from({ length: 17 }, (_, index) => `- [Step ${index}](https://example.com/${index})`).join(
+      "\n",
+    );
+    expect(containsSecret(code)).toBe(false);
+    expect(containsSecret(links)).toBe(false);
+    expect(containsSecret('const headers = {"Content-Type": type};')).toBe(false);
+    expect(containsSecret('const body = {"name": "demo"')).toBe(false);
+    expect(
+      containsSecret(
+        `${code}\nconst line = {"text": "a\\nb\\t\\u00e9 \\"quoted\\" https:\\/\\/example.com\\/x", next};`,
+      ),
+    ).toBe(false);
+  });
+
+  it("finds a secret or an email past the scan bound and in a payload that does not parse", () => {
+    const code = Array.from({ length: 20 }, (_, index) => `function f${index}() { return [${index}]; }`).join("\n");
+    expect(containsSecret(`${code}\nconst key = "sk-ant-abcdefgh12345678";`)).toBe(true);
+    expect(containsSecret(`${code}\n{"apiKey":"abcdef123456"}`)).toBe(true);
+    expect(containsSecret(`${code}\nmail owner@example.com`)).toBe(true);
+    expect(containsSecret('const auth = {"password": "hunter2-real", retry};')).toBe(true);
+    expect(containsSecret(`${code}\n{"headers": {"X-Custom": "abc123zz"}}`)).toBe(true);
+    expect(containsSecret(`${code}\n{"name": "API_TOKEN", "value": "abc123zz"}`)).toBe(true);
+    expect(containsSecret(`${code}\n{"pass\\u0077ord": "hunter2x"}`)).toBe(true);
+    expect(containsSecret('x {"pass\\u0077ord": "hunter2x", retry}')).toBe(true);
+    expect(containsSecret('const body = {"name": "demo"\nlater {"headers": {"X-Custom": "abc123zz"}}')).toBe(true);
+    expect(
+      containsSecret('const body = {"name": "demo"\nlater {"auth": {"user": "a", "pwd": "x"}, "apiKey": "abc123zz"}'),
+    ).toBe(true);
+    expect(containsSecret(`${code}\n{"body": "{\\"apiKey\\":\\"abcdef123456\\"}"}`)).toBe(true);
+    expect(containsSecret(`${code}\n{"body": "{\\"headers\\":{\\"X-Custom\\":\\"abc123zz\\"}}"}`)).toBe(true);
+    expect(containsSecret(`${code}\n{"hook":"https:\\/\\/hooks.slack.com\\/services\\/T0\\/B0\\/abcdefgh"}`)).toBe(
+      true,
+    );
+    expect(containsSecret(`${code}\n{"auth": "Bearer\\tabcdef123456", retry}`)).toBe(true);
+    registerSecretValue("saved-skill-secret-value");
+    expect(containsSecret(`${code}\nuse saved-skill-secret-value here`)).toBe(true);
+  });
+
   it("bounds the work a line of open braces can cause", () => {
     const braces = "{".repeat(65_536);
     const started = performance.now();
@@ -387,11 +432,98 @@ describe("registerSecretValue", () => {
     expect(redactText("sign in with acmeshop")).toBe("sign in with [redacted]");
   });
 
+  it("keeps a public model id that contains a short saved value, and masks the value elsewhere", () => {
+    registerSecretValue("claude", { allowShort: true });
+    registerPublicValues(["claude-opus-5-5", "claude-sonnet-5-5", "claude"]);
+
+    const models = '{"defaultModel":"claude-opus-5-5","models":[{"id":"claude-sonnet-5-5","name":"Claude Opus 5.5"}]}';
+    expect(redactText(models)).toBe(models);
+    expect(redactText("Available models: claude-opus-5-5, claude-sonnet-5-5, …")).toBe(
+      "Available models: claude-opus-5-5, claude-sonnet-5-5, …",
+    );
+    expect(redactText("The model is claude-opus-5-5.")).toBe("The model is claude-opus-5-5.");
+    expect(redactText('{"provider":"claude"}')).not.toContain("claude");
+    for (const text of [
+      "claude-opus-5-6",
+      "sshpass -pclaude ssh h",
+      'out="typed:\\nclaude\\n"',
+      "next=%2Flogin%3Fpw%3Dclaude%26x",
+      "my password is claude.Then",
+      "pw=claude-1",
+      "pw: claude_",
+      "https://user:claude@db.example.com/x",
+    ]) {
+      expect(redactText(text)).not.toContain("claude");
+    }
+  });
+
+  it("masks a saved value that ends where a public id ends", () => {
+    registerSecretValue("sonnet-5-5.", { allowShort: true });
+    registerPublicValues(["claude-sonnet-5-5"]);
+
+    expect(redactText("pw=claude-sonnet-5-5.")).not.toContain("sonnet-5-5");
+  });
+
+  it("masks a saved value in a chat app post only when it is a whole token", () => {
+    registerSecretValue("acmeshop", { allowShort: true });
+
+    expect(
+      redactPostText(
+        "Code: acmeshop. Write to biuro@acmeshop.pl, see https://acmeshop.pl/kontakt, acmeshopping, zażółćacmeshop",
+      ),
+    ).toBe(
+      "Code: [redacted]. Write to biuro@acmeshop.pl, see https://acmeshop.pl/kontakt, acmeshopping, zażółćacmeshop",
+    );
+  });
+
+  it("masks an internal token with no key format in a chat app post", () => {
+    registerSecretValue("mt4f9a2c7e1b3d5f60");
+
+    expect(redactPostText("Token: `mt4f9a2c7e1b3d5f60` and http://127.0.0.1:4100/mcp/mt4f9a2c7e1b3d5f60")).toBe(
+      "Token: `[redacted]` and http://127.0.0.1:4100/mcp/[redacted]",
+    );
+    expect(redactPostText("https://x.example/cb?next=%2Fa%3Ftoken%3Dmt4f9a2c7e1b3d5f60%26b%3D1")).toBe(
+      "https://x.example/cb?next=%2Fa%3Ftoken%3D[redacted]%26b%3D1",
+    );
+    expect(redactPostText("git clone https://mt4f9a2c7e1b3d5f60@git.example.com/repo.git")).toBe(
+      "git clone https://[redacted]@git.example.com/repo.git",
+    );
+    expect(redactPostText("https://mt4f9a2c7e1b3d5f60:pw12345@git.example.com")).toBe(
+      "https://[redacted]:[redacted]@git.example.com",
+    );
+    expect(redactPostText("https://hooks.slack.com/services/mt4f9a2c7e1b3d5f60/B000/XXXXXXXX")).toBe(
+      "https://hooks.slack.com/services/[redacted]",
+    );
+  });
+
   it("keeps a value that cannot be URL-encoded masked, without throwing", () => {
     const secret = "12345678\uD800";
     registerSecretValue(secret);
 
     expect(redactText(`key ${secret} rejected`)).toBe("key [redacted] rejected");
+  });
+});
+
+describe("replaceSecretValueGroup", () => {
+  it("stops masking a value that the group no longer holds", () => {
+    replaceSecretValueGroup("test-vault", [{ values: ["vlt1", "vaultkey-778899"], allowShort: true }]);
+    expect(redactText("use vlt1 and vaultkey-778899")).toBe("use [redacted] and [redacted]");
+    replaceSecretValueGroup("test-vault", [{ values: ["vaultkey-778899"] }]);
+    expect(redactText("use vlt1 and vaultkey-778899")).toBe("use vlt1 and [redacted]");
+    replaceSecretValueGroup("test-vault", []);
+    expect(redactText("use vlt1 and vaultkey-778899")).toBe("use vlt1 and vaultkey-778899");
+  });
+
+  it("keeps a value that is also registered outside the group", () => {
+    registerSecretValue("shared-secret-5566");
+    replaceSecretValueGroup("test-shared", [{ values: ["shared-secret-5566"] }]);
+    replaceSecretValueGroup("test-shared", []);
+    expect(redactText("token shared-secret-5566")).toBe("token [redacted]");
+  });
+
+  it("skips a short value unless the set allows it", () => {
+    replaceSecretValueGroup("test-short", [{ values: ["shrt"] }]);
+    expect(redactText("shrt")).toBe("shrt");
   });
 });
 

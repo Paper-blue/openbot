@@ -1,6 +1,7 @@
 import { isString } from "@openbot/contracts/runtime-values";
 import { decodeSignalServerMessage } from "@openbot/contracts/signal-protocol/decode";
 import {
+  SIGNAL_CLIENT_RECONNECT_GRACE_MS,
   SIGNAL_NO_READY_CLOSE_CODE,
   SIGNAL_PROTOCOL_VERSION,
   SIGNAL_TURN_REFRESH_INTERVAL_MS,
@@ -10,6 +11,7 @@ import {
 import { BROWSER_EGRESS_CHANNEL } from "@openbot/contracts/team-protocol/browser-egress-v1";
 import { TEAM_PROTOCOL_V2_CHANNELS } from "@openbot/contracts/team-protocol/v2";
 import { sourceText } from "@openbot/i18n/source";
+import { iceCandidateRoute } from "@openbot/team-client/ice-diagnostics";
 import { encodeTeamWebRtcPayload, TeamWebRtcPayloadDecoder } from "./team-webrtc-framing";
 import { isPrivateNetworkCandidate, privateNetworkSdp } from "./team-webrtc-private-network";
 
@@ -27,7 +29,8 @@ export interface BridgeCommand {
     | "open-egress"
     | "close-egress"
     | "send-egress"
-    | "close";
+    | "close"
+    | "ping";
   peerId: string;
   signalUrl?: string;
   token?: string;
@@ -47,6 +50,11 @@ interface MainBridgeMessage {
   channel?: "rpc" | "events" | "files" | "desktop";
   data?: string | ArrayBuffer;
   path?: "p2p" | "relay";
+  route?: string;
+  side?: "host" | "client";
+  url?: string;
+  errorCode?: number;
+  errorText?: string;
   code?: string;
   message?: string;
   terminal?: boolean;
@@ -59,6 +67,7 @@ interface MainBridgeMessage {
   localFingerprint?: string;
   remoteFingerprint?: string;
   iceServers?: RTCIceServer[];
+  retryInMs?: number;
 }
 
 interface PeerState {
@@ -94,6 +103,9 @@ interface PeerState {
   restartIceOnReady: boolean;
   pathLost: boolean;
   signalChain: Promise<void>;
+  unconfirmedSessions: Map<string, number>;
+  reconfirmClockStartedAt: number | null;
+  reconfirmTimer: number | null;
   closed: boolean;
 }
 
@@ -102,6 +114,8 @@ const DISCONNECT_GRACE_MS = 15_000;
 const SIGNAL_READY_DEADLINE_MS = 30_000;
 const SIGNAL_PROBE_INTERVAL_MS = 4 * 60_000;
 const RELAYED_FRAME_DEADLINE_MS = 30_000;
+const SIGNAL_HOLD_SPREAD_MS = 5_000;
+export const CLIENT_RECONFIRM_MS = SIGNAL_CLIENT_RECONNECT_GRACE_MS + 60_000;
 
 const peers = new Map<string, PeerState>();
 let signalRetryAt = 0;
@@ -116,6 +130,9 @@ interface PreparedSignal {
 const PREPARED_SIGNAL_LIFETIME_MS = 30_000;
 const preparedSignals = new Map<string, PreparedSignal>();
 const dataChannelNames = ["rpc", "events", "files", "desktop"] as const;
+const DATA_CHANNEL_QUEUE_BYTES = 256 * 1024;
+const DATA_CHANNEL_LOW_BYTES = 64 * 1024;
+const EGRESS_QUEUE_BYTES = 4 * 1024 * 1024;
 const maximumIceRestarts = 10;
 let mainPort: MessagePort;
 
@@ -180,6 +197,9 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
         restartIceOnReady: false,
         pathLost: false,
         signalChain: Promise.resolve(),
+        unconfirmedSessions: new Map(),
+        reconfirmClockStartedAt: null,
+        reconfirmTimer: null,
         closed: false,
       };
       peers.set(state.id, state);
@@ -215,7 +235,7 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       if (channel?.readyState !== "open" || data === undefined)
         throw new Error(sourceText("error.remote.channelNotOpen"));
       const sent = state.egressChain.then(async () => {
-        await waitForWritableChannel(channel);
+        await waitForWritableChannel(channel, EGRESS_QUEUE_BYTES);
         if (channel.readyState !== "open") throw new Error(sourceText("error.remote.channelNotOpen"));
         if (isString(data)) channel.send(data);
         else channel.send(data);
@@ -329,6 +349,7 @@ function connectSignal(state: PeerState, prepared: WebSocket | null = null): voi
       ...(state.waitForHost ? { waitForHost: true } : {}),
     };
     socket.send(JSON.stringify(hello));
+    if (state.role === "host") markClientsUnconfirmed(state);
     awaitSignalReady(state, socket);
   };
   const open = prepared?.readyState === WebSocket.OPEN;
@@ -361,6 +382,7 @@ function connectSignal(state: PeerState, prepared: WebSocket | null = null): voi
     if (state.socket !== socket) return;
     state.socket = null;
     clearSignalLiveness(state);
+    if (state.role === "host") pauseClientReconfirm(state);
     if (state.role === "host" && !state.closed)
       post({ type: "signal-closed", peerId: state.id, code: String(event.code), terminal: event.code === 4000 });
     if (event.code === 4000) {
@@ -386,13 +408,18 @@ async function handleSignal(state: PeerState, message: SignalServerMessage): Pro
     message.type === "github-delivery" ||
     message.type === "telegram-delivery" ||
     message.type === "telegram-call-result" ||
-    message.type === "queued-delivery"
+    message.type === "queued-delivery" ||
+    message.type === "watch-delivery"
   )
     return;
   if (message.type === "host-waiting") {
     state.reconnectAttempt = 0;
     state.resumeToken = message.resumeToken;
     post({ type: "host-waiting", peerId: state.id });
+    return;
+  }
+  if (message.type === "sessions-ended") {
+    if (state.role === "host" && !state.signalHost) endSessions(state, message.sessionIds);
     return;
   }
   if (message.type === "account-profile-changed") {
@@ -435,7 +462,11 @@ async function handleSignal(state: PeerState, message: SignalServerMessage): Pro
       client &&
         (state.restartIceOnReady ||
           client.connectionState !== "connected" ||
-          (turnRefresh && (await selectedPath(client).catch(() => "relay")) === "relay")),
+          (turnRefresh &&
+            (await selectedPath(client).then(
+              ({ path }) => path,
+              () => "relay",
+            )) === "relay")),
     );
     state.restartIceOnReady = false;
     state.resumeToken = message.resumeToken;
@@ -461,6 +492,7 @@ async function handleSignal(state: PeerState, message: SignalServerMessage): Pro
     else scheduleTurnRefresh(state);
     post({ type: "ice-servers", peerId: state.id, iceServers: usableIceServers(state) });
     post({ type: "signal-ready", peerId: state.id });
+    if (state.role === "host" && !state.signalHost) armClientReconfirm(state);
     if (shouldRestartIce) state.iceRestartPending = true;
     if (state.iceRestartPending) await retryPendingIceRestart(state);
     if (state.role === "client" && state.connectionId && !state.peerConnection) {
@@ -482,6 +514,7 @@ async function handleSignal(state: PeerState, message: SignalServerMessage): Pro
     return;
   }
   if (message.type === "peer-ready" && state.role === "host") {
+    state.unconfirmedSessions.delete(message.sessionId);
     let client = state.clients.get(message.sessionId);
     if (client && !message.resumed) {
       disconnect(client.id);
@@ -507,6 +540,9 @@ async function handleSignal(state: PeerState, message: SignalServerMessage): Pro
         disconnectedTimer: null,
         pathLost: false,
         signalChain: Promise.resolve(),
+        unconfirmedSessions: new Map(),
+        reconfirmClockStartedAt: null,
+        reconfirmTimer: null,
       };
       state.clients.set(message.sessionId, client);
       peers.set(client.id, client);
@@ -631,6 +667,21 @@ function createPeerConnection(state: PeerState, iceServers: RTCIceServer[]): RTC
       sdpMLineIndex: event.candidate.sdpMLineIndex,
     });
   };
+  const candidateErrors = new Set<string>();
+  connection.onicecandidateerror = (event) => {
+    if (state.peerConnection !== connection) return;
+    const key = `${event.url} ${event.errorCode}`;
+    if (candidateErrors.has(key)) return;
+    candidateErrors.add(key);
+    post({
+      type: "ice-candidate-error",
+      peerId: state.id,
+      side: state.role,
+      url: event.url,
+      errorCode: event.errorCode,
+      errorText: event.errorText,
+    });
+  };
   connection.ondatachannel = (event) => {
     if (event.channel.label === BROWSER_EGRESS_CHANNEL && state.role === "host") {
       bindEgressChannel(state, event.channel);
@@ -679,7 +730,7 @@ function bindDataChannel(
   channel: RTCDataChannel,
 ): void {
   channel.binaryType = "arraybuffer";
-  channel.bufferedAmountLowThreshold = 1024 * 1024;
+  channel.bufferedAmountLowThreshold = DATA_CHANNEL_LOW_BYTES;
   state.channels[kind] = channel;
   state.payloadDecoders[kind]?.reset();
   const decoder = new TeamWebRtcPayloadDecoder();
@@ -768,14 +819,17 @@ async function sendChannelPayload(
 ): Promise<void> {
   const maximumMessageSize = state.peerConnection?.sctp?.maxMessageSize ?? Number.POSITIVE_INFINITY;
   for (const frame of encodeTeamWebRtcPayload(data, maximumMessageSize)) {
-    await waitForWritableChannel(channel);
+    await waitForWritableChannel(channel, DATA_CHANNEL_QUEUE_BYTES);
     if (isString(frame)) channel.send(frame);
     else channel.send(frame);
   }
 }
 
-function waitForWritableChannel(channel: RTCDataChannel): Promise<void> {
-  if (channel.bufferedAmount <= 4 * 1024 * 1024) return Promise.resolve();
+async function waitForWritableChannel(channel: RTCDataChannel, queueBytes: number): Promise<void> {
+  while (channel.bufferedAmount > queueBytes) await waitForLowBuffer(channel);
+}
+
+function waitForLowBuffer(channel: RTCDataChannel): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
     const timer = window.setTimeout(() => {
@@ -895,10 +949,10 @@ function requiredDescriptionSdp(description: RTCSessionDescriptionInit): string 
 }
 
 async function reportSelectedPath(state: PeerState, connection: RTCPeerConnection): Promise<void> {
-  post({ type: "ice-path", peerId: state.id, path: await selectedPath(connection) });
+  post({ type: "ice-path", peerId: state.id, side: state.role, ...(await selectedPath(connection)) });
 }
 
-async function selectedPath(connection: RTCPeerConnection): Promise<"relay" | "p2p"> {
+async function selectedPath(connection: RTCPeerConnection): Promise<{ path: "relay" | "p2p"; route: string }> {
   const stats = await connection.getStats();
   const transport = [...stats.values()].find((report) => report.type === "transport" && report.selectedCandidatePairId);
   const selectedPair = transport ? stats.get(transport.selectedCandidatePairId) : null;
@@ -910,7 +964,10 @@ async function selectedPath(connection: RTCPeerConnection): Promise<"relay" | "p
     [...stats.values()].find((report) => report.type === "candidate-pair" && report.state === "succeeded");
   const local = pair ? stats.get(pair.localCandidateId) : null;
   const remote = pair ? stats.get(pair.remoteCandidateId) : null;
-  return local?.candidateType === "relay" || remote?.candidateType === "relay" ? "relay" : "p2p";
+  return {
+    path: local?.candidateType === "relay" || remote?.candidateType === "relay" ? "relay" : "p2p",
+    route: iceCandidateRoute(local, remote),
+  };
 }
 
 function sendSignal(state: PeerState, message: SignalClientMessage): void {
@@ -931,13 +988,71 @@ function replaceSignal(state: PeerState): void {
   connectSignal(state);
 }
 
+function markClientsUnconfirmed(host: PeerState): void {
+  pauseClientReconfirm(host);
+  for (const sessionId of host.clients.keys()) {
+    if (!host.unconfirmedSessions.has(sessionId)) host.unconfirmedSessions.set(sessionId, CLIENT_RECONFIRM_MS);
+  }
+}
+
+function armClientReconfirm(host: PeerState): void {
+  host.reconfirmClockStartedAt ??= Date.now();
+  scheduleClientReconfirm(host);
+}
+
+function pauseClientReconfirm(host: PeerState): void {
+  const startedAt = host.reconfirmClockStartedAt;
+  if (startedAt === null) return;
+  host.reconfirmClockStartedAt = null;
+  const onlineMs = Date.now() - startedAt;
+  for (const [sessionId, remainingMs] of host.unconfirmedSessions)
+    host.unconfirmedSessions.set(sessionId, Math.max(0, remainingMs - onlineMs));
+  scheduleClientReconfirm(host);
+}
+
+function scheduleClientReconfirm(host: PeerState): void {
+  if (host.reconfirmTimer !== null) clearTimeout(host.reconfirmTimer);
+  host.reconfirmTimer = null;
+  const startedAt = host.reconfirmClockStartedAt;
+  if (startedAt === null || host.unconfirmedSessions.size === 0) return;
+  const dueAt = startedAt + Math.min(...host.unconfirmedSessions.values());
+  host.reconfirmTimer = window.setTimeout(
+    () => {
+      host.reconfirmTimer = null;
+      endUnconfirmedSessions(host);
+    },
+    Math.max(0, dueAt - Date.now()),
+  );
+}
+
+function endUnconfirmedSessions(host: PeerState): void {
+  const startedAt = host.reconfirmClockStartedAt;
+  if (host.closed || startedAt === null) return;
+  const onlineMs = Date.now() - startedAt;
+  const expired = [...host.unconfirmedSessions]
+    .filter(([, remainingMs]) => remainingMs <= onlineMs)
+    .map(([sessionId]) => sessionId);
+  endSessions(host, expired);
+  scheduleClientReconfirm(host);
+}
+
+function endSessions(host: PeerState, sessionIds: readonly string[]): void {
+  for (const sessionId of sessionIds) {
+    host.unconfirmedSessions.delete(sessionId);
+    const client = host.clients.get(sessionId);
+    if (client) disconnect(client.id);
+  }
+}
+
 function scheduleSignalReconnect(state: PeerState): void {
   if (state.reconnectTimer !== null) return;
   const attempt = state.reconnectAttempt++;
+  const holdMs = signalRetryAt - Date.now();
   const delay = Math.max(
-    signalRetryAt - Date.now(),
+    holdMs > 0 ? holdMs + Math.random() * SIGNAL_HOLD_SPREAD_MS : 0,
     attempt === 0 ? 500 + Math.random() * 3_500 : Math.min(30_000, 500 * 2 ** attempt) * (0.5 + Math.random() / 2),
   );
+  if (holdMs > 0) post({ type: "signal-held", peerId: state.id, retryInMs: Math.ceil(delay) });
   state.reconnectTimer = window.setTimeout(() => {
     state.reconnectTimer = null;
     connectSignal(state);
@@ -951,6 +1066,7 @@ function awaitSignalReady(state: PeerState, socket: WebSocket): void {
     state.signalReadyTimer = null;
     if (state.closed || state.socket !== socket) return;
     state.socket = null;
+    pauseClientReconfirm(state);
     socket.close(1000, "No ready");
     post({ type: "signal-closed", peerId: state.id, code: SIGNAL_NO_READY_CLOSE_CODE, terminal: false });
     scheduleSignalReconnect(state);
@@ -1003,9 +1119,12 @@ function disconnect(peerId: string): void {
   for (const child of [...state.clients.values()]) disconnect(child.id);
   if (state.signalHost) {
     for (const [sessionId, child] of state.signalHost.clients) {
-      if (child === state) state.signalHost.clients.delete(sessionId);
+      if (child !== state) continue;
+      state.signalHost.clients.delete(sessionId);
+      state.signalHost.unconfirmedSessions.delete(sessionId);
     }
   }
+  if (state.reconfirmTimer !== null) clearTimeout(state.reconfirmTimer);
   if (state.reconnectTimer !== null) clearTimeout(state.reconnectTimer);
   if (state.turnRefreshTimer !== null) clearTimeout(state.turnRefreshTimer);
   clearSignalLiveness(state);

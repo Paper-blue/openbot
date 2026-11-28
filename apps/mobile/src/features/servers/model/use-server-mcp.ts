@@ -3,7 +3,6 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useQueryScope } from "@/features/auth/context/mobile-session-context";
 import { useLockedMutation } from "@/features/servers/model/use-locked-action";
 import {
-  useMobileWorkspace,
   useMobileWorkspaceActions,
   useMobileWorkspaceSelector,
 } from "@/features/workspace/context/mobile-workspace-context";
@@ -22,21 +21,25 @@ export function useMcpServerList(serverId: string) {
   return { canManage, list };
 }
 
-export function useServerMcp(serverId: string) {
-  const { servers } = useMobileWorkspace();
+export function useMcpSignIns(serverId: string, canManage: boolean) {
   const { listMcpSignIns } = useMobileWorkspaceActions();
   const queryScope = useQueryScope();
+  return useQuery({
+    queryKey: queryKeys.mcpSignIns(queryScope, serverId),
+    enabled: canManage,
+    retry: false,
+    queryFn: () => listMcpSignIns(serverId),
+  });
+}
+
+export function useServerMcp(serverId: string) {
+  const server = useMobileWorkspaceSelector((workspace) => workspace.servers.find((item) => item.id === serverId));
+  const queryScope = useQueryScope();
   const queryClient = useQueryClient();
-  const server = servers.find((candidate) => candidate.id === serverId);
   const { canManage, list } = useMcpServerList(serverId);
   const listKey = queryKeys.mcpServers(queryScope, serverId);
   const signInsKey = queryKeys.mcpSignIns(queryScope, serverId);
-  const signIns = useQuery({
-    queryKey: signInsKey,
-    enabled: canManage,
-    retry: false,
-    queryFn: () => listMcpSignIns(serverId).catch((): McpSignInState[] => []),
-  });
+  const signIns = useMcpSignIns(serverId, canManage);
   const { action, perform } = useLockedMutation();
   return {
     server,

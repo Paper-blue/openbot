@@ -18,6 +18,8 @@ export const messages = {
     "OpenBot はこのコンピューターから Telegram に接続できません。サインインし、このコンピューターに名前を付けてから、もう一度お試しください。",
   "error.messaging.telegramRelayUnreachable":
     "OpenBot はこのコンピューターからサービスに接続できません。インターネット接続、VPN、プロキシ、またはファイアウォールを確認してから、もう一度お試しください。",
+  "error.messaging.telegramRelayCertificate":
+    "このコンピューターから OpenBot のサービスに安全に接続できません。HTTPS 通信を検査するセキュリティソフト、またはこのコンピューターの日付と時刻の誤りが原因の可能性があります。確認してから、もう一度お試しください。",
   "error.messaging.telegramServiceUnavailable":
     "OpenBot は現在 Telegram に接続できません。しばらくしてからもう一度お試しください。",
   "error.messaging.whatsappNotConnected": "この WhatsApp 番号は接続されていません。",
@@ -25,6 +27,7 @@ export const messages = {
   "error.messaging.whatsappTooManySenders": "1 つの WhatsApp 番号で許可できる連絡先とグループは最大 200 件です。",
   "error.messaging.whatsappNumberNotFound":
     "この番号には WhatsApp アカウントがありません。+44 7700 900123 のように国番号を付けて入力してください。",
+  "error.messaging.whatsappSenderNotFound": "この連絡先またはグループはリストにありません。",
   "error.messaging.whatsappRequestEnded":
     "このリクエストは終了しました。新しいコードを受け取るには、相手にもう一度書き込むよう依頼してください。",
   "error.messaging.memoryLimit":

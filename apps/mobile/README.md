@@ -87,8 +87,7 @@ do not commit it: the app config is in the runtime version.
 The iOS commands keep the Xcode build in `ios/DerivedData`, not in
 `~/Library/Developer/Xcode/DerivedData`, so removing a worktree removes its build. Do not remove
 `ios/build`: CocoaPods writes codegen output there. When that output is missing, `bun mobile:ios`
-installs the pods again. Metro keeps its
-caches in `.expo/metro-cache` and `.expo/metro-file-map` of the worktree.
+installs the pods again. Metro keeps its file map cache in `.expo/metro-file-map` of the worktree.
 
 `bun mobile:android` also applies the config plugins without clearing `android/`, then runs
 `expo run:android`. Three local settings make a build in a new worktree faster:
@@ -98,9 +97,35 @@ caches in `.expo/metro-cache` and `.expo/metro-file-map` of the worktree.
 - The local `android/gradle.properties` gets `org.gradle.caching=true`. Worktrees share Gradle task
   outputs in `~/.gradle/caches/build-cache-1`. The app config, fingerprint and EAS builds stay the
   same.
-- `CCACHE_BASEDIR` and `CCACHE_NOHASHDIR` let ccache share the C++ results of the app CMake project
-  between worktrees. Install ccache with `brew install ccache`; React Native uses it when it is on
-  `PATH`.
+- `CCACHE_BASEDIR` and `CCACHE_NOHASHDIR` let ccache share C++ results between worktrees. Install
+  ccache with `brew install ccache`. React Native uses it for the app CMake project when it is on
+  `PATH`, and `CMAKE_C_COMPILER_LAUNCHER` and `CMAKE_CXX_COMPILER_LAUNCHER` add it to the CMake
+  projects of the libraries, such as Reanimated, Worklets, Expo modules and Skia.
+
+The first build in a new worktree also reuses the work of other worktrees through two shared caches
+in `openbot-mobile-cache.noindex` of the common git directory (`git rev-parse --git-common-dir`), on
+the disk of the main checkout. `OPENBOT_MOBILE_BUILD_CACHE=<directory>` puts them in another
+directory; a relative path starts at the checkout root. `OPENBOT_MOBILE_BUILD_CACHE=off` turns them
+off. You can remove the directory at any time.
+
+- `metro/`: Metro transforms of all mobile commands (`metro-cache.js`). Each set of mobile
+  dependencies in `bun.lock` and their patches has its own namespace, because the Metro cache key
+  does not include the versions of the Babel plugins. Packages that only other workspaces or the dev
+  dependencies of the app use are not in the namespace. When `bun.lock` or a patch is newer than the
+  last `bun install` (`node_modules/.openbot-install-stamp`), Metro warns and does not use the shared
+  cache. A namespace that no worktree used for 14 days is removed. A transform that contains the
+  path of the checkout, such as a `use dom` component, stays in `.expo/metro-cache` of the worktree.
+  The entries use the file store of `@expo/metro-config`, which writes each entry to a temporary file
+  and renames it, so several Metro processes can use one namespace. The store is not a public export
+  of Expo: when Expo moves it, Metro warns and does not use the shared cache. Uniwind replaces the
+  Metro cache stores with one in the system temporary directory, so `metro.config.js` sets them
+  again; EAS builds keep the store of Uniwind. React Native's build scripts and the early bundle of
+  `expo run` clear the Metro cache before each release bundle; `bun mobile:ios` and
+  `bun mobile:android` keep it. `bun mobile -- --clear` clears the namespace for all worktrees.
+- `xcode/`: the Xcode compilation cache of `bun mobile:ios` (Swift, Objective-C and C++). Prefix
+  mapping replaces the checkout path and its real path with `/^openbot` in the cache keys, in the
+  debug info and in `__FILE__`. Only the `xcodebuild` build command (with `-destination`) gets these
+  settings. Xcode removes old entries above 20 GB.
 
 The local launcher enables RocketSim Connect in the local native project. The config plugin
 loads it before React Native starts, only in Debug builds on the iOS Simulator.
@@ -194,7 +219,13 @@ already loaded remain visible during reconnection.
 
 The phone keeps an encrypted copy of the agents, hidden agents, sections, latest chat pages,
 channels with the latest 50 messages of each opened channel, capabilities and last drawer values (`drawer-snapshot.ts`) of each server (`workspace-cache.ts`),
-and writes it when a server load ends and when the app goes to the background. It also keeps the
+and writes it when a server load ends and when the app goes to the background. Each server has two
+files: a small one with the agents, sections, channel list, capabilities and drawer values, and one
+with the chat and channel pages. Both files of one write have the same ID. At start the app reads
+the small file of each server first and shows the agent list, then reads the page files. It does not
+write a server while its page file is still being read. A copy in the older one-file format (from a
+previous app version) is read once and replaced at the next write; an older app bundle then finds no
+copy and loads from the host. It also keeps the
 last server list of the account service. After a start, the servers of that list connect at once,
 before the account service answers; a server whose key is not the key that the phone trusts waits
 for the account service. Its list then replaces the copy: it removes a server that the account
@@ -221,8 +252,10 @@ so it survives a restart. Each chat sends its messages one at a time and in orde
 online. An agent message carries a `clientMessageId` when the host advertises `message-client-id-v1`,
 and a channel message uses the same id as its `operationId`, so a repeat after a lost reply stores
 the message once. A message that the host refused shows `Not sent`, and its menu adds Retry; it holds
-the later messages of its chat. A message that the host may have stored is not repeated when
-the host cannot drop a repeat, or 12 hours after its first attempt; it shows `Not confirmed`. This
+the later messages of its chat, which show `Waits for the message that was not sent`. A refused message writes its failure kind,
+its file count and its size to the support log, without the error text, which can name a file. A message that the host may have stored is not repeated when
+the host cannot drop a repeat, or 12 hours after its first attempt; it shows `Not confirmed` and tells
+the user to touch and hold it, where its menu has Edit and Don't send. This
 visual state is derived only in the mobile UI: it never changes the agent's synced avatar profile or
 sends appearance updates over RTC.
 
@@ -260,6 +293,37 @@ recent apps show a blank card. The lock screen draws in `FullWindowOverlay` on i
 Android, above sheets. Notification, Live Activity, quick action and share navigation waits until
 the user unlocks. Expo Go does not have the module: it measures with the phone clock and cannot see a phone lock.
 
+## Background refresh
+
+While the user is signed in, the phone asks the system for a background refresh at most once every
+15 minutes. The system decides when it runs. In a refresh, the workspace makes the server connections
+active for at most 25 seconds. It waits until each server loads with its channels and open chats, or
+stops at the retry cooldown, then saves the encrypted workspace copy and makes the connections
+inactive again. The app stays "away" for the hosts, so they continue to send notifications, and a
+chat on screen is not marked as read. A refresh sends no connection analytics.
+
+- iOS uses `BGAppRefreshTask` with the identifier `run.openbot.mobile.refresh` (`UIBackgroundModes`
+  `fetch` in `app.json`). The local `modules/background-refresh` module registers the task at launch
+  and gives each run to JavaScript. iOS lists the app in Settings > General > Background App Refresh.
+- Android uses `expo-background-task` (WorkManager). `package.json` excludes it, `expo-task-manager`
+  and `unimodules-app-loader` from iOS autolinking, because that package schedules only an idle
+  processing task on iOS.
+- The server connections run in a web view, so a refresh needs the React tree. When the system
+  starts the app in the background with no window, React Native does not start (iOS) or no component
+  mounts (Android). The run then ends with no network work, and the refresh stops until the user
+  opens the app again.
+- The support log shows `Background refresh: available` (or the iOS status), and for each run the
+  number of servers that loaded, or why the run did nothing (`Background refresh skipped: ...`). On
+  iOS, the device log (subsystem `run.openbot.mobile`, category `BackgroundRefresh`) shows when iOS
+  started the task and when it ended.
+- Test on a device. iOS has no background tasks in the Simulator. Attach Xcode to `OpenBot`, put
+  the app in the background and pause it. Select a thread that is not the main thread
+  (`thread select <n>`): on the main thread the command does not return. Then run
+  `e -l objc -- @import Foundation`, `e -l objc -- @import BackgroundTasks` and
+  `e -l objc -- (void)[[BGTaskScheduler sharedScheduler] performSelector:NSSelectorFromString(@"_simulateLaunchForTaskWithIdentifier:") withObject:@"run.openbot.mobile.refresh"]`,
+  and continue. Wait before you open the app: a run with the app in the foreground does nothing.
+  On Android, `adb shell cmd jobscheduler run -f run.openbot.mobile <job id>` starts the job.
+
 ## iOS shortcuts
 
 The Shortcuts app of iOS 26 and later has three OpenBot shortcuts: List Agents, Send Message and
@@ -277,7 +341,9 @@ start, and iOS suspends the app soon after the intent returns.
   (`src/features/shortcuts/model/shortcut-directory.ts`): the agents, the agent of Settings >
   Shortcuts, the app lock and the card text. Sign-out deletes it. The servers with their public
   keys and the agent pictures are the ones that the app writes for the share extension.
-- List Agents reads that file. A tap on an agent opens its chat.
+- List Agents reads that file. A tap on an agent opens its chat. The message button of an agent runs
+  the hidden intent Message Agent: it asks for the text and sends it to that agent as Send Message
+  does, and the app does not open.
 - Open Agent opens the app on the chat of the agent of Settings > Shortcuts. With no agent, it opens
   Settings > Shortcuts. It uses the same `ShortcutBridge` path as the card buttons.
 - Send Message sends to the agent of Settings > Shortcuts with the sender of the share extension
@@ -365,6 +431,31 @@ bun run mobile:lint
 bun run mobile:typecheck
 bun run mobile:doctor
 ```
+
+### Screen open times
+
+`scripts/mobile-screen-open-e2e.ts` measures how fast screens open. It opens chat, agent info,
+Settings, Server Settings and the Hidden chats sheet N times from the agent list, and writes the
+p50 and p90 times to `.openbot-build/mobile-screen-open/<label>.json`. It drives the app through the
+Metro inspector, so it needs no taps and no deep link prompts.
+
+The app records the times with the Expo Router performance marks
+(`unstable_enablePerformanceIntegration`), in `src/features/screen-metrics/screen-open-probe.ts`.
+The probe runs only in a development bundle, or in a bundle that Metro builds with
+`EXPO_PUBLIC_OPENBOT_SCREEN_METRICS=1`. It sends no data: the script reads the times over the
+inspector. `focusMs` is the time from the push to the `expo-router:page-focused` mark, after the
+screen content commits. `paintMs` adds two animation frames.
+
+1. Start Metro and open a development build on a simulator. For times near a release build, start
+   Metro with `EXPO_PUBLIC_OPENBOT_SCREEN_METRICS=1` and `--no-dev --minify`.
+2. Sign in and open the agent list.
+3. Run `bun scripts/mobile-screen-open-e2e.ts --runs=20 --label=before`. Options: `--metro-port`,
+   `--screens=chat,settings`, `--device`, `--agent-id`, `--agent-server-id` and `--server-id`.
+4. After a change, run it again with `--label=after --baseline=.openbot-build/mobile-screen-open/before.json`.
+   The report then has the p50 and p90 differences.
+
+The first run of each screen is in `cold`. `warm` has the other runs. Compare runs on the same
+simulator, with the same data and the same bundle mode.
 
 ## EAS
 
@@ -742,7 +833,7 @@ Run them from the repository root. The publish, rollout and rollback commands st
 | `bun run mobile:ota:publish -- --platform all --message "Fix the chat scroll"` | Publishes the current branch to all phones of the store builds that can get it. `--platform ios` or `android` selects one platform. `--rollout 10` gives it to 10% of the phones. `--dry-run` runs the checks and the guard, and publishes nothing. |
 | `bun run mobile:ota:rollout -- --platform all --rollout 50` | Changes the percentage of phones that get the current update. |
 | `bun run mobile:ota:rollback -- --platform all` | Takes the current update back. Phones get the earlier update again, or with `--to-embedded` the bundle in their binary. |
-| `bun run mobile:ota:status` | Shows what the update server gives the phones of each store build. It changes nothing. |
+| `bun run mobile:ota:status` | Shows what the update server gives the phones of each store build. It changes nothing. It asks with no install ID, so during a rollout under 100% it shows the earlier update or "no update". |
 | `bun run mobile:release:ota -- --base <store build tag> --platform all` | Writes the release notes of an update. See [the notes of an update](#release-notes-of-an-update). |
 
 Add `--channel preview` to send an update to internal builds of the `preview` profile only. Such a
@@ -754,10 +845,17 @@ commit, or from a commit with the same runtime version (`mobile:ota:check` print
 1. Merge the fix to `main` with its note file in `changelog.d`.
 2. Run `bun run mobile:ota:check`. When it names the store builds, `main` has no native change since
    those builds, and all of `main` can go out.
-3. Run `bun run mobile:ota:publish -- --platform all --message "<what the update does>"`.
-4. Follow the workflow in GitHub Actions. It runs the mobile lint, typecheck and tests, the guard,
+3. Write the notes with `bun run mobile:release:ota`, and merge that change before the publish. The
+   update banner reads the notes from the account service when the update is ready on the phone; a
+   phone that gets the update before the notes deploy never shows them. Wait for the
+   `Deploy Cloudflare production` job of the merge, and confirm that
+   `https://openbot.run/v1/mobile/changelog?platform=ios&after=<store version>` has the new section.
+4. Run `bun run mobile:ota:publish -- --platform all --message "<what the update does>"`.
+5. Follow the workflow in GitHub Actions. It runs the mobile lint, typecheck and tests, the guard,
    `expo export`, and the upload. Its summary names each update ID and the store builds that get it.
-5. Write the notes with `bun run mobile:release:ota`, and merge that change.
+
+The `release-mobile-ota` agent skill (`.agents/skills/release-mobile-ota`) does these steps with the
+checks before and after the publish.
 
 When step 2 says that the checkout needs a store build, `main` has a native change. Then:
 
@@ -930,14 +1028,14 @@ of both platforms is required before release.
 ### Event catalog
 
 Every event has `surface=mobile`, `platform=ios|android`, `environment=production`,
-`event_schema_version=3`, `app_version` and `build_number`. Operation outcomes use `result` and,
+`event_schema_version=5`, `app_version` and `build_number`. Operation outcomes use `result` and,
 where available, `duration_ms`. Failure codes are fixed categories, never raw error text.
 
 | Event | Meaning |
 | --- | --- |
 | `mobile_app_opened` | Cold start or return from background, with `signed_in`; iOS inactive overlays do not count as a new visit |
 | `mobile_pairing_action` | Sign-in scanner opened, camera permission result, QR redemption result, scanner cancelled; `entry_point` is `qr` or `link` (a pairing link) |
-| `mobile_connection_action` | Initial connection attempt, reconnection attempt, or connection lost; result, duration and bounded loading stage |
+| `mobile_connection_action` | Initial connection attempt, reconnection attempt, or connection lost; result, duration and bounded loading stage. From generation 5, the milliseconds from the start of the attempt to the Signal socket (`signal_socket_ms`), the Signal answer (`signal_ms`), the open data channels (`channels_ms`) and the host sign-in (`auth_ms`), when the attempt made a new peer connection; `route`, the candidate types and transports of the selected WebRTC path (for example `relay/tcp -> host/udp`; for a relay candidate, the transport from the phone to the relay); and `vpn` (`off`, `on`, `proxy` for a tunnel address in `198.18.0.0/15` as Clash-type proxy apps use, or `unknown`), also on `lost`. No address or VPN name is sent |
 | `conversation_opened` | One visible-visit outcome and time to readable conversation, including cached/offline reads; failures when no readable conversation is available |
 | `message_send` | Host receipt or failure, attachment count, reply flag, provider/model/reasoning metadata when known |
 | `agent_input_action` | Submission of a structured prompt answer or an approval decision (`accept` or `decline`); no answer contents, command or path |

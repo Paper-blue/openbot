@@ -1,7 +1,7 @@
 import type { AgentEvent, AgentSummary } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import type { Logger } from "@openbot/logging";
-import { Effect, Result, Schema } from "effect";
+import { Cause, Effect, Exit, Option, Result, Schema } from "effect";
 import type { AgentApiKeys } from "../agent-api-keys";
 import type { AgentClient, AgentProvider } from "../agent-client";
 import type { AgentStore } from "../agent-store";
@@ -23,9 +23,11 @@ export interface AgentRemovalHooks {
   emit(event: AgentEvent): void;
   listAgents(): AgentSummary[];
   deleteTasks(agentId: string): Effect.Effect<void, AgentRemovalFailed>;
+  clearChannelContexts(agentId: string): Effect.Effect<void, AgentRemovalFailed>;
   cancelMemoryReview(agentId: string): Effect.Effect<void>;
   stopAgentProcess(agentId: string): Effect.Effect<boolean, AgentRemovalFailed>;
   releaseFolderHolders(agentId: string): Effect.Effect<boolean, AgentRemovalFailed>;
+  folderHeld(agentId: string): boolean;
   currentClient(provider: AgentProvider): AgentClient | null;
   usageLimitHolds(agentId: string): boolean;
   settleModelMoves(agentId: string): Effect.Effect<void>;
@@ -54,8 +56,11 @@ export interface AgentRemovalOptions {
   hooks: AgentRemovalHooks;
 }
 
+const WORK_SETTLE_WAIT_MS = 30_000;
+
 export class AgentRemoval {
   readonly #deleting = new Set<string>();
+  readonly #heldFolders = new Set<string>();
   readonly #store: AgentStore;
   readonly #mailbox: MailboxStore;
   readonly #conversation: ConversationRuntime;
@@ -98,11 +103,18 @@ export class AgentRemoval {
     return this.#deleting;
   }
 
+  heldFoldersReleased(): string[] {
+    if (this.#heldFolders.size === 0) return [];
+    const listed = new Set(this.#store.list().map((agent) => agent.id));
+    for (const agentId of this.#heldFolders) if (!listed.has(agentId)) this.#heldFolders.delete(agentId);
+    return [...this.#heldFolders].filter((agentId) => !this.#deleting.has(agentId) && !this.#hooks.folderHeld(agentId));
+  }
+
   readonly ensureDeletable = Effect.fn("AgentRemoval.ensureDeletable")(function* (this: AgentRemoval, agentId: string) {
     yield* removalStep(() => this.#deletable(agentId));
   });
 
-  readonly delete = Effect.fn("AgentRemoval.delete")(function* (this: AgentRemoval, agentId: string) {
+  readonly #deleteAgent = Effect.fn("AgentRemoval.delete")(function* (this: AgentRemoval, agentId: string) {
     const agent = yield* removalStep(() => this.#deletable(agentId));
     yield* Effect.acquireUseRelease(
       removalStep(() => {
@@ -113,8 +125,7 @@ export class AgentRemoval {
       }),
       ({ wasPending }) =>
         Effect.gen({ self: this }, function* () {
-          yield* this.#drain.taskFor(agentId)?.pipe(Effect.ignore) ?? Effect.void;
-          yield* this.#hooks.settleModelMoves(agentId);
+          yield* this.#settleWork(agentId);
           const current = yield* removalStep(() => {
             this.#assertIdle(agentId);
             return this.#store.list().find((entry) => entry.id === agentId) ?? agent;
@@ -137,6 +148,38 @@ export class AgentRemoval {
         }),
     );
   }, Effect.uninterruptible);
+
+  delete(agentId: string): Effect.Effect<void, AgentRemovalFailed> {
+    return this.#deleteAgent(agentId).pipe(
+      Effect.mapError((failure) =>
+        isFolderInUse(failure)
+          ? new AgentRemovalFailed({ cause: new AgentFolderInUse(sourceText("error.agent.deleteWhenFolderFree")) })
+          : failure,
+      ),
+      Effect.onExit((exit) =>
+        Effect.sync(() => {
+          if (Exit.isFailure(exit) && Option.exists(Cause.findErrorOption(exit.cause), isFolderInUse))
+            this.#heldFolders.add(agentId);
+          else this.#heldFolders.delete(agentId);
+        }),
+      ),
+    );
+  }
+
+  #settleWork(agentId: string): Effect.Effect<void, AgentRemovalFailed> {
+    return Effect.interruptible(
+      Effect.andThen(
+        this.#drain.taskFor(agentId)?.pipe(Effect.ignore) ?? Effect.void,
+        this.#hooks.settleModelMoves(agentId),
+      ),
+    ).pipe(
+      Effect.timeoutOrElse({
+        duration: WORK_SETTLE_WAIT_MS,
+        orElse: () =>
+          Effect.fail(new AgentRemovalFailed({ cause: new Error(sourceText("error.agent.stopBeforeDelete")) })),
+      }),
+    );
+  }
 
   #deletable(agentId: string): AgentSummary | undefined {
     if (this.#deleting.has(agentId)) throw new Error(sourceText("error.agent.deletionBusy"));
@@ -163,7 +206,7 @@ export class AgentRemoval {
   ) {
     yield* this.#deleteWithRevokedApproval(agent.id, () => this.#removeAgentDataEffect(agent)).pipe(
       Effect.mapError((failure) =>
-        failure.cause instanceof AgentFolderInUse
+        failure.cause instanceof AgentFolderInUse || failure.cause instanceof AgentFolderLocked
           ? failure
           : new AgentRemovalFailed({ cause: new Error(sourceText("error.agent.deleteIncomplete")) }),
       ),
@@ -186,6 +229,7 @@ export class AgentRemoval {
       })),
     );
     let stage = "provider-files";
+    let orchestratorOf: readonly string[] = [];
     let processKeptForWork = false;
     yield* Effect.gen({ self: this }, function* () {
       for (const session of providerSessions)
@@ -193,13 +237,15 @@ export class AgentRemoval {
           .deleteProviderSessionFiles(session.externalSessionId, session.id)
           .pipe(toAgentRemovalFailed);
       stage = "messaging";
-      yield* this.#messaging.deleteForAgent(agent.id).pipe(toAgentRemovalFailed);
+      orchestratorOf = yield* this.#messaging.deleteForAgent(agent.id).pipe(toAgentRemovalFailed);
       stage = "tasks";
       yield* this.#hooks.deleteTasks(agent.id);
       stage = "mailbox";
       yield* this.#mailbox
         .deleteAgentData(agent.id, this.#channels.store.allContextThreads())
         .pipe(toAgentRemovalFailed);
+      stage = "channel-contexts";
+      yield* this.#hooks.clearChannelContexts(agent.id);
       stage = "api-keys";
       if (this.#apiKeys) yield* this.#apiKeys.removeAgent(agent.id).pipe(toAgentRemovalFailed);
       const stopped = yield* Effect.result(this.#hooks.stopAgentProcess(agent.id));
@@ -223,11 +269,29 @@ export class AgentRemoval {
         ),
       );
     }).pipe(
+      Effect.tapError(() =>
+        removalStep(() => {
+          if (this.#store.list().some((candidate) => candidate.id === agent.id))
+            this.#messaging.store.restoreOrchestrator(agent.id, orchestratorOf);
+        }).pipe(
+          Effect.catch((failure) =>
+            Effect.sync(() =>
+              this.#logger.warn("Could not restore a deleted agent's orchestrator role.", removalErrorCode(failure)),
+            ),
+          ),
+        ),
+      ),
       Effect.mapError((failure) => {
         const code = removalErrorCode(failure);
         this.#logger.warn("Agent deletion failed.", { stage, ...code });
-        if (stage === "agent-files-and-record" && processKeptForWork && code.code === "EBUSY")
-          return new AgentRemovalFailed({ cause: new AgentFolderInUse(sourceText("error.agent.deleteFolderInUse")) });
+        if (stage === "agent-files-and-record" && code.code === "EBUSY") {
+          if (processKeptForWork)
+            return new AgentRemovalFailed({ cause: new AgentFolderInUse(sourceText("error.agent.deleteFolderInUse")) });
+          if (process.platform === "win32")
+            return new AgentRemovalFailed({
+              cause: new AgentFolderLocked(sourceText("error.agent.deleteFolderLocked")),
+            });
+        }
         return new AgentRemovalFailed({ cause: new Error(sourceText("error.agent.deleteIncomplete")) });
       }),
     );
@@ -280,6 +344,11 @@ export class AgentRemovalFailed extends Schema.TaggedError<AgentRemovalFailed>()
 const { sync: removalStep, rewrap: toAgentRemovalFailed } = causeHelpers(AgentRemovalFailed);
 
 class AgentFolderInUse extends Error {}
+
+class AgentFolderLocked extends Error {}
+
+const isFolderInUse = (failure: unknown): boolean =>
+  failure instanceof AgentRemovalFailed && failure.cause instanceof AgentFolderInUse;
 
 function removalErrorCode(failure: unknown): { code?: string; errcode?: number } {
   let cause = failure;

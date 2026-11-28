@@ -18,9 +18,11 @@ const config: KnipConfig = {
   ignoreBinaries: [
     "xterm",
     "ssh-keygen",
+    "openssl",
     "ssh-keyscan",
     "ssh-add",
     "cmake",
+    "ccache",
     "otool",
     "install_name_tool",
     "ldd",
@@ -75,9 +77,12 @@ const config: KnipConfig = {
       ignoreUnresolved: ["scripts/.+\\.ts"],
     },
     "apps/auth-api": {
-      entry: ["*.ts", "src/email-relay-entry.ts"],
-      project: ["src/**/*.{ts,tsx,css}", "test/**/*.ts", "*.ts"],
+      entry: ["*.ts", "src/email-relay-entry.ts", "scripts/*.ts"],
+      project: ["src/**/*.{ts,tsx,css}", "test/**/*.ts", "scripts/**/*.ts", "*.ts"],
       ignoreDependencies: ["cloudflare"],
+    },
+    "apps/browser-extension": {
+      entry: ["src/x-content.ts"],
     },
     "apps/site-router": {
       project: ["src/**/*.ts"],

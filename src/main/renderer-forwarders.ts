@@ -2,9 +2,11 @@ import { hostname } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   type AgentEvent,
+  type AgentRuntimeSnapshot,
   agentNotificationLevelMap,
   type BrowserDisplayState,
   type ChannelSummary,
+  type ChatWindowTarget,
   type ClientAgentSummary,
   decodeChannelSummaries,
   type HiddenAgentsSnapshot,
@@ -37,6 +39,7 @@ import {
   notificationForAgentEvent,
   notificationForUsageLimit,
   notificationRequestKey,
+  settledRequestKeys,
   teammateTurnCompleted,
 } from "@openbot/team-client/agent-notifications";
 import {
@@ -55,6 +58,7 @@ import {
   desktopAgentEventLevel,
   type NotificationChat,
   RETAINED_NOTIFICATION_LIMIT,
+  releaseWhenNotificationGone,
   showRetainedNotification,
 } from "./desktop-notifications";
 import type { HostService } from "./host-service";
@@ -71,6 +75,7 @@ type NotifyLevel = (
 export interface RendererForwarderDependencies {
   getMainWindow: () => BrowserWindow | null;
   getChatWindows: () => BrowserWindow[];
+  chatWindowTarget: (window: BrowserWindow) => ChatWindowTarget | null;
   getAgentService: () => Pick<AgentService, "listAgents" | "listHiddenAgents"> | null;
   getHostService: () => HostService | null;
   getHostAnalytics: () => HostAnalytics | null;
@@ -84,6 +89,7 @@ export interface RendererForwarderDependencies {
     | "cachedNotificationLevels"
     | "knownNotificationLevels"
     | "supportsCapability"
+    | "sync"
   > | null;
   ownAgentNotificationLevels: () => ReadonlyMap<string, ServerNotificationLevel>;
   showMainWindow: (window: BrowserWindow) => void;
@@ -100,6 +106,7 @@ const CHANNEL_READ_GAP_MS = 250;
 export function createRendererForwarders({
   getMainWindow,
   getChatWindows,
+  chatWindowTarget,
   getAgentService,
   getHostService,
   getHostAnalytics,
@@ -121,12 +128,23 @@ export function createRendererForwarders({
     return window.isFocused() || getChatWindows().some((chatWindow) => chatWindow.isFocused());
   }
 
+  function windowShowsConversation(window: BrowserWindow, serverId: string, agentId: string | null): boolean {
+    if (agentId === null) return true;
+    const chat = chatWindowTarget(window);
+    return chat === null || (chat.serverId === serverId && chat.agentId === agentId);
+  }
+
   function forwardAgentEvent(serverId: string, event: AgentEvent, bufferedLive = false): void {
     if (serverId === LOCAL_SERVER_ID) getHostAnalytics()?.handleAgentEvent(event);
     const window = getMainWindow();
     if (!window || window.isDestroyed()) return;
     const scoped = bufferedLive ? { serverId, event, bufferedLive } : { serverId, event };
-    for (const target of appWindows()) sendToRenderer(target, IPC_ENDPOINTS.agent.scopedEvent, scoped);
+    const agentId = conversationAgentId(event);
+    for (const target of appWindows()) {
+      if (windowShowsConversation(target, serverId, agentId)) {
+        sendToRenderer(target, IPC_ENDPOINTS.agent.scopedEvent, scoped);
+      }
+    }
     if (event.type === "browser-changed" && serverId !== LOCAL_SERVER_ID) {
       forwardBrowserDisplayState(serverId, { tabs: event.tabs, activeTabId: event.activeTabId });
     }
@@ -156,9 +174,7 @@ export function createRendererForwarders({
       shown.delete(notification);
       if (shown.size === 0 && chatNotifications.get(key) === shown) chatNotifications.delete(key);
     };
-    notification.on("click", release);
-    notification.on("close", release);
-    notification.on("failed", release);
+    releaseWhenNotificationGone(notification, release);
   }
 
   function closeChatNotifications(serverId: string, chat: NotificationChat): void {
@@ -208,7 +224,10 @@ export function createRendererForwarders({
     const remoteManager = getRemoteServerManager();
     const server = remoteManager?.list().find((candidate) => candidate.id === serverId);
     if (!remoteManager || !server?.compatibility?.capabilities.includes(TEAM_CHANNEL_ATTENTION_CAPABILITY)) return null;
-    return runCauseEffect(remoteManager.request(serverId, CHANNEL_ROUTES.list, decodeChannelSummaries));
+    return (
+      remoteManager.sync.channels.values(serverId) ??
+      runCauseEffect(remoteManager.request(serverId, CHANNEL_ROUTES.list, decodeChannelSummaries))
+    );
   }
 
   async function notifyChannelReplies(serverId: string, next: ChannelSummary[]): Promise<void> {
@@ -223,12 +242,15 @@ export function createRendererForwarders({
     if (level() !== "all" || newChannelReplies(previous, next).length === 0) return;
     const agentLookup = notificationAgents(serverId);
     const agents = agentLookup instanceof Promise ? await agentLookup : agentLookup;
+    const levelLookup = agentNotificationLevels(serverId);
+    const agentLevels = levelLookup instanceof Promise ? await levelLookup : levelLookup;
     const current = level();
     if (!current) return;
     const replies = channelReplyNotifications(previous, next, {
       agents,
       translate: getTranslate(),
       level: current,
+      agentLevels,
       redact: notificationPreviewEnabled() ? redactText : null,
     });
     for (const reply of replies) {
@@ -240,10 +262,8 @@ export function createRendererForwarders({
       const release = () => {
         if (channelNotifications.get(key) === notification) channelNotifications.delete(key);
       };
-      notification.on("close", release);
-      notification.on("failed", release);
+      releaseWhenNotificationGone(notification, release);
       notification.on("click", () => {
-        release();
         const window = getMainWindow();
         if (!window || window.isDestroyed()) return;
         showMainWindow(window);
@@ -279,6 +299,11 @@ export function createRendererForwarders({
     if (serverId === LOCAL_SERVER_ID) return getAgentService()?.listAgents() ?? [];
     const remoteManager = getRemoteServerManager();
     if (!remoteManager) return [];
+    const synced = remoteManager.sync.agents.values(serverId);
+    if (synced) {
+      remoteAgents.set(serverId, synced);
+      return synced;
+    }
     return runCauseEffect(remoteManager.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummaries)).then(
       (agents) => {
         remoteAgents.set(serverId, agents);
@@ -317,13 +342,22 @@ export function createRendererForwarders({
 
   const requestNotifications = new Map<string, Notification | null>();
 
-  function withdrawResolvedNotification(serverId: string, event: AgentEvent): void {
-    if (event.type !== "agent-input-resolved" && event.type !== "browser-takeover-resolved") return;
-    const key = notificationRequestKey(serverId, event);
-    if (!key || !requestNotifications.has(key)) return;
+  function withdrawRequestNotification(key: string): void {
+    if (!requestNotifications.has(key)) return;
     const notification = requestNotifications.get(key);
     requestNotifications.delete(key);
     if (notification) closeRetainedNotification(notification);
+  }
+
+  function withdrawResolvedNotification(serverId: string, event: AgentEvent): void {
+    if (event.type !== "agent-input-resolved" && event.type !== "browser-takeover-resolved") return;
+    const key = notificationRequestKey(serverId, event);
+    if (key) withdrawRequestNotification(key);
+  }
+
+  function withdrawSettledNotifications(serverId: string, snapshot: AgentRuntimeSnapshot): void {
+    for (const key of settledRequestKeys(serverId, snapshot, requestNotifications.keys()))
+      withdrawRequestNotification(key);
   }
 
   async function notifyAgentEvent(serverId: string, received: AgentEvent): Promise<void> {
@@ -409,9 +443,7 @@ export function createRendererForwarders({
       const release = () => {
         if (requestNotifications.get(requestKey) === notification) requestNotifications.delete(requestKey);
       };
-      notification.on("click", release);
-      notification.on("close", release);
-      notification.on("failed", release);
+      releaseWhenNotificationGone(notification, release);
     }
     notification.on("click", () => {
       const current = getMainWindow();
@@ -567,6 +599,10 @@ export function createRendererForwarders({
     for (const window of appWindows()) sendToRenderer(window, IPC_ENDPOINTS.linkAccount.changed, status);
   }
 
+  function forwardNearWalletStatus(status: import("@openbot/contracts/ipc").NearWalletStatus): void {
+    for (const window of appWindows()) sendToRenderer(window, IPC_ENDPOINTS.nearWallet.changed, status);
+  }
+
   function forwardOnePasswordConnectorStatus(
     status: import("@openbot/contracts/ipc").OnePasswordConnectorStatus,
   ): void {
@@ -603,6 +639,10 @@ export function createRendererForwarders({
     const host = getHostService();
     const summaries = host ? withLocalHostSummary(servers, host.getStatus()) : servers;
     for (const target of appWindows()) sendToRenderer(target, IPC_ENDPOINTS.servers.event, summaries);
+  }
+
+  function forwardSyncChanged(serverId: string, name: string): void {
+    for (const target of appWindows()) sendToRenderer(target, IPC_ENDPOINTS.agent.syncChanged, { serverId, name });
   }
 
   function forwardTeamPresence(
@@ -647,9 +687,16 @@ export function createRendererForwarders({
     for (const target of appWindows()) sendToRenderer(target, IPC_ENDPOINTS.instanceTransfer.uploadProgress, progress);
   }
 
+  function forwardOwnerTransfersChanged(): void {
+    const window = getMainWindow();
+    if (!window || window.isDestroyed()) return;
+    sendToRenderer(window, IPC_ENDPOINTS.auth.ownerTransfersChanged);
+  }
+
   return {
     closeChatNotifications,
     forwardAgentEvent,
+    withdrawSettledNotifications,
     forwardWorkflowNotice,
     forwardMachineAlert,
     forwardBrowserDisplayState,
@@ -663,6 +710,7 @@ export function createRendererForwarders({
     forwardProviderRuntimeStatus,
     forwardGitHubConnectorStatus,
     forwardLinkAccountStatus,
+    forwardNearWalletStatus,
     forwardOnePasswordConnectorStatus,
     forwardBitwardenConnectorStatus,
     forwardPasswordManagerStatus,
@@ -671,10 +719,26 @@ export function createRendererForwarders({
     forwardRemoteDesktopSessions,
     forwardServers,
     forwardTeamPresence,
+    forwardSyncChanged,
     forwardDirectMessage,
     forwardDirectTyping,
     forwardAttachmentDownload,
     forwardAttachmentImportProgress,
     forwardInstanceTransferUploadProgress,
+    forwardOwnerTransfersChanged,
   };
+}
+
+function conversationAgentId(event: AgentEvent): string | null {
+  switch (event.type) {
+    case "conversation-delta":
+    case "turn-progress":
+      return event.agentId;
+    case "conversation":
+      return event.snapshot.agentId;
+    case "conversation-page":
+      return event.page.agentId;
+    default:
+      return null;
+  }
 }

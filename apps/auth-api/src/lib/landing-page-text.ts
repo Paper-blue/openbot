@@ -5,6 +5,7 @@ import { ADA, CLAUDE_CODE, type LandingFeatureId, type LandingTeamsOfferId, LINU
 import type { LandingQuestion } from "./landing-faq";
 import { OPENBOT_LINKS } from "./landing-links";
 import type { MobilePlatform } from "./mobile-apps";
+import { referralPageText } from "./referral-page-text";
 import { slot, slotted } from "./text-slots";
 
 export interface HeroProviderPart {
@@ -266,6 +267,10 @@ export function landingPageText(t: AppTranslate) {
       ],
       download: t("sitePage.landing.pricing.download"),
       license: t("sitePage.landing.pricing.license"),
+      eggs: {
+        smallPrint: t("sitePage.landing.pricing.eggs.smallPrint"),
+        forever: t("sitePage.landing.pricing.eggs.forever"),
+      },
     },
     teams: {
       title: t("sitePage.landing.teams.title"),
@@ -292,10 +297,15 @@ export function landingPageText(t: AppTranslate) {
         linux: downloadFor("linux"),
       } satisfies Record<DownloadPlatform, string>,
       phone,
+      chrome: {
+        description: t("sitePage.landing.download.chromeDescription"),
+        action: t("sitePage.landing.download.chromeAction"),
+      },
       pages: t("sitePage.landing.download.pages"),
       apk: t("sitePage.landing.download.apk"),
       intelMac: t("sitePage.marketplace.downloadFor", { platform: "Intel Mac" }),
     },
+    referral: referralPageText(t),
   };
 }
 

@@ -29,6 +29,7 @@ import { type CodeToken, fileCodeLanguage, highlightedCodeLines } from "@openbot
 import { MarkdownFilePreview } from "@openbot/ui/features/conversation/MarkdownFilePreview";
 import type { QuoteShortcutModifier } from "@openbot/ui/features/conversation/SelectionActions";
 import { SpreadsheetFilePreview } from "@openbot/ui/features/conversation/SpreadsheetFilePreview";
+import { WordFilePreview } from "@openbot/ui/features/conversation/WordFilePreview";
 import { useText } from "@openbot/ui/text";
 import { holdFlag } from "@openbot/ui/utils";
 import type { JSX } from "@solidjs/web";
@@ -69,6 +70,7 @@ interface FilePreviewPanelProps {
   isPageAppShortcut?: ((key: ChatVisualKey) => boolean) | undefined;
   quoteShortcut?: QuoteShortcutModifier | undefined;
   macWindowControls?: boolean | undefined;
+  remoteContent?: boolean | undefined;
   onOpenExternally: () => void;
   allowExternalOpen?: boolean;
   onDownload?: () => void;
@@ -123,16 +125,17 @@ export default function FilePreviewPanel(props: FilePreviewPanelProps) {
     setRawSource(false);
   });
   createEffect(
-    () => ({ preview: file(), sourceUrl: props.sourceUrl }),
-    ({ preview, sourceUrl }) => {
+    () => ({ preview: file(), sourceUrl: props.sourceUrl, pageUrl: props.pageUrl }),
+    ({ preview, sourceUrl, pageUrl }) => {
       if (currentPreviewUrl) URL.revokeObjectURL(currentPreviewUrl);
       currentPreviewUrl = null;
       if (!preview) {
         setPreviewUrl(null);
         return;
       }
-      if (sourceUrl && BLOB_PREVIEW_KINDS.has(preview.previewKind)) {
-        setPreviewUrl(sourceUrl);
+      const directUrl = sourceUrl || (preview.previewKind === "pdf" ? pageUrl : null);
+      if (directUrl && BLOB_PREVIEW_KINDS.has(preview.previewKind)) {
+        setPreviewUrl(directUrl);
         return;
       }
       if (!preview.bytes || !BLOB_PREVIEW_KINDS.has(preview.previewKind)) {
@@ -165,7 +168,7 @@ export default function FilePreviewPanel(props: FilePreviewPanelProps) {
 
   let panel!: HTMLElement;
   onSettled(() => {
-    const conversation = panel.closest(".conversation-panel");
+    const conversation = panel.closest("[data-side-split]") ? null : panel.closest(".conversation-panel");
     return conversation ? holdFlag(conversation, "file-preview-panel") : undefined;
   });
 
@@ -344,6 +347,7 @@ export default function FilePreviewPanel(props: FilePreviewPanelProps) {
             onOpenLink={props.onOpenLink}
             onOpenSharedFile={props.onOpenSharedFile}
             onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+            remoteContent={props.remoteContent}
           />
         </Show>
         <Show when={!rawSource() && hasPage()}>
@@ -359,6 +363,7 @@ export default function FilePreviewPanel(props: FilePreviewPanelProps) {
             isAppShortcut={props.isPageAppShortcut}
             quoteShortcut={props.quoteShortcut}
             macWindowControls={props.macWindowControls}
+            remoteContent={props.remoteContent}
           />
         </Show>
         <Show when={showsSourceText()}>
@@ -390,6 +395,9 @@ export default function FilePreviewPanel(props: FilePreviewPanelProps) {
         </Show>
         <Show when={previewKind() === "spreadsheet"}>
           <SpreadsheetFilePreview class="file-preview-spreadsheet" bytes={file()?.bytes ?? null} />
+        </Show>
+        <Show when={previewKind() === "document"}>
+          <WordFilePreview class="file-preview-markdown" bytes={file()?.bytes ?? null} />
         </Show>
         <Show when={previewKind() === "none"}>
           <div class="file-preview-unsupported">

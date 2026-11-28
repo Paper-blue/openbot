@@ -2,9 +2,12 @@ import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  AGENT_INSTRUCTION_FILE_NAMES,
+  type AgentInstructionFileName,
   type AgentSummary,
   agentAutomationAllowed,
   agentComputerUseEnabled,
+  agentMemoryEnabled,
   agentProviderDescriptor,
   agentQuickAcknowledgementEnabled,
   COMPUTER_USE_MCP_SERVER_ID,
@@ -52,6 +55,7 @@ import {
 import { decodeRecordResponse, decodeThreadResponse, getRecord, getString, type ResponseDecoder } from "../protocol";
 import { TimeoutError, withTimeout } from "../with-timeout";
 import type { AgentMemories } from "./agent-memories";
+import { CodexArchiveRetries } from "./codex-archive-retries";
 import { readCodexMcpConfig } from "./codex-mcp-config";
 import { type CodexPromptSettings, codexPromptSettings } from "./codex-prompt-settings";
 import type { ContextCompaction } from "./context-compaction";
@@ -65,6 +69,7 @@ import {
 } from "./developer-instructions";
 import {
   appendRoutineDigest,
+  hasEarlierChat,
   readHandoffHistory,
   renderProviderHandoff,
   renderRoutineHandoff,
@@ -75,14 +80,19 @@ import { mcpFallbackRunsServer } from "./mcp-tools";
 import { isProviderTimeout } from "./provider-status";
 import { sessionSettingsIdentity } from "./session-settings";
 import { isArchivedThreadError, isMissingProviderSessionError, providerLabel } from "./thread-items";
-import { visibleDynamicTools } from "./tool-catalog";
+import { toolCatalogNames, visibleDynamicTools } from "./tool-catalog";
 import {
   AGENT_INSTRUCTIONS_FILE_BYTES,
+  missingInstructionFileNames,
   type PromptInstructionsFile,
   promptInstructionsFile,
 } from "./workspace-instructions";
 import {
+  agentWriteAreas,
+  type CodexApprovalPolicy,
+  type CodexSandboxConfig,
   checkAgentFolders,
+  codexApprovalPolicy,
   codexSandboxConfig,
   codexSandboxMode,
   existingAgentFolders,
@@ -98,6 +108,8 @@ const NO_CODEX_OWN_SERVERS: CodexOwnServers = { disabled: {}, transports: {}, re
 
 const RUNTIME_RELOADED_ON_RESUME: ReadonlySet<AgentProvider> = new Set(["claude"]);
 
+export type RuntimeRefreshTiming = "now" | "after-background-work";
+
 type CodexToolApprovals = Array<[string, DynamicRecord]>;
 const SESSION_NAME_PREFIX = "OpenBot · ";
 
@@ -105,13 +117,41 @@ interface InstructionsFileInPrompt {
   fileName: PromptInstructionsFile["fileName"];
   found: PromptInstructionsFile | null;
   file: PromptInstructionsFile | null;
+  hiddenFromCli: AgentInstructionFileName[];
 }
 
-const CODEX_TOOLS_CONFIG = { update_plan: { enabled: true } } as const;
+const CODEX_TOOLS_CONFIG = {
+  update_plan: { enabled: true },
+  experimental_request_user_input: { enabled: false },
+} as const;
 
-export const CODEX_FEATURES_CONFIG = { "features.goals": false, "features.request_permissions_tool": false } as const;
+export const CODEX_FEATURES_CONFIG = {
+  "features.goals": false,
+  "features.request_permissions_tool": false,
+  "features.multi_agent_v2_dynamic_tools": true,
+} as const;
+
+const CODEX_COMPUTER_USE_PLUGINS_OFF = {
+  "plugins.computer-use@openai-bundled.enabled": false,
+  "plugins.unified-computer-use@openai-bundled.enabled": false,
+} as const;
+
+const CODEX_BROWSER_PLUGINS_OFF = {
+  "plugins.browser@openai-bundled.enabled": false,
+  "plugins.chrome@openai-bundled.enabled": false,
+  "plugins.chrome-dev@openai-bundled.enabled": false,
+  "plugins.chrome-internal@openai-bundled.enabled": false,
+} as const;
 
 const CODEX_MCP_STARTUP_GRACE_MS = 10_000;
+const CODEX_WAIT_FOR_MCP_STARTUP_MS = 0;
+
+function waitingForMcpStartup(params: DynamicRecord): DynamicRecord {
+  const config = params.config;
+  return isDynamicRecord(config)
+    ? { ...params, config: { ...config, mcp_optional_startup_grace_ms: CODEX_WAIT_FOR_MCP_STARTUP_MS } }
+    : params;
+}
 
 const CODEX_DIRECT_ONLY_NAMESPACES = [...visibleDynamicTools("codex").map((namespace) => namespace.name), "image_gen"];
 
@@ -144,6 +184,7 @@ export interface ThreadLifecycleOptions {
   agentCursorDrawn?: boolean;
   computerUseOnWayland?: boolean;
   computerUseInputRefused?: () => boolean;
+  computerUseForegroundInput?: boolean;
   responseStyle?: () => ResponseStyle;
   memoryReview?: () => boolean;
   skillRevision?: () => boolean;
@@ -152,6 +193,7 @@ export interface ThreadLifecycleOptions {
   branchThread?: (threadId: string) => boolean;
   importedHistory?: (threadId: string) => boolean;
   routineThread?: (threadId: string) => boolean;
+  asksFirst?: (agentId: string) => boolean;
 }
 
 export class ThreadLifecycle {
@@ -177,6 +219,7 @@ export class ThreadLifecycle {
   readonly #agentCursorDrawn: boolean;
   readonly #computerUseOnWayland: boolean;
   readonly #computerUseInputRefused: () => boolean;
+  readonly #computerUseForegroundInput: boolean;
   readonly #responseStyle: () => ResponseStyle;
   readonly #memoryReview: () => boolean;
   readonly #skillRevision: () => boolean;
@@ -185,9 +228,11 @@ export class ThreadLifecycle {
   readonly #branchThread: (threadId: string) => boolean;
   readonly #importedHistory: (threadId: string) => boolean;
   readonly #routineThread: (threadId: string) => boolean;
+  readonly #asksFirst: (agentId: string) => boolean;
   readonly #pendingHandoffs = new Map<string, string>();
   readonly #givenTurnContext = new Map<string, string>();
   readonly #handoffWrites = Semaphore.makeUnsafe(1);
+  readonly #archiveRetries: CodexArchiveRetries;
   readonly #pendingRuntimeRefreshes = new Set<string>();
   readonly #mcpRuntimeRefreshes = new Set<string>();
   readonly #pendingStarts = new Map<string, number>();
@@ -201,6 +246,10 @@ export class ThreadLifecycle {
     this.#memories = options.memories;
     this.#compaction = options.compaction;
     this.#hooks = options.hooks;
+    this.#archiveRetries = new CodexArchiveRetries({
+      path: () => join(this.#store.database.userDataPath, "provider-archive-retries.json"),
+      logFailure: (provider, error) => this.#hooks.logReleaseFailure(provider, error),
+    });
     this.#mcpServers = options.mcpServers ?? (() => []);
     this.#mcpToolRuntimes = options.mcpToolRuntimes;
     this.#mcpEndpoint = options.mcpEndpoint;
@@ -214,6 +263,7 @@ export class ThreadLifecycle {
     this.#agentCursorDrawn = options.agentCursorDrawn ?? false;
     this.#computerUseOnWayland = options.computerUseOnWayland ?? false;
     this.#computerUseInputRefused = options.computerUseInputRefused ?? (() => false);
+    this.#computerUseForegroundInput = options.computerUseForegroundInput ?? false;
     this.#responseStyle = options.responseStyle ?? (() => DEFAULT_RESPONSE_STYLE);
     this.#memoryReview = options.memoryReview ?? (() => false);
     this.#skillRevision = options.skillRevision ?? (() => false);
@@ -222,6 +272,11 @@ export class ThreadLifecycle {
     this.#branchThread = options.branchThread ?? (() => false);
     this.#importedHistory = options.importedHistory ?? (() => false);
     this.#routineThread = options.routineThread ?? (() => false);
+    this.#asksFirst = options.asksFirst ?? (() => false);
+  }
+
+  approvalPolicy(agent: Pick<AgentSummary, "id" | "access">): CodexApprovalPolicy {
+    return codexApprovalPolicy(agent, this.#asksFirst(agent.id));
   }
 
   #toolRuntimes(): McpToolRuntimes {
@@ -244,10 +299,11 @@ export class ThreadLifecycle {
 
   readonly refreshAllAgentRuntimes = Effect.fn("ThreadLifecycle.refreshAllAgentRuntimes")(function* (
     this: ThreadLifecycle,
+    timing: RuntimeRefreshTiming,
   ) {
     for (const agent of this.#store.list()) {
       this.#pendingRuntimeRefreshes.add(agent.id);
-      this.#mcpRuntimeRefreshes.add(agent.id);
+      if (timing === "now") this.#mcpRuntimeRefreshes.add(agent.id);
       yield* this.applyPendingRuntimeRefresh(agent);
     }
   }, Effect.uninterruptible).bind(this);
@@ -516,7 +572,11 @@ export class ThreadLifecycle {
     });
     const { params } = yield* this.#startParams(owner, client, publicThreadId);
     const response = yield* client
-      .request("thread/start", { ...params, ephemeral: false, persistSession: false }, decodeThreadResponse)
+      .request(
+        "thread/start",
+        { ...waitingForMcpStartup(params), ephemeral: false, persistSession: false },
+        decodeThreadResponse,
+      )
       .pipe(toThreadOperationFailed);
     const externalThreadId = response.thread.id;
     this.#conversation.bindThread(externalThreadId, owner.id, publicThreadId);
@@ -604,13 +664,14 @@ export class ThreadLifecycle {
       effort: agent.reasoningEffort,
       cwd: agent.workspacePath,
       runtimeWorkspaceRoots: workspaceWritableRoots(agent, this.#store.sharedRoot),
-      approvalPolicy: "on-request",
+      approvalPolicy: this.approvalPolicy(agent),
       approvalsReviewer: "user",
       sandbox: codexSandboxMode(agent),
       ...this.#workspaceOnlyParam(agent, client),
       ...this.#computerUseParam(agent, client),
       ...this.#mcpAgentParam(agent, client),
       ...this.#channelToolsParam(client, publicThreadId),
+      ...this.#excludedInstructionFilesParam(instructionsFile),
       ...this.#instructions(
         agent,
         client,
@@ -710,6 +771,7 @@ export class ThreadLifecycle {
     this.#conversation.markThreadLoaded(externalThreadId, client);
     this.#conversation.ensureSnapshot(agent.id, publicThreadId);
     yield* this.#nameSession(client, externalThreadId, agent, null);
+    yield* this.#archiveRetries.retry(client);
     if (replaced) yield* this.#archiveSession(client, replaced.externalSessionId);
     return externalThreadId;
   });
@@ -719,12 +781,7 @@ export class ThreadLifecycle {
     client: AgentClient,
     externalThreadId: string,
   ) {
-    if (!client.archiveThread) return;
-    yield* client
-      .archiveThread(externalThreadId)
-      .pipe(
-        Effect.catch((failure) => Effect.sync(() => this.#hooks.logReleaseFailure(client.provider, failure.cause))),
-      );
+    yield* this.#archiveRetries.archive(client, externalThreadId);
   }, Effect.uninterruptible);
 
   readonly #nameSession = Effect.fn("ThreadLifecycle.nameSession")(function* (
@@ -794,14 +851,16 @@ export class ThreadLifecycle {
       config?: {
         mcp_servers?: Record<string, CodexMcpServer | CodexDisabledMcpServer>;
         tools: typeof CODEX_TOOLS_CONFIG;
+        model_reasoning_effort: AgentSummary["reasoningEffort"];
         project_doc_max_bytes: number;
         mcp_optional_startup_grace_ms: number;
-        "features.goals": false;
-        "features.request_permissions_tool": false;
         "features.code_mode.direct_only_tool_namespaces": string[];
         [variable: `shell_environment_policy.set.${string}`]: string;
-      } & CodexPromptSettings &
-        ReturnType<typeof codexSandboxConfig>;
+      } & typeof CODEX_FEATURES_CONFIG &
+        CodexPromptSettings &
+        typeof CODEX_BROWSER_PLUGINS_OFF &
+        Partial<typeof CODEX_COMPUTER_USE_PLUGINS_OFF> &
+        CodexSandboxConfig;
     },
     ThreadOperationFailed
   > {
@@ -816,15 +875,18 @@ export class ThreadLifecycle {
       config: {
         ...(Object.keys(mcpServers).length > 0 ? { mcp_servers: mcpServers } : {}),
         tools: CODEX_TOOLS_CONFIG,
+        model_reasoning_effort: agent.reasoningEffort,
         ...CODEX_FEATURES_CONFIG,
         ...codexPromptSettings(own.read),
+        ...CODEX_BROWSER_PLUGINS_OFF,
+        ...(agentComputerUseEnabled(agent) ? {} : CODEX_COMPUTER_USE_PLUGINS_OFF),
         project_doc_max_bytes: AGENT_INSTRUCTIONS_FILE_BYTES,
         mcp_optional_startup_grace_ms: CODEX_MCP_STARTUP_GRACE_MS,
         "features.code_mode.direct_only_tool_namespaces": [
           ...CODEX_DIRECT_ONLY_NAMESPACES,
           ...codexDirectMcpNamespaces(servers),
         ],
-        ...codexSandboxConfig(agent, this.#store.sharedRoot),
+        ...(yield* codexSandboxConfig(agent, this.#store.sharedRoot, this.writeAreas())),
         ...Object.fromEntries(
           Object.entries(environment).map(([name, value]) => [`shell_environment_policy.set.${name}`, value]),
         ),
@@ -915,6 +977,8 @@ export class ThreadLifecycle {
           ...(instructionsFile.fileName === "AGENTS.md" ? [] : [["instructions-file", instructionsFile.fileName]]),
           ...(instructionsFile.found?.text ? [["instructions", instructionsFile.found.text]] : []),
           ...(catalogCommands.length > 0 ? [["catalog-commands", ...catalogCommands]] : []),
+          ...(agentComputerUseEnabled(agent) ? [] : ["codex-computer-use-off"]),
+          ...(agentMemoryEnabled(agent) ? [] : ["memory-off"]),
         ]),
       )
       .digest("hex");
@@ -975,7 +1039,7 @@ export class ThreadLifecycle {
 
   #computerUseInOwnChat(agent: AgentSummary, publicThreadId: string): boolean {
     return (
-      this.#runsBesideOwnChat(agent, publicThreadId) &&
+      this.#conversation.isTaskThread(publicThreadId) &&
       !this.#routineThread(publicThreadId) &&
       agentComputerUseEnabled(agent)
     );
@@ -993,14 +1057,30 @@ export class ThreadLifecycle {
     return agentMcpServers(this.#mcpServers(agent.id), agentComputerUseEnabled(agent));
   }
 
-  #workspaceOnlyParam(agent: AgentSummary, client: AgentClient): { workspaceOnly?: true; excludedFolders?: string[] } {
+  #workspaceOnlyParam(
+    agent: AgentSummary,
+    client: AgentClient,
+  ): { workspaceOnly?: true; excludedFolders?: string[]; writeAreas?: string[] } {
     if (
       agentProviderDescriptor(client.provider).workspaceEnforcement !== "tool-sandbox" ||
       !workspaceAccessEnforced(agent)
     )
       return {};
     const excluded = workspaceExcludedFolders(agent);
-    return { workspaceOnly: true, ...(excluded.length ? { excludedFolders: excluded } : {}) };
+    return {
+      workspaceOnly: true,
+      ...(excluded.length ? { excludedFolders: excluded } : {}),
+      writeAreas: this.writeAreas(),
+    };
+  }
+
+  writeAreasParam(agent: AgentSummary, client: AgentClient): { writeAreas?: string[] } {
+    const { writeAreas } = this.#workspaceOnlyParam(agent, client);
+    return writeAreas ? { writeAreas } : {};
+  }
+
+  writeAreas(): string[] {
+    return agentWriteAreas(this.#store.list(), this.#store.sharedRoot);
   }
 
   #computerUseParam(agent: AgentSummary, client: AgentClient): { computerUse?: false } {
@@ -1012,7 +1092,8 @@ export class ThreadLifecycle {
   }
 
   #channelToolsParam(client: AgentClient, publicThreadId: string): { channelTools?: true } {
-    return client.provider === "claude" && this.#conversation.channelForThread(publicThreadId) !== null
+    return (client.provider === "claude" || client.provider === "grok") &&
+      this.#conversation.channelForThread(publicThreadId) !== null
       ? { channelTools: true }
       : {};
   }
@@ -1117,7 +1198,8 @@ export class ThreadLifecycle {
     instructionsFile: InstructionsFileInPrompt,
     workspaceSkills: readonly string[] = [],
   ): DynamicRecord {
-    const memories = this.#memories.essentialFor(agent.id);
+    const memoryEnabled = agentMemoryEnabled(agent);
+    const memories = memoryEnabled ? this.#memories.essentialFor(agent.id) : [];
     const options = {
       computerUseInOwnChat,
       computerUseNotReady:
@@ -1130,12 +1212,13 @@ export class ThreadLifecycle {
       agentCursorDrawn: this.#agentCursorDrawn,
       computerUseOnWayland: this.#computerUseOnWayland,
       computerUseInputRefused: this.#computerUseInputRefused(),
+      computerUseForegroundInput: this.#computerUseForegroundInput,
       responseStyle: this.#responseStyle(),
       memoryReview: this.#memoryReview(),
       skillRevision: this.#skillRevision(),
       memoryLimit: this.#memories.limit(),
       storedMemoryCount: this.#memories.listFor(agent.id).length,
-      memoriesInTurns: client.turnContext === true,
+      memoriesInTurns: memoryEnabled && client.turnContext === true,
       teammatesInTurns: client.turnContext === true,
       savedLoginsInTurns: client.turnContext === true,
       instructionsFileInTurns: this.#instructionsFileInTurns(client),
@@ -1152,10 +1235,14 @@ export class ThreadLifecycle {
             : // Antigravity 1.5 leaves the tools over its schema budget out (#7427). OpenBot runs the
               client.provider === "antigravity"
               ? mcpServers
-                  .filter((config) => mcpFallbackRunsServer(config, agent) && config.id !== COMPUTER_USE_MCP_SERVER_ID)
-                  .map((config) => providerMcpServerName(config.name))
+                  .filter((config) => mcpFallbackRunsServer(config, agent))
+                  .map(
+                    (config) =>
+                      client.sessionMcpServerName?.(config, agent.workspacePath) ?? providerMcpServerName(config.name),
+                  )
               : [],
       catalogAsMcpTools: client.catalogAsMcpTools?.(agent.model) === true,
+      ...(client.provider === "antigravity" ? { toolCatalog: toolCatalogNames(client.provider) } : {}),
       instructionsFileName: instructionsFile.fileName,
       instructionsFile: instructionsFile.file,
     };
@@ -1167,10 +1254,10 @@ export class ThreadLifecycle {
       this.#store.agentDefaults(),
       options,
     );
-    return options.memoriesInTurns
+    return client.turnContext === true
       ? {
           developerInstructions: instructions,
-          memoryContext: memoryContext(memories, options),
+          ...(options.memoriesInTurns ? { memoryContext: memoryContext(memories, options) } : {}),
           sectionTeammates: section,
           savedLogins: options.passwordVault,
           ...(options.instructionsFileInTurns ? { instructionsFile: options.instructionsFile } : {}),
@@ -1200,17 +1287,34 @@ export class ThreadLifecycle {
     agent: AgentSummary,
     client: AgentClient,
   ) {
+    const enforced = workspaceAccessEnforced(agent);
     const read =
-      client.provider === "claude" && workspaceAccessEnforced(agent)
+      client.provider === "claude" && enforced
         ? []
         : agentProviderDescriptor(client.provider).workspaceInstructionFiles;
     const file = yield* promptInstructionsFile(agent.workspacePath, read);
+    const sent = file && !file.readByCli ? file : null;
+    const cliReadsProjectFiles = client.provider === "claude" && !enforced;
+    const missing = cliReadsProjectFiles ? yield* missingInstructionFileNames(agent.workspacePath) : [];
     return {
       fileName: file?.fileName ?? "AGENTS.md",
       found: file,
-      file: file && !file.readByCli ? file : null,
+      file: sent,
+      hiddenFromCli: cliReadsProjectFiles
+        ? AGENT_INSTRUCTION_FILE_NAMES.filter(
+            (fileName) => !read.includes(fileName) && (sent?.fileName === fileName || missing.includes(fileName)),
+          )
+        : [],
     } satisfies InstructionsFileInPrompt;
   });
+
+  #excludedInstructionFilesParam(instructionsFile: InstructionsFileInPrompt): {
+    excludedInstructionFiles?: AgentInstructionFileName[];
+  } {
+    return instructionsFile.hiddenFromCli.length > 0
+      ? { excludedInstructionFiles: instructionsFile.hiddenFromCli }
+      : {};
+  }
 
   readonly threadParams = Effect.fn("ThreadLifecycle.threadParams")(function* (
     this: ThreadLifecycle,
@@ -1224,19 +1328,21 @@ export class ThreadLifecycle {
     yield* checkAgentFolders(agent);
     const configs = this.#agentMcpServers(agent);
     const toolRuntimes = this.#toolRuntimes();
+    const instructionsFile = yield* this.#instructionsFile(agent, client);
     return {
       threadId: externalThreadId,
       model: agent.model,
       effort: agent.reasoningEffort,
       cwd: agent.workspacePath,
       runtimeWorkspaceRoots: workspaceWritableRoots(agent, this.#store.sharedRoot),
-      approvalPolicy: "on-request",
+      approvalPolicy: this.approvalPolicy(agent),
       approvalsReviewer: "user",
       sandbox: codexSandboxMode(agent),
       ...this.#workspaceOnlyParam(agent, client),
       ...this.#computerUseParam(agent, client),
       ...this.#mcpAgentParam(agent, client),
       ...this.#channelToolsParam(client, publicThreadId),
+      ...this.#excludedInstructionFilesParam(instructionsFile),
       ...this.#instructions(
         agent,
         client,
@@ -1245,7 +1351,7 @@ export class ThreadLifecycle {
         yield* this.#homeSkills(agent, client),
         this.#runsBesideOwnChat(agent, publicThreadId),
         configs,
-        yield* this.#instructionsFile(agent, client),
+        instructionsFile,
         yield* this.#workspaceSkills(agent, client),
       ),
       ...(client.provider === "codex" ? {} : { dynamicTools: visibleDynamicTools(client.provider) }),
@@ -1285,6 +1391,7 @@ export class ThreadLifecycle {
     this.#rememberTurnContext(client, externalThreadId, givenContext);
     this.#conversation.markThreadLoaded(externalThreadId, client);
     yield* this.#nameSession(client, externalThreadId, agent, getString(getRecord(response, "thread"), "name"));
+    yield* this.#archiveRetries.retry(client);
   }).bind(this);
 
   readonly dropRefusedProviderSession = Effect.fn("ThreadLifecycle.dropRefusedProviderSession")(function* (
@@ -1591,7 +1698,10 @@ export class ThreadLifecycle {
       const text = captures.get(session.id)?.get(row.message.turnId);
       if (text) steps.set(row.message.id, text);
     }
-    return renderProviderHandoff(history, agentNames, steps, { branch });
+    return renderProviderHandoff(history, agentNames, steps, {
+      branch,
+      earlierChat: hasEarlierChat(this.#store.database, agentId, threadId, history.resetMessageId),
+    });
   }).bind(this);
 }
 

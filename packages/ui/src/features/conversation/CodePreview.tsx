@@ -1,8 +1,13 @@
-import { type ChatPreviewKind, chatHtmlPreviewDocument } from "@openbot/contracts/chat-preview";
+import {
+  type ChatPreviewKind,
+  chatHtmlPreviewDocument,
+  mermaidMayLoadRemoteContent,
+} from "@openbot/contracts/chat-preview";
 import { Button, Dialog, Maximize2, SlidingTabs } from "@openbot/ui";
 import { prefersReducedMotion } from "@openbot/ui/utils";
 import type { JSX } from "@solidjs/web";
 import { createEffect, createSignal, Match, onSettled, Show, Switch } from "solid-js";
+import { ScrollEdges } from "../../components/ScrollEdges";
 import { documentColorScheme } from "../../document-color-scheme";
 import { useText } from "../../text";
 import { CodeBlock } from "./CodeBlock";
@@ -22,8 +27,15 @@ export function CodePreview(props: {
   kind: ChatPreviewKind;
   streaming?: boolean;
   onOpenLink: (url: string) => void;
+  remoteContent?: boolean | undefined;
 }) {
   const { t } = useText();
+  const [remoteAllowed, setRemoteAllowed] = createSignal(false);
+  const remoteBlocked = () =>
+    props.kind === "mermaid" &&
+    props.remoteContent !== true &&
+    !remoteAllowed() &&
+    mermaidMayLoadRemoteContent(props.block.code);
   const [view, setView] = createSignal<PreviewView>("preview");
   const [expanded, setExpanded] = createSignal(false);
   const [diagram, setDiagram] = createSignal<DiagramState>({ status: "drawing" });
@@ -37,7 +49,7 @@ export function CodePreview(props: {
   createEffect(
     () => {
       diagramAttempt();
-      return props.kind === "mermaid" && !props.streaming
+      return props.kind === "mermaid" && !props.streaming && !remoteBlocked()
         ? { source: props.block.code, scheme: documentColorScheme() }
         : null;
     },
@@ -74,6 +86,14 @@ export function CodePreview(props: {
       <Match when={props.kind === "html"}>
         <HtmlPreviewFrame html={props.block.code} title={title()} fill={fill} onOpenLink={props.onOpenLink} />
       </Match>
+      <Match when={remoteBlocked()}>
+        <div class="message-preview-remote">
+          <p class="message-preview-status">{t("chat.remoteContent.diagramNotDrawn")}</p>
+          <Button variant="outline" size="sm" type="button" onClick={() => setRemoteAllowed(true)}>
+            {t("chat.remoteContent.loadDiagram")}
+          </Button>
+        </div>
+      </Match>
       <Match when={diagram().status === "drawing"}>
         <p class="message-preview-status" role="status">
           {t("chat.preview.drawing")}
@@ -94,9 +114,23 @@ export function CodePreview(props: {
     <div class="message-preview-resize" ref={(element) => (resize = element)}>
       <SlidingTabs.ContentSlot class="message-preview-views" ref={(element) => (views = element)}>
         <SlidingTabs.Content value="preview" class="message-preview-view">
-          <div class="message-preview-body" data-preview-kind={props.kind}>
-            {content(false)}
-          </div>
+          <Show
+            when={props.kind === "mermaid"}
+            fallback={
+              <div class="message-preview-body" data-preview-kind={props.kind}>
+                {content(false)}
+              </div>
+            }
+          >
+            <ScrollEdges
+              axis="y"
+              label={title()}
+              class="message-preview-diagram-scroll"
+              viewClass="message-preview-body message-preview-diagram-view"
+            >
+              {content(false)}
+            </ScrollEdges>
+          </Show>
         </SlidingTabs.Content>
         <SlidingTabs.Content value="code" class="message-preview-view">
           {code}

@@ -1,11 +1,11 @@
-import { canPreviewAttachment } from "@openbot/contracts/ipc";
+import { canPreviewAttachment, LOCAL_SERVER_ID } from "@openbot/contracts/ipc";
 import type { AppTextKey } from "@openbot/i18n";
 import { classifyFailure } from "@openbot/telemetry";
 import { Input } from "@openbot/ui";
 import type { AgentMessage } from "@openbot/ui/data";
 import { ChatSearch } from "@openbot/ui/features/conversation/ChatSearch";
 import { contextUsageView } from "@openbot/ui/features/conversation/ContextUsage";
-import { AgentThreadView, type AgentThreadVoice } from "@openbot/ui/features/conversation/threads/AgentThreadView";
+import { AgentThreadView } from "@openbot/ui/features/conversation/threads/AgentThreadView";
 import type { AgentThreadBranchSource } from "@openbot/ui/features/conversation/threads/BranchDivider";
 import { useText } from "@openbot/ui/text";
 import { createEffect, createMemo, createProjection, createSignal, Show, untrack } from "solid-js";
@@ -17,7 +17,10 @@ import { useChatBubbleStyle } from "../../chat-bubble-style-preference";
 import { useCompactMessageActions } from "../../compact-message-actions-preference";
 import { usePlatform } from "../../platform";
 import { deviceQuoteShortcut, deviceSendShortcut } from "../../send-shortcut-preference";
+import { remoteAgentError } from "../agents/agent-error-text";
+import { useRemoteChatContent } from "../servers/remote-chat-content";
 import { useThreadVisualReplyCard } from "./ChatVisualReply";
+import { ConversationBrowserLocation } from "./ConversationBrowserLocation";
 import { ConversationBrowserTakeover } from "./ConversationBrowserTakeover";
 import { ConversationQuestionPrompt } from "./ConversationQuestionPrompt";
 import { chatSearchOpensMessage } from "./chat-search";
@@ -28,9 +31,13 @@ import type { ConversationThreads } from "./conversation-types";
 import { useThreadMarketplaceSuggestionCard } from "./MarketplaceSuggestionChatCard";
 import { useThreadMcpSignInCard } from "./McpSignInChatCard";
 import { useMessageBackdropAction } from "./message-backdrop";
+import { useThreadNearPaymentCard } from "./NearPaymentThreadCard";
+import { narrationRows, naturalThreadRows } from "./narration-rows";
+import { useNearPaymentApproval } from "./near-payment-approval";
 import { useThreadSettingLinkCard } from "./SettingLinkChatCard";
 import { withQuestionContext } from "./stores/scroll-store";
 import { createTurnSteps } from "./turn-steps";
+import { createTurnStreamHold } from "./turn-stream-hold";
 import { useTurnTrace } from "./turn-trace";
 
 export function ConversationThread() {
@@ -40,6 +47,7 @@ export function ConversationThread() {
     previewAttachment,
     attachmentAction,
     attachmentDownloads,
+    imageCopies,
     openThreadFile,
     browserTakeoverResolution,
     installedSkills,
@@ -53,16 +61,7 @@ export function ConversationThread() {
     threadFocusRequest,
     requestThreadFocus,
     messagePins,
-    threadVoiceLiveText,
-    threadVoiceOwned,
-    startThreadVoiceRecording,
-    stopVoiceRecording,
-    stopVoiceRecordingAndSend,
-    cancelVoiceRecording,
-    voicePhase,
-    voiceLevels,
-    voiceElapsedSeconds,
-    voiceModelProgress,
+    threadVoice,
     sideQuestionAvailable,
     openSideQuestion,
     threadSearch,
@@ -76,11 +75,16 @@ export function ConversationThread() {
     copiedMessageId,
     branchThread,
     changeMarkerActions,
+    shownSubagentId,
+    toggleSubagentPanel,
+    browserTabs,
   } = useConversationViewScope();
+  const remoteChatContent = useRemoteChatContent();
   const backdropAction = useMessageBackdropAction(conversationRuntime(props));
   const threadBackgroundWorkSince = (taskId: string | undefined) =>
     taskId === undefined ? undefined : props.backgroundWorkSince?.(taskId);
   const { t, errorMessage } = useText();
+  const { card: nearPaymentCard } = useNearPaymentApproval(() => props.server?.kind === "local" && !props.runtime);
   const [picker, setPicker] = createSignal<HTMLInputElement>();
   const failureToast = (fallback: AppTextKey) => ({
     onError: (error: unknown) => {
@@ -90,7 +94,8 @@ export function ConversationThread() {
     },
   });
   const takeoverShown = () => props.browserTakeover !== undefined || browserTakeoverResolution() !== null;
-  const hasAttention = createMemo(() => takeoverShown() || props.prompt !== undefined);
+  const locationAsked = () => browserTabs().some((tab) => tab.permissionRequest !== undefined);
+  const hasAttention = createMemo(() => takeoverShown() || locationAsked() || props.prompt !== undefined);
   const messages = createProjection<AgentMessage[]>(
     () => {
       const conversation = props.threads?.conversation;
@@ -100,7 +105,15 @@ export function ConversationThread() {
     [],
     { key: "id" },
   );
-  const shownMessages = createMemo(() => withQuestionContext(messages, messages, props.prompt?.turnId));
+  const streamHeld = createTurnStreamHold(() => props.threads?.open?.activeTurnId);
+  const shownMessages = createMemo(() =>
+    withQuestionContext(
+      props.responseStyle === "natural" ? naturalThreadRows(messages, props.agent?.provider, streamHeld) : messages,
+      messages,
+      props.prompt?.turnId,
+      (thinking) => narrationRows(thinking, props.agent?.provider),
+    ),
+  );
   const turnSteps = createTurnSteps({
     messages: () => messages,
     lines: () => undefined,
@@ -159,22 +172,6 @@ export function ConversationThread() {
     const request = threadFocusRequest();
     return request > shownAt ? request : undefined;
   };
-  const voice = (): AgentThreadVoice | undefined => {
-    if (props.runtime) return undefined;
-    const owned = threadVoiceOwned();
-    return {
-      phase: owned ? voicePhase() : "idle",
-      blocked: !owned && voicePhase() !== "idle",
-      liveText: threadVoiceLiveText(),
-      levels: voiceLevels(),
-      elapsedSeconds: voiceElapsedSeconds(),
-      modelProgress: voiceModelProgress(),
-      onStart: startThreadVoiceRecording,
-      onCancel: cancelVoiceRecording,
-      onFinish: stopVoiceRecording,
-      onSend: stopVoiceRecordingAndSend,
-    };
-  };
   const branch = (threads: ConversationThreads) => {
     const taskId = threads.open?.id;
     if (!threads.onBranch || !taskId) return undefined;
@@ -223,6 +220,7 @@ export function ConversationThread() {
   );
   const marketplaceCard = useThreadMarketplaceSuggestionCard();
   const settingLinkCard = useThreadSettingLinkCard();
+  const paymentRecordCard = useThreadNearPaymentCard();
   const visualReplyCard = useThreadVisualReplyCard(threadComposer.openDraftKey, requestThreadFocus);
   const attention = () => {
     if (!hasAttention()) return undefined;
@@ -234,6 +232,7 @@ export function ConversationThread() {
           }
         />
         <ConversationBrowserTakeover />
+        <ConversationBrowserLocation />
       </>
     );
   };
@@ -258,6 +257,7 @@ export function ConversationThread() {
           </Show>
           <AgentThreadView
             scrollRef={setThreadScrollElement}
+            failureText={props.server && props.server.kind !== "local" ? remoteAgentError : undefined}
             showFullMessage={(message) =>
               threadSearchOpen() && chatSearchOpensMessage(message.body, threadSearchQuery())
             }
@@ -288,7 +288,7 @@ export function ConversationThread() {
             }
             onAttachFiles={current().threads.acceptsFiles ? openPicker : undefined}
             onSideQuestion={askSideQuestion()}
-            voice={voice()}
+            voice={threadVoice(threadComposer.openDraftKey())}
             focusRequest={focusRequest()}
             onSend={(text) => {
               const key = threadComposer.openDraftKey();
@@ -304,11 +304,21 @@ export function ConversationThread() {
             onPreview={(attachment) => void previewAttachment(attachment)}
             onAttachmentAction={attachmentAction}
             mediaSource={props.runtime?.attachmentMedia}
+            imageCopies={imageCopies()}
             downloads={attachmentDownloads}
             macWindowControls={props.platform === "darwin"}
+            remoteContent={remoteChatContent.enabled(props.server?.id ?? LOCAL_SERVER_ID)}
             approval={current().threads.approval}
+            media={props.mediaApproval}
             onRespondApproval={(decision) =>
               current().threads.onRespondApproval(decision, failureToast("prompt.approval.answerFailed"))
+            }
+            approvalCard={(approval) =>
+              nearPaymentCard(
+                approval,
+                () => current().threads.onRespondApproval("accept", failureToast("prompt.approval.answerFailed")),
+                () => current().threads.onRespondApproval("decline", failureToast("prompt.approval.answerFailed")),
+              )
             }
             context={contextUsageView(current().threads.contextState)}
             onCompactContext={current().threads.onCompactContext}
@@ -318,7 +328,8 @@ export function ConversationThread() {
               visualReplyCard(message, quote) ??
               mcpSignInCard(message) ??
               marketplaceCard(message) ??
-              settingLinkCard(message)
+              settingLinkCard(message) ??
+              paymentRecordCard(message)
             }
             olderMessages={current().threads.olderMessages}
             newerMessages={current().threads.newerMessages}
@@ -333,6 +344,7 @@ export function ConversationThread() {
             copiedMessageId={copiedMessageId()}
             compactMessageActions={compactMessageActions()}
             bubbleStyle={bubbleStyle()}
+            responseStyle={props.responseStyle}
             onBranch={branch(current().threads)}
             onDeleteMessage={deleteMessage(current().threads)}
             messagePins={threadPins(current().threads.open?.id)}
@@ -346,6 +358,7 @@ export function ConversationThread() {
             queue={threadQueue.view(current().threads.open, threadComposer.openDraftKey())}
             awaiting={awaiting()}
             selectionActions={selectionActions(current().threads)}
+            subagents={{ selectedId: shownSubagentId(), onOpen: toggleSubagentPanel }}
           />
         </>
       )}

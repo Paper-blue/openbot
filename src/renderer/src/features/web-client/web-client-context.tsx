@@ -24,7 +24,10 @@ import type {
   MemberChatColorEntry,
   ProviderModelSourceEntry,
   QueueSnapshot,
+  ReadMediaApprovalInput,
   RespondToApprovalInput,
+  RespondToCreditsHoldInput,
+  RespondToMediaApprovalInput,
   RespondToPromptInput,
   SidebarLayoutAction,
   SidebarLayoutSnapshot,
@@ -44,6 +47,7 @@ import {
 } from "@openbot/contracts/team-protocol/current";
 import { FOCUS_USE_CAPABILITY } from "@openbot/contracts/team-protocol/focus-use-v1";
 import { HOST_APPEARANCE_CAPABILITY, type ServerAppearance } from "@openbot/contracts/team-protocol/host-appearance-v1";
+import { HOST_RESTART_CAPABILITY } from "@openbot/contracts/team-protocol/host-restart-v1";
 import { MESSAGE_DELETE_CAPABILITY } from "@openbot/contracts/team-protocol/message-delete-v1";
 import { SIDEBAR_PINS_CAPABILITY } from "@openbot/contracts/team-protocol/sidebar-pins-v1";
 import { cleanAgentMessageText } from "@openbot/team-client/agent-message-text";
@@ -67,6 +71,13 @@ import { currentText } from "@openbot/ui/text";
 import { errorReference, type UserErrorDetails } from "@openbot/user-errors";
 import { createEffect, createMemo, createSignal, createStore, onSettled } from "solid-js";
 import { toAgentProfile } from "../../app-message-projection";
+import {
+  cancelQueueEdit,
+  patchQueueDeliveries,
+  type QueueEdit,
+  reorderQueueEdit,
+  steerQueueEdit,
+} from "../../queue-optimistic";
 import { backgroundWorkKey } from "../conversation/background-work-key";
 import { messagePromptRequestKey, promptRequestKey } from "../conversation/conversation-keys";
 import {
@@ -74,7 +85,14 @@ import {
   missingReplyOriginals,
   windowedSnapshotMessages,
 } from "../conversation/conversation-merge";
-import { latestIncomingConversationMessage } from "../conversation/conversation-read-state";
+import {
+  heldUnreadState,
+  isIncomingConversationMessage,
+  latestIncomingConversationMessage,
+  markedReadState,
+  markedUnreadState,
+  sameReadState,
+} from "../conversation/conversation-read-state";
 import type { PromptAnswerOptions } from "../conversation/conversation-types";
 import { appendTurnStepLine, type TurnStepLines } from "../conversation/turn-step-lines";
 import {
@@ -97,6 +115,7 @@ import {
   readSavedAgentPicture,
   saveAgentPicture,
 } from "./web-agent-pictures";
+import { readCachedWebHosts, writeCachedWebHosts } from "./web-host-cache";
 import type { WebHostNotice } from "./web-host-connections";
 import { createWebHostLifecycle } from "./web-host-lifecycle";
 import { WebHostOtherTabError, type WebHostState } from "./web-host-lock";
@@ -124,6 +143,7 @@ interface WebConversation {
 
 const LATEST_PAGE_SIZE = 50;
 const PRELOADED_AGENTS = 3;
+const PRELOAD_CONCURRENCY = 2;
 const EVENT_READS_INTERVAL_MS = 1_000;
 
 function trimToLatestPage(conversation: WebConversation): void {
@@ -163,6 +183,7 @@ interface WebWorkspaceState {
   threadContextStates: Record<string, AgentContextState>;
   backgroundWork: Record<string, number>;
   browserTabs: BrowserTab[];
+  noticedBrowserTabIds: string[] | null;
   activeBrowserTabId: string | null;
   browserControlState: BrowserControlState;
   presence: TeamPresenceSnapshot | null;
@@ -182,6 +203,7 @@ interface WebWorkspaceState {
   agentStatus: AgentStatus | null;
   models: ClientAgentModelOption[];
   hostRestart: { state: "waiting" | "restarting"; version: string | null } | null;
+  restartReady: boolean;
   hostStates: Record<string, WebHostState>;
   incompatibility: {
     hostId: string;
@@ -227,8 +249,9 @@ export function createWebWorkspace(
     onStatus?: (status: AgentStatus) => void;
   } = {},
 ) {
+  const cachedHosts = readCachedWebHosts(props.accountId);
   const [state, setState] = createStore<WebWorkspaceState>({
-    hosts: [],
+    hosts: cachedHosts,
     host: null,
     agents: [],
     agentsLoaded: false,
@@ -245,6 +268,7 @@ export function createWebWorkspace(
     threadContextStates: {},
     backgroundWork: {},
     browserTabs: [],
+    noticedBrowserTabIds: null,
     activeBrowserTabId: null,
     browserControlState: { sessions: [] },
     presence: null,
@@ -264,9 +288,10 @@ export function createWebWorkspace(
     agentStatus: null,
     models: [],
     hostRestart: null,
+    restartReady: false,
     hostStates: {},
     incompatibility: null,
-    hostsLoaded: false,
+    hostsLoaded: cachedHosts.length > 0,
     hostsLoading: false,
     hostsError: null,
     revocationRevision: 0,
@@ -284,6 +309,7 @@ export function createWebWorkspace(
   });
   const [stepLines, setStepLines] = createSignal<TurnStepLines>({});
   let generation = 0;
+  let restartCapable = false;
   let selectedId: string | null = null;
   let hostId: string | null = null;
   let disposed = false;
@@ -374,6 +400,52 @@ export function createWebWorkspace(
   });
   const hostNoticeListeners = new Set<(hostId: string, event: WebHostNotice, agents: ClientAgentSummary[]) => void>();
   const wholeApprovalReads = new Set<string>();
+  let promptListRead: "idle" | "reading" | "again" = "idle";
+  const resolvedDuringPromptListRead = new Set<string>();
+  let listedPrompts: { generation: number; prompts: Array<Extract<AgentEvent, { type: "prompt" }>> } = {
+    generation,
+    prompts: [],
+  };
+  function withListedPrompts(prompts: Array<Extract<AgentEvent, { type: "prompt" }>>) {
+    if (listedPrompts.generation !== generation) return prompts;
+    const known = new Set(prompts.map((item) => String(item.requestId)));
+    const missing = listedPrompts.prompts.filter((prompt) => !known.has(String(prompt.requestId)));
+    return missing.length > 0 ? [...prompts, ...missing] : prompts;
+  }
+  function forgetListedPrompt(requestId: string | number): void {
+    if (promptListRead !== "idle") resolvedDuringPromptListRead.add(String(requestId));
+    listedPrompts.prompts = listedPrompts.prompts.filter((prompt) => String(prompt.requestId) !== String(requestId));
+  }
+  function readListedPrompts(): void {
+    const list = runtime.listPendingPrompts;
+    if (!list) return;
+    if (promptListRead !== "idle") {
+      promptListRead = "again";
+      return;
+    }
+    promptListRead = "reading";
+    resolvedDuringPromptListRead.clear();
+    const current = generation;
+    void list()
+      .then((prompts) => {
+        if (disposed || current !== generation) return;
+        listedPrompts = {
+          generation: current,
+          prompts: prompts
+            .filter((prompt) => !resolvedDuringPromptListRead.has(String(prompt.requestId)))
+            .map((prompt) => ({ ...prompt, type: "prompt" as const })),
+        };
+        setState((draft) => {
+          draft.prompts = withListedPrompts(draft.prompts);
+        });
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        const again = promptListRead === "again";
+        promptListRead = "idle";
+        if (again && !disposed) readListedPrompts();
+      });
+  }
   function readWholeApprovals(): void {
     const read = runtime.readPendingApproval;
     if (!read) return;
@@ -421,6 +493,7 @@ export function createWebWorkspace(
     props.accountId,
     {
       accountChanged: props.onSessionCheck,
+      serversChanged: retryHosts,
       accessDenied(id, error) {
         if (!disposed && id === hostId) blockAccess(error);
       },
@@ -438,12 +511,14 @@ export function createWebWorkspace(
       hostTaken(id) {
         if (disposed || id !== hostId) return;
         generation += 1;
+        restartCapable = false;
         hostLifecycle.endSleep();
         recoveryBlocked = true;
         recovery.suspend();
         setState((draft) => {
           draft.otherTab = true;
           draft.status = "offline";
+          draft.restartReady = false;
           draft.connectionError = null;
         });
       },
@@ -454,6 +529,7 @@ export function createWebWorkspace(
           (update.state === "offline" || update.hostOffline === true) && !update.code && !state.hostRestart;
         setState((draft) => {
           if (update.state !== "online") draft.status = update.state;
+          draft.restartReady = update.state === "online" && restartCapable;
           if (update.state !== "online") syncedAt = 0;
           if (update.hostOffline) draft.hostOffline = true;
           else if (update.state !== "connecting") draft.hostOffline = false;
@@ -550,6 +626,8 @@ export function createWebWorkspace(
               event.snapshot.pendingPrompts.map((prompt) => ({ ...prompt, type: "prompt" as const })),
               attentionComplete,
             );
+            if (attentionComplete) listedPrompts = { generation, prompts: [] };
+            else draft.prompts = withListedPrompts(draft.prompts);
             draft.takeovers = reconcilePendingRequests(
               draft.takeovers,
               event.snapshot.pendingBrowserTakeovers,
@@ -569,6 +647,7 @@ export function createWebWorkspace(
             );
           });
           readWholeApprovals();
+          if (!attentionComplete) readListedPrompts();
         } else if (event.type === "prompt") {
           setState((draft) => {
             draft.prompts = [...draft.prompts.filter((item) => item.requestId !== event.requestId), event];
@@ -581,6 +660,7 @@ export function createWebWorkspace(
             ];
           });
         } else if (event.type === "agent-input-resolved") {
+          forgetListedPrompt(event.requestId);
           setState((draft) => {
             draft.approvals = draft.approvals.filter((item) => String(item.requestId) !== String(event.requestId));
             draft.prompts = draft.prompts.filter((item) => String(item.requestId) !== String(event.requestId));
@@ -633,6 +713,7 @@ export function createWebWorkspace(
                 ...(kept?.userControl ? { userControl: true as const } : {}),
                 ...(kept?.canGoBack === undefined ? {} : { canGoBack: kept.canGoBack }),
                 ...(kept?.canGoForward === undefined ? {} : { canGoForward: kept.canGoForward }),
+                ...(kept?.httpSignIn === undefined ? {} : { httpSignIn: kept.httpSignIn }),
               };
             });
             draft.activeBrowserTabId = event.activeTabId;
@@ -644,6 +725,19 @@ export function createWebWorkspace(
               ...tab,
               ...states.get(tab.id),
             }));
+          });
+        if (event.type === "browser-http-sign-in-changed")
+          setState((draft) => {
+            const prompts = new Map(event.tabs.map((prompt) => [prompt.tabId, prompt]));
+            draft.browserTabs = draft.browserTabs.map(({ httpSignIn: _signIn, ...tab }) => {
+              const prompt = prompts.get(tab.id);
+              return prompt
+                ? {
+                    ...tab,
+                    httpSignIn: { origin: prompt.origin, ...(prompt.refused ? { refused: true as const } : {}) },
+                  }
+                : tab;
+            });
           });
         if (event.type === "browser-user-control-changed")
           setState((draft) => {
@@ -753,6 +847,15 @@ export function createWebWorkspace(
         : null,
     (id) => focusUse.setTarget(id),
   );
+  createEffect(
+    () => state.selectedId ?? null,
+    (agentId) => {
+      runtime.focusSync?.(agentId);
+    },
+  );
+  runtime.onConversationReadsChanged?.(() => {
+    if (!disposed) loadReads();
+  });
   const [serverOrder, setServerOrder] = createSignal(readWebServerOrder(props.accountId));
   const orderedHosts = createMemo(() => orderWebHosts(state.hosts, serverOrder()));
   const [avatars, setAvatars] = createSignal<ReadonlyMap<string, { source: string; url: string }>>(new Map());
@@ -956,8 +1059,6 @@ export function createWebWorkspace(
   }
   function refreshHosts(): Promise<void> {
     if (hostsRefreshPromise) return hostsRefreshPromise;
-    const refreshGeneration = generation;
-    const refreshHostId = hostId;
     const promise = (async () => {
       if (disposed) return;
       setState((draft) => {
@@ -966,9 +1067,21 @@ export function createWebWorkspace(
       });
       try {
         markRemoteSync("hosts-start");
-        const hosts = await runtime.listHosts();
+        const cachedHostId = readWebServerSelection(props.accountId);
+        const cachedHost =
+          hostId === null
+            ? (state.hosts.find((host) => host.hostId === cachedHostId) ??
+              orderWebHosts(state.hosts, serverOrder())[0] ??
+              null)
+            : null;
+        const listedHosts = runtime.listHosts();
+        if (cachedHost) void connect(cachedHost);
+        const refreshGeneration = generation;
+        const refreshHostId = hostId;
+        const hosts = await listedHosts;
         markRemoteSync("hosts");
         if (disposed) return;
+        writeCachedWebHosts(props.accountId, hosts);
         deleteRemoteWorkspaceFrames(
           props.accountId,
           hosts.map((host) => host.hostId),
@@ -981,8 +1094,16 @@ export function createWebWorkspace(
           props.accountId,
           hosts.map((host) => host.hostId),
         );
-        const activeGeneration = refreshGeneration === generation && refreshHostId === hostId;
-        if (!activeGeneration) return;
+        const earlyHostId = cachedHost?.hostId ?? null;
+        const activeGeneration =
+          refreshHostId === hostId && (refreshGeneration === generation || refreshHostId === earlyHostId);
+        if (!activeGeneration) {
+          setState((draft) => {
+            draft.hosts = hosts;
+            draft.hostsLoaded = true;
+          });
+          return;
+        }
         if (refreshHostId && !hosts.some((host) => host.hostId === refreshHostId)) {
           generation += 1;
           hostId = null;
@@ -1009,6 +1130,7 @@ export function createWebWorkspace(
             setStepLines({});
             draft.takeovers = [];
             draft.browserTabs = [];
+            draft.noticedBrowserTabIds = null;
             draft.activeBrowserTabId = null;
             draft.browserControlState = { sessions: [] };
             draft.sidebarLayout = defaultSidebarLayout();
@@ -1019,16 +1141,24 @@ export function createWebWorkspace(
             draft.duplicatingAgentIds = [];
             draft.capabilities = [];
             draft.status = "offline";
-            draft.error = leftHostIds.has(refreshHostId)
-              ? null
-              : { message: currentText().t("webClient.error.accessEnded"), reference: null };
+            draft.error =
+              leftHostIds.has(refreshHostId) || refreshHostId === earlyHostId
+                ? null
+                : { message: currentText().t("webClient.error.accessEnded"), reference: null };
           });
           runtime.hosts?.setHosts(hosts);
           await runtime.disconnect().catch(() => undefined);
         }
         const connected = hosts.find((host) => host.hostId === hostId);
+        const listedEarlyHost = connected && connected.hostId === earlyHostId ? connected : null;
         setState((draft) => {
-          if (connected && draft.host?.hostId === connected.hostId) {
+          if (listedEarlyHost && draft.host?.hostId === listedEarlyHost.hostId) {
+            const appearance = draft.capabilities.includes(HOST_APPEARANCE_CAPABILITY)
+              ? draft.host.appearance
+              : listedEarlyHost.appearance;
+            draft.host = { ...listedEarlyHost };
+            if (appearance !== undefined) draft.host.appearance = appearance;
+          } else if (connected && draft.host?.hostId === connected.hostId) {
             draft.host.name = connected.name;
             draft.host.logoKey = connected.logoKey;
             if (connected.appearance !== undefined && !draft.capabilities.includes(HOST_APPEARANCE_CAPABILITY))
@@ -1039,10 +1169,17 @@ export function createWebWorkspace(
           draft.hostsError = null;
         });
         for (const left of leftHostIds) if (!hosts.some((host) => host.hostId === left)) leftHostIds.delete(left);
+        if (listedEarlyHost && cachedHost && listedEarlyHost.devicePublicKey !== cachedHost.devicePublicKey) {
+          await connectionPromise?.promise.catch(() => undefined);
+          if (!disposed && hostId === listedEarlyHost.hostId) await connect(listedEarlyHost);
+        }
         if (!hostId) {
           const savedHostId = readWebServerSelection(props.accountId);
+          const ordered = orderWebHosts(hosts, serverOrder());
           const initialHost =
-            hosts.find((host) => host.hostId === savedHostId) ?? orderWebHosts(hosts, serverOrder())[0];
+            hosts.find((host) => host.hostId === savedHostId && host.hidden !== true) ??
+            ordered.find((host) => host.hidden !== true) ??
+            ordered[0];
           if (initialHost) await connect(initialHost);
         }
         if (!disposed) runtime.hosts?.setHosts(hosts);
@@ -1080,6 +1217,18 @@ export function createWebWorkspace(
     if (!remove) throw new Error(currentText().t("server.settings.actionFailed"));
     await departHost(host, () => remove(host.hostId));
   }
+  async function setHostHidden(host: RemoteTeamHost, hidden: boolean): Promise<void> {
+    const change = runtime.setHostHidden;
+    if (!change) throw new Error(currentText().t("server.settings.actionFailed"));
+    await change(host.hostId, hidden);
+    setState((draft) => {
+      const listed = draft.hosts.find((candidate) => candidate.hostId === host.hostId);
+      if (!listed) return;
+      if (hidden) listed.hidden = true;
+      else delete listed.hidden;
+    });
+    void (hostsRefreshPromise ?? Promise.resolve()).catch(() => undefined).then(retryHosts);
+  }
   async function departHost(host: RemoteTeamHost, operation: () => Promise<void>): Promise<void> {
     leftHostIds.add(host.hostId);
     try {
@@ -1092,6 +1241,13 @@ export function createWebWorkspace(
   }
   function retryHosts(): Promise<void> {
     return refreshHosts().catch(() => undefined);
+  }
+  let focusAccountCheckedAt = Number.NEGATIVE_INFINITY;
+  function focusAccountCheck(): Promise<void> {
+    const now = Date.now();
+    if (now - focusAccountCheckedAt < FOCUS_ACCOUNT_CHECK_MS) return Promise.resolve();
+    focusAccountCheckedAt = now;
+    return props.onSessionCheck().then(retryHosts);
   }
   function setHostedSleep(hostedSleep: HostedServerSleep | null): void {
     if (state.hostedSleep !== hostedSleep)
@@ -1106,9 +1262,11 @@ export function createWebWorkspace(
       deleteCachedWorkflows(hostId);
     }
     generation += 1;
+    restartCapable = false;
     selectedId = null;
     setState((draft) => {
       draft.revocationRevision += 1;
+      draft.restartReady = false;
       draft.workspaceLoaded = false;
       draft.synced = false;
       draft.agents = [];
@@ -1125,6 +1283,7 @@ export function createWebWorkspace(
       setStepLines({});
       draft.takeovers = [];
       draft.browserTabs = [];
+      draft.noticedBrowserTabIds = null;
       draft.activeBrowserTabId = null;
       draft.browserControlState = { sessions: [] };
       draft.sidebarLayout = defaultSidebarLayout();
@@ -1189,6 +1348,9 @@ export function createWebWorkspace(
       if (!disposed && hostId === host.hostId && state.recovery?.phase !== "suspended") recover();
     }
   }
+  function restartRequested(): void {
+    if (state.status !== "online") generation += 1;
+  }
   async function useHere(): Promise<void> {
     const host = state.host;
     if (host && state.otherTab) await connect(host, true);
@@ -1214,6 +1376,7 @@ export function createWebWorkspace(
     writeWebServerSelection(props.accountId, host.hostId);
     if (!keepWorkspace) selectedId = null;
     if (!sameHost) hostLifecycle.endSleep();
+    if (!sameHost) restartCapable = false;
     setState((draft) => {
       draft.host = host;
       draft.recovery = null;
@@ -1228,6 +1391,7 @@ export function createWebWorkspace(
       }
       draft.status = "connecting";
       draft.hostRestart = null;
+      if (!sameHost) draft.restartReady = false;
       draft.memberId = sameHost ? draft.memberId : null;
       if (!keepWorkspace) {
         draft.agents = [];
@@ -1251,6 +1415,7 @@ export function createWebWorkspace(
       if (!keepWorkspace) {
         draft.progress = {};
         draft.browserTabs = [];
+        draft.noticedBrowserTabIds = null;
         draft.activeBrowserTabId = null;
         draft.sidebarLayout = defaultSidebarLayout();
         draft.userHiddenAgents = [];
@@ -1311,6 +1476,12 @@ export function createWebWorkspace(
       }
       const capabilities = await connecting;
       markRemoteSync("connected");
+      if (!disposed && current === generation) {
+        restartCapable = capabilities.includes(HOST_RESTART_CAPABILITY);
+        setState((draft) => {
+          draft.restartReady = restartCapable;
+        });
+      }
       const [agents, agentStatus, models] = await (early.gate ?? readGate());
       if (disposed || current !== generation) return;
       revokedReconnect = false;
@@ -1451,6 +1622,7 @@ export function createWebWorkspace(
           if (!isCurrent()) return;
           setState((draft) => {
             draft.browserTabs = browserTabs;
+            draft.noticedBrowserTabIds ??= browserTabs.map((tab) => tab.id);
             draft.activeBrowserTabId = browserTabs.some((tab) => tab.id === draft.activeBrowserTabId)
               ? draft.activeBrowserTabId
               : (browserTabs[0]?.id ?? null);
@@ -1689,12 +1861,52 @@ export function createWebWorkspace(
       }
     })();
   }
-  function changeQueue(change: (agentId: string) => Promise<void>) {
+  interface ShownQueueEdit {
+    agentId: string;
+    edit: QueueEdit;
+    revision: number;
+    generation: number;
+  }
+  function showQueueEdit(agentId: string, edit: QueueEdit | null): ShownQueueEdit | null {
+    if (edit === null) return null;
+    const revision = (queueRevisions.get(agentId) ?? 0) + 1;
+    queueRevisions.set(agentId, revision);
+    setState((draft) => {
+      const queue = draft.queues[agentId];
+      if (queue) patchQueueDeliveries(queue.deliveries, edit, "apply");
+    });
+    return { agentId, edit, revision, generation };
+  }
+  function rollBackQueueEdit(shown: ShownQueueEdit | null): void {
+    if (shown === null || disposed || shown.generation !== generation) return;
+    if ((queueRevisions.get(shown.agentId) ?? 0) !== shown.revision) {
+      loadQueue(shown.agentId);
+      return;
+    }
+    setState((draft) => {
+      const queue = draft.queues[shown.agentId];
+      if (queue) patchQueueDeliveries(queue.deliveries, shown.edit, "roll-back");
+    });
+  }
+  function showCancelEdit(agentIds: readonly string[], deliveryId: string): ShownQueueEdit | null {
+    for (const agentId of agentIds) {
+      const shown = showQueueEdit(agentId, cancelQueueEdit(state.queues[agentId], deliveryId));
+      if (shown !== null) return shown;
+    }
+    return null;
+  }
+  function changeQueue(
+    change: (agentId: string) => Promise<void>,
+    show: (agentId: string) => ShownQueueEdit | null = () => null,
+    quietFailure: (agentId: string) => boolean = () => false,
+  ) {
     const id = selectedId;
     const current = generation;
     if (!id || state.status !== "online") return;
+    const shown = show(id);
     void change(id).catch((error) => {
-      if (current === generation) report(error);
+      rollBackQueueEdit(shown);
+      if (current === generation && !quietFailure(id)) report(error);
     });
   }
   async function select(id: string) {
@@ -1727,16 +1939,22 @@ export function createWebWorkspace(
     }
   }
   async function preloadRecent(ids: readonly string[], current: number) {
-    for (const id of ids.slice(0, PRELOADED_AGENTS)) {
-      if (disposed || current !== generation) return;
-      if (state.conversations[id]) continue;
-      setState((draft) => {
-        draft.conversations[id] ??= { page: null, draft: "", attachments: [], loading: false, trimmed: true };
-      });
-      try {
-        await load(id);
-      } catch {}
-    }
+    const pending = ids.slice(0, PRELOADED_AGENTS);
+    let next = 0;
+    const worker = async () => {
+      while (next < pending.length) {
+        if (disposed || current !== generation) return;
+        const id = pending[next++];
+        if (!id || state.conversations[id]) continue;
+        setState((draft) => {
+          draft.conversations[id] ??= { page: null, draft: "", attachments: [], loading: false, trimmed: true };
+        });
+        try {
+          await load(id);
+        } catch {}
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(PRELOAD_CONCURRENCY, pending.length) }, worker));
   }
   let readsLoad: { generation: number; promise: Promise<void> } | null = null;
   let pendingReads = false;
@@ -1908,22 +2126,56 @@ export function createWebWorkspace(
     readWrites.set(id, write);
     return write;
   }
+  function holdRead(agentId: string, optimistic: ConversationReadState): () => void {
+    const current = generation;
+    let restore: ConversationReadState | undefined;
+    setState((draft) => {
+      const read = draft.reads[agentId];
+      restore = read ? { ...read } : undefined;
+      draft.reads[agentId] = optimistic;
+    });
+    return () => {
+      if (disposed || current !== generation) return;
+      setState((draft) => {
+        if (!sameReadState(draft.reads[agentId], optimistic)) return;
+        if (restore) draft.reads[agentId] = restore;
+        else delete draft.reads[agentId];
+      });
+    };
+  }
+  function selectedLatestPage(agentId: string): ConversationPage | undefined {
+    const conversation = state.conversations[agentId];
+    const page = conversation?.page;
+    if (selectedId !== agentId || !page || conversation.loading || conversation.around) return undefined;
+    return page.messages.length > 0 ? page : undefined;
+  }
   function markAgentRead(id: string) {
     const current = generation;
+    const loaded = selectedLatestPage(id);
+    const loadedLatest = loaded ? { threadId: loaded.threadId, messageId: loaded.messages.at(-1)?.id } : undefined;
+    const rollback = holdRead(
+      id,
+      markedReadState(loadedLatest?.messageId ?? state.reads[id]?.throughMessageId ?? null),
+    );
     const write = (readWrites.get(id) ?? Promise.resolve())
       .catch(() => undefined)
       .then(async () => {
         if (disposed || current !== generation) return;
-        const page = await runtime.conversation(id);
-        const latestMessageId = page.messages.at(-1)?.id;
+        const fetched = loadedLatest ? undefined : await runtime.conversation(id);
+        const threadId = loadedLatest ? loadedLatest.threadId : fetched?.threadId;
+        const latestMessageId = loadedLatest ? loadedLatest.messageId : fetched?.messages.at(-1)?.id;
         if (!latestMessageId || disposed || current !== generation) return;
         const readState = await runtime.markRead(id, latestMessageId);
         if (disposed || current !== generation) return;
         setState((draft) => {
           const value = draft.conversations[id]?.page;
-          if (value?.threadId === page.threadId) value.readState = readState;
+          if (value && value.threadId === threadId) value.readState = readState;
           draft.reads[id] = readState;
         });
+      })
+      .catch((error: unknown) => {
+        rollback();
+        throw error;
       });
     readWrites.set(id, write);
     return write;
@@ -1941,6 +2193,15 @@ export function createWebWorkspace(
   }
   async function markUnreadFrom(agentId: string, messageId: string): Promise<void> {
     const current = generation;
+    const rollback = holdRead(
+      agentId,
+      markedUnreadState(
+        state.conversations[agentId]?.page?.messages ?? [],
+        messageId,
+        isIncomingConversationMessage,
+        state.reads[agentId],
+      ),
+    );
     const write = (readWrites.get(agentId) ?? Promise.resolve())
       .catch(() => undefined)
       .then(async () => {
@@ -1951,13 +2212,27 @@ export function createWebWorkspace(
           if (value) value.readState = readState;
           draft.reads[agentId] = readState;
         });
+      })
+      .catch((error: unknown) => {
+        rollback();
+        throw error;
       });
     readWrites.set(agentId, write);
     await write;
   }
   async function markLatestReplyUnread(agentId: string): Promise<void> {
-    const reply = latestIncomingConversationMessage((await runtime.conversation(agentId)).messages);
-    if (reply) await markUnreadFrom(agentId, reply.id);
+    const loaded = selectedLatestPage(agentId);
+    const loadedReply = loaded ? latestIncomingConversationMessage(loaded.messages) : undefined;
+    if (loadedReply) return markUnreadFrom(agentId, loadedReply.id);
+    const rollback = holdRead(agentId, heldUnreadState(state.reads[agentId]));
+    try {
+      const reply = latestIncomingConversationMessage((await runtime.conversation(agentId)).messages);
+      if (reply) await markUnreadFrom(agentId, reply.id);
+      else rollback();
+    } catch (error) {
+      rollback();
+      throw error;
+    }
   }
   const hostViews = (): HostRestartView[] =>
     state.host
@@ -1974,14 +2249,13 @@ export function createWebWorkspace(
       : [];
   createHostRestartToasts(() => hostViews().filter((host) => !followsServerUpdate(host.id)));
   onSettled(() => {
+    focusAccountCheckedAt = Date.now();
     void refreshHosts().catch(report);
     const pageFocus = () => setPageFocused(!document.hidden && document.hasFocus());
     const focus = () => {
       pageFocus();
       runtime.hosts?.refresh();
-      void props
-        .onSessionCheck()
-        .then(() => refreshHosts())
+      void focusAccountCheck()
         .then(() => {
           if (state.status === "online") return Date.now() - syncedAt < FOCUS_RESYNC_MS ? undefined : resync();
           if (state.recovery?.phase !== "suspended") recoverNow();
@@ -2056,27 +2330,39 @@ export function createWebWorkspace(
     setHostAppearance,
     leaveHost,
     removeOwnedHost,
+    setHostHidden,
+    canHideHosts: runtime.setHostHidden !== undefined,
     retryHosts,
     reconnect,
+    restartRequested,
     useHere,
     joinInvite,
     connect,
     select,
     refresh,
     send,
-    cancelQueued: (deliveryId: string) => changeQueue((agentId) => runtime.cancelQueued({ agentId, deliveryId })),
+    cancelQueued: (deliveryId: string, recipientAgentId?: string) =>
+      changeQueue(
+        (agentId) => runtime.cancelQueued({ agentId: recipientAgentId ?? agentId, deliveryId }),
+        (agentId) => showCancelEdit([recipientAgentId ?? agentId, agentId], deliveryId),
+      ),
     steerQueued(deliveryId: string) {
       const expectedTurnId = conversation()?.page?.activeTurnId;
       if (!expectedTurnId) return;
-      changeQueue((agentId) =>
-        runtime.steerQueued({ agentId, deliveryId, expectedTurnId }).catch((error: unknown) => {
+      changeQueue(
+        (agentId) => runtime.steerQueued({ agentId, deliveryId, expectedTurnId }),
+        (agentId) => showQueueEdit(agentId, steerQueueEdit(state.queues[agentId], deliveryId, expectedTurnId)),
+        (agentId) => {
           const delivery = state.queues[agentId]?.deliveries.find((item) => item.id === deliveryId);
-          if (delivery && delivery.status !== "queued") return;
-          throw error;
-        }),
+          return delivery !== undefined && delivery.status !== "queued";
+        },
       );
     },
-    reorderQueue: (deliveryIds: string[]) => changeQueue((agentId) => runtime.reorderQueue({ agentId, deliveryIds })),
+    reorderQueue: (deliveryIds: string[]) =>
+      changeQueue(
+        (agentId) => runtime.reorderQueue({ agentId, deliveryIds }),
+        (agentId) => showQueueEdit(agentId, reorderQueueEdit(state.queues[agentId], deliveryIds)),
+      ),
     async updateQueued(
       deliveryId: string,
       text: string,
@@ -2280,6 +2566,7 @@ export function createWebWorkspace(
       const current = generation;
       await runtime.answer(input);
       if (disposed || current !== generation) return;
+      forgetListedPrompt(input.requestId);
       setState((draft) => {
         draft.prompts = draft.prompts.filter((item) => String(item.requestId) !== String(input.requestId));
       });
@@ -2312,6 +2599,14 @@ export function createWebWorkspace(
       if (state.browserTabs.some((tab) => tab.id === tabId))
         setState((draft) => {
           draft.activeBrowserTabId = tabId;
+        });
+    },
+    noticeBrowserTabs(tabIds: readonly string[]) {
+      const noticed = state.noticedBrowserTabIds;
+      const added = noticed ? tabIds.filter((tabId) => !noticed.includes(tabId)) : [];
+      if (added.length > 0)
+        setState((draft) => {
+          draft.noticedBrowserTabIds?.push(...added);
         });
     },
     async openSearchMessage(messageId: string): Promise<boolean> {
@@ -2371,6 +2666,42 @@ export function createWebWorkspace(
     async approve(input: RespondToApprovalInput) {
       const current = generation;
       await runtime.approve(input);
+      if (disposed || current !== generation) return;
+      setState((draft) => {
+        draft.approvals = draft.approvals.filter((item) => item.requestId !== input.requestId);
+      });
+      await refresh();
+    },
+    readMediaApproval(input: ReadMediaApprovalInput) {
+      return runtime.readMediaApproval?.(input) ?? Promise.resolve({ media: null, hold: null });
+    },
+    async respondToCreditsHold(input: RespondToCreditsHoldInput) {
+      const respond = runtime.respondToCreditsHold;
+      if (!respond) throw new Error(currentText().t("error.team.mediaApprovalChoiceUnsupported"));
+      const current = generation;
+      const hold = await respond(input);
+      if (hold || disposed || current !== generation) return hold;
+      setState((draft) => {
+        draft.approvals = draft.approvals.filter((item) => item.requestId !== input.requestId);
+      });
+      await refresh();
+      return hold;
+    },
+    async setCreditsAskMuted(muted: boolean) {
+      const setMuted = runtime.setCreditsAskMuted;
+      if (!setMuted) throw new Error(currentText().t("error.team.mediaApprovalChoiceUnsupported"));
+      await setMuted({ muted });
+    },
+    async readCreditsAskMuted() {
+      const read = runtime.readCreditsAskMuted;
+      if (!read) throw new Error(currentText().t("error.team.mediaApprovalChoiceUnsupported"));
+      return read();
+    },
+    async respondToMediaApproval(input: RespondToMediaApprovalInput) {
+      const respond = runtime.respondToMediaApproval;
+      if (!respond) throw new Error(currentText().t("error.team.mediaApprovalChoiceUnsupported"));
+      const current = generation;
+      await respond(input);
       if (disposed || current !== generation) return;
       setState((draft) => {
         draft.approvals = draft.approvals.filter((item) => item.requestId !== input.requestId);
@@ -2457,6 +2788,7 @@ export function createWebWorkspace(
 }
 
 const FOCUS_RESYNC_MS = 30_000;
+const FOCUS_ACCOUNT_CHECK_MS = 60_000;
 
 function changedConversation(event: AgentEvent | TeamRealtimeEvent): string | undefined {
   switch (event.type) {

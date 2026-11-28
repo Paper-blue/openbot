@@ -1,10 +1,10 @@
 {
-  "version": "0.73.0",
+  "version": "0.81.0",
   "highlights": [
-    "Update your joined servers to this version too, so that custom image sizes and the Sunra and Higgsfield models work there.",
-    "See the side threads of each agent in the sidebar, and filter the sidebar by agents, channels, unread chats or folders.",
-    "Edit one workflow together with other people at the same time.",
-    "OpenBot uses much less CPU while many agents work, and its database uses much less space.",
-    "Agents finish a checkout when the bank asks for a 3-D Secure code that they can read in your email or SMS."
+    "Update your joined servers to this version too. The faster chats and channels, the remote content setting and canvas videos work there only then.",
+    "Chats and channels on a joined server stay up to date by themselves, and reactions, read marks and queue changes show at once.",
+    "Choose if chats load pictures and pages from other web sites with the new \"Load remote content in chats\" server setting.",
+    "Put videos and audio files on a workflow canvas, and send them to an agent or a video step.",
+    "Pay less for most OpenBot credit pictures and videos: the prices are lower by up to 80%."
   ]
 }

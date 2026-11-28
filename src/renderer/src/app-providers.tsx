@@ -1,8 +1,9 @@
-import type { ChatWindowTarget } from "@openbot/contracts/ipc";
+import { type ChatWindowTarget, LOCAL_SERVER_ID } from "@openbot/contracts/ipc";
 import type { JSX } from "@solidjs/web";
-import { type ParentProps, Show } from "solid-js";
+import { type ParentProps, Show, untrack } from "solid-js";
 import { AnsweredPromptsProvider } from "./answered-prompts";
 import { AppBootstrap } from "./app-bootstrap";
+import { appPort } from "./app-port";
 import { AuthProvider } from "./features/account/account-context";
 import { AgentTasksProvider } from "./features/agent-tasks/agent-tasks-context";
 import { AgentThreadsProvider } from "./features/agent-threads/agent-threads-context";
@@ -11,15 +12,19 @@ import { AgentEventBridge } from "./features/agents/agent-event-bridge";
 import { AgentReadTrackingProvider } from "./features/agents/agent-read-tracking";
 import { AgentsProvider } from "./features/agents/agents-context";
 import { BrowserTabsProvider } from "./features/browser/browser-context";
+import { ServerBrowserWindowBridge } from "./features/browser/ServerBrowserWindowBridge";
 import { ChannelsProvider } from "./features/channels/channels-context";
 import { readStoredComposerDrafts } from "./features/conversation/composer-draft-storage";
 import { ConversationProvider } from "./features/conversation/conversation-context";
 import {
+  closeBrowserWindowWithServerScope,
   createServerConversationState,
   createStableConversationState,
+  followBrowserWindowEvents,
 } from "./features/conversation/conversation-controller";
 import { ConversationControllerProvider } from "./features/conversation/conversation-controller-context";
 import { DirectMessagesProvider } from "./features/conversation/direct-messages-context";
+import { CreditModelsProvider, createCreditModels } from "./features/credits/credits-context";
 import { CustomAgentsProvider } from "./features/custom-agents/custom-agents-context";
 import { CustomProvidersProvider } from "./features/custom-providers/custom-providers-context";
 import { ProviderDetectionProvider } from "./features/custom-providers/provider-detection-context";
@@ -60,6 +65,8 @@ export function AppProviders(props: ParentProps<AppProps>): JSX.Element {
     !props.chatWindow,
     readStoredComposerDrafts(),
   );
+  if (!props.chatWindow) followBrowserWindowEvents(stableConversation);
+  const creditModels = createCreditModels(() => appPort().credits.getCatalog());
   return (
     <PlatformProvider
       landingPreview={props.landingPreview}
@@ -84,16 +91,18 @@ export function AppProviders(props: ParentProps<AppProps>): JSX.Element {
                                     <AnsweredPromptsProvider>
                                       <UiErrorsProvider>
                                         <UsageProvider>
-                                          <WindowPageProvider>
-                                            <AgentReadTrackingProvider>
-                                              <Show when={!props.chatWindow}>
-                                                <AppBootstrap />
-                                              </Show>
-                                              <ServerScopeBoundary stableConversation={stableConversation}>
-                                                {props.children}
-                                              </ServerScopeBoundary>
-                                            </AgentReadTrackingProvider>
-                                          </WindowPageProvider>
+                                          <CreditModelsProvider models={creditModels}>
+                                            <WindowPageProvider>
+                                              <AgentReadTrackingProvider>
+                                                <Show when={!props.chatWindow}>
+                                                  <AppBootstrap />
+                                                </Show>
+                                                <ServerScopeBoundary stableConversation={stableConversation}>
+                                                  {props.children}
+                                                </ServerScopeBoundary>
+                                              </AgentReadTrackingProvider>
+                                            </WindowPageProvider>
+                                          </CreditModelsProvider>
                                         </UsageProvider>
                                       </UiErrorsProvider>
                                     </AnsweredPromptsProvider>
@@ -131,7 +140,13 @@ interface ScopedConversationProps {
 
 function ScopedProviders(props: ParentProps<ScopedConversationProps>): JSX.Element {
   const platform = usePlatform();
-  const conversationController = { ...props.stableConversation, ...createServerConversationState() };
+  const { activeServerId } = useServers();
+  const keepSidePanelFiles = !platform.chatWindow && untrack(activeServerId) === LOCAL_SERVER_ID;
+  if (!platform.chatWindow) closeBrowserWindowWithServerScope(props.stableConversation);
+  const conversationController = {
+    ...props.stableConversation,
+    ...createServerConversationState(keepSidePanelFiles),
+  };
   return (
     <ConversationControllerProvider controller={conversationController}>
       <PresenceProvider>
@@ -152,6 +167,7 @@ function ScopedProviders(props: ParentProps<ScopedConversationProps>): JSX.Eleme
                                     <AgentEventBridge />
                                     <Show when={!platform.chatWindow}>
                                       <DynamicIslandBridge />
+                                      <ServerBrowserWindowBridge />
                                     </Show>
                                     {props.children}
                                   </ServerScopeProvider>

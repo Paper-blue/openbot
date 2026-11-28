@@ -12,6 +12,7 @@ import Earth from "lucide-react-native/icons/earth";
 import Fingerprint from "lucide-react-native/icons/fingerprint-pattern";
 import HardDrive from "lucide-react-native/icons/hard-drive";
 import KeyRound from "lucide-react-native/icons/key-round";
+import RadioTower from "lucide-react-native/icons/radio-tower";
 import RefreshCcw from "lucide-react-native/icons/refresh-ccw";
 import RefreshCw from "lucide-react-native/icons/refresh-cw";
 import RotateCcw from "lucide-react-native/icons/rotate-ccw";
@@ -20,6 +21,7 @@ import RotateCcwKey from "lucide-react-native/icons/rotate-ccw-key";
 import ShieldCheck from "lucide-react-native/icons/shield-check";
 import Sparkles from "lucide-react-native/icons/sparkles";
 import UserRound from "lucide-react-native/icons/user-round";
+import UserRoundCog from "lucide-react-native/icons/user-round-cog";
 import UsersRound from "lucide-react-native/icons/users-round";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Alert } from "react-native";
@@ -28,32 +30,47 @@ import { useMobileSession } from "@/features/auth/context/mobile-session-context
 import { hostedServerCalls } from "@/features/servers/api/hosted-servers";
 import {
   ServerBrowsingMemoryRow,
+  ServerMediaApprovalCreditsRow,
   ServerMemoryLimitRow,
   ServerMemoryReviewRow,
   ServerPersonalityRow,
+  ServerRemoteChatContentRow,
   ServerSkillLearningRow,
 } from "@/features/servers/components/server-learning-rows";
+import { ServerTurnLimitsRows } from "@/features/servers/components/server-turn-limits-rows";
+import { ServerVoiceModelRow } from "@/features/servers/components/server-voice-model-row";
 import { TrailingValue } from "@/features/servers/components/trailing-value";
 import { SERVER_ROLE_LABEL_KEYS } from "@/features/servers/model/server-role";
-import { canRestartServer } from "@/features/servers/model/server-settings-access";
+import { canRestartServer, useOwnerHostedServerIds } from "@/features/servers/model/server-settings-access";
 import { timeZoneLabel } from "@/features/servers/model/time-zones";
 import { useLockedAction } from "@/features/servers/model/use-locked-action";
 import { useServerBrowserProfiles } from "@/features/servers/model/use-server-browser-profiles";
 import { useServerProviders } from "@/features/servers/model/use-server-providers";
+import { signalLatencyTone, useServerSignalHome } from "@/features/servers/model/use-server-signal-home";
 import { useServerSites } from "@/features/servers/model/use-server-sites";
 import { useServerTimezone } from "@/features/servers/model/use-server-timezone";
 import { updateAvailable, useServerUpdate } from "@/features/servers/model/use-server-update";
 import { SettingsRow, SettingsSection } from "@/features/settings/components/settings-content";
 import { RowIcon } from "@/features/settings/components/settings-row-icon";
-import { useMobileWorkspace, useMobileWorkspaceActions } from "@/features/workspace/context/mobile-workspace-context";
+import {
+  useMobileWorkspaceActions,
+  useMobileWorkspaceSelector,
+} from "@/features/workspace/context/mobile-workspace-context";
 import { type ServerRowState, serverRowState } from "@/features/workspace/model/server-row-state";
 import type { MobileServer, ServerChecks } from "@/features/workspace/model/workspace-types";
 import { haptics } from "@/shared/lib/haptics";
 import { currentText, useText } from "@/shared/lib/text";
 
-function useServerRows(serverId: string) {
-  const workspace = useMobileWorkspace();
-  return (permits: (checks: ServerChecks) => unknown) => serverRowState(workspace, serverId, permits);
+function useServerRow(serverId: string, permits: (checks: ServerChecks) => unknown): ServerRowState {
+  return useMobileWorkspaceSelector((workspace) => serverRowState(workspace, serverId, permits));
+}
+
+type ServerFlag = {
+  [Key in keyof ServerChecks]: ServerChecks[Key] extends (serverId: string) => boolean ? Key : never;
+}[keyof ServerChecks];
+
+function useServerFlag(serverId: string, flag: ServerFlag): boolean {
+  return useMobileWorkspaceSelector((workspace) => workspace[flag](serverId));
 }
 
 function LinkRow({ label, icon, pathname, serverId, trailing, disabled }: LinkRowProps) {
@@ -74,6 +91,7 @@ interface LinkRowProps {
   icon: LucideIcon;
   pathname:
     | "/server-settings/members"
+    | "/server-settings/owner-transfer"
     | "/server-settings/roles"
     | "/server-settings/audit"
     | "/server-settings/vault"
@@ -87,11 +105,11 @@ interface LinkRowProps {
 
 export function ServerPeopleSection({ server }: { server: MobileServer }) {
   const { t } = useText();
-  const { memberCountByServer } = useMobileWorkspace();
-  const row = useServerRows(server.id);
-  const roles = row((checks) => checks.canManageServerRoles(server.id));
-  const audit = row((checks) => checks.canReadServerAudit(server.id));
-  const memberCount = memberCountByServer[server.id];
+  const memberCount = useMobileWorkspaceSelector((workspace) => workspace.memberCountByServer[server.id]);
+  const roles = useServerRow(server.id, (checks) => checks.canManageServerRoles(server.id));
+  const audit = useServerRow(server.id, (checks) => checks.canReadServerAudit(server.id));
+  const ownerTransfer = useServerRow(server.id, (checks) => checks.canTransferOwnership(server.id));
+  const hostedServerIds = useOwnerHostedServerIds(server);
   return (
     <SettingsSection title={t("mobile.server.settings.peopleSection")}>
       <SettingsRow
@@ -139,14 +157,22 @@ export function ServerPeopleSection({ server }: { server: MobileServer }) {
           disabled={audit === "disabled"}
         />
       )}
+      {ownerTransfer === "hidden" || hostedServerIds?.has(server.id) ? null : (
+        <LinkRow
+          label={t("mobile.server.route.ownerTransfer")}
+          icon={UserRoundCog}
+          pathname="/server-settings/owner-transfer"
+          serverId={server.id}
+          disabled={ownerTransfer === "disabled"}
+        />
+      )}
     </SettingsSection>
   );
 }
 
 export function ServerAiSection({ serverId }: { serverId: string }) {
   const { t } = useText();
-  const row = useServerRows(serverId);
-  const providers = row((checks) => checks.canManageProviders(serverId));
+  const providers = useServerRow(serverId, (checks) => checks.canManageProviders(serverId));
   if (providers === "hidden") return null;
   return (
     <SettingsSection title={t("mobile.server.settings.aiSection")}>
@@ -157,13 +183,12 @@ export function ServerAiSection({ serverId }: { serverId: string }) {
 
 export function ServerDataSections({ serverId }: { serverId: string }) {
   const { t } = useText();
-  const row = useServerRows(serverId);
-  const vault = row((checks) => checks.canManageVault(serverId));
-  const browserProfiles = row((checks) => checks.canManageBrowserProfiles(serverId));
-  const sites = row((checks) => checks.canViewHostedSites(serverId));
-  const storage = row((checks) => checks.canReadServerStorage(serverId));
-  const importAgents = row((checks) => checks.canImportAgents(serverId));
-  const transfer = row((checks) => checks.canTransferServer(serverId));
+  const vault = useServerRow(serverId, (checks) => checks.canManageVault(serverId));
+  const browserProfiles = useServerRow(serverId, (checks) => checks.canManageBrowserProfiles(serverId));
+  const sites = useServerRow(serverId, (checks) => checks.canViewHostedSites(serverId));
+  const storage = useServerRow(serverId, (checks) => checks.canReadServerStorage(serverId));
+  const importAgents = useServerRow(serverId, (checks) => checks.canImportAgents(serverId));
+  const transfer = useServerRow(serverId, (checks) => checks.canTransferServer(serverId));
   const shown = (state: ServerRowState) => state !== "hidden";
   return (
     <>
@@ -228,14 +253,15 @@ export function ServerConnectionSection({
 }) {
   const { t } = useText();
   const serverId = server.id;
-  const { refreshServer, hostedServerStarting, canRestartServerItself, restartServerItself } = useMobileWorkspace();
+  const { reconnectServer, hostedServerStarting, restartServerItself } = useMobileWorkspaceActions();
+  const restartsItself = useMobileWorkspaceSelector((workspace) => workspace.canRestartServerItself(serverId));
   const { session } = useMobileSession();
   const action = useLockedAction();
   const { busy, error } = action;
   const [restarting, setRestarting] = useState(false);
   const [restarted, setRestarted] = useState<string | null>(null);
   const hosted = canRestartServer(server, hostedServerIds);
-  const selfHosted = !hosted && canRestartServerItself(serverId);
+  const selfHosted = !hosted && restartsItself;
   function perform(operation: () => Promise<void>, failure?: (error: unknown) => string) {
     setRestarted(null);
     return action.perform(operation, failure);
@@ -246,7 +272,7 @@ export function ServerConnectionSection({
         leading={<RowIcon icon={RefreshCcw} tone="accent" />}
         disclosure={false}
         disabled={busy}
-        onPress={() => void perform(() => refreshServer(serverId))}
+        onPress={() => void perform(() => reconnectServer(serverId))}
       >
         <Typography.Paragraph className="text-accent">
           {busy && !restarting ? t("mobile.server.settings.refreshing") : t("mobile.server.settings.refresh")}
@@ -302,28 +328,38 @@ export function ServerConnectionSection({
 
 function permitsAgentSettings(checks: ServerChecks, serverId: string): boolean {
   return (
+    checks.canManageServerTurnLimits(serverId) ||
     checks.canManageServerPersonality(serverId) ||
     checks.canManageAgentMemoryLimit(serverId) ||
     checks.canManageMemoryReview(serverId) ||
     checks.canManageSkillLearning(serverId) ||
-    checks.canManageBrowsingMemory(serverId)
+    checks.canManageBrowsingMemory(serverId) ||
+    checks.canManageRemoteChatContent(serverId) ||
+    checks.canManageMediaApprovalCredits(serverId) ||
+    checks.canManageServerVoiceModel(serverId)
   );
 }
 
 export function useAgentSettingsAvailable(serverId: string): boolean {
-  return permitsAgentSettings(useMobileWorkspace(), serverId);
+  return useMobileWorkspaceSelector((workspace) => permitsAgentSettings(workspace, serverId));
 }
 
 export function ServerGeneralSection({ serverId }: { serverId: string }) {
-  const { t, errorMessage } = useText();
+  const { t, errorMessage, format } = useText();
   const timezone = useServerTimezone(serverId);
+  const signalHome = useServerSignalHome(serverId);
   const update = useServerUpdate(serverId, { poll: false });
-  const row = useServerRows(serverId);
-  const updateRow = row((checks) => checks.serverUpdateAccess(serverId));
-  const timezoneRow = row((checks) => checks.canManageServerTimezone(serverId));
-  const agentsRow = row((checks) => permitsAgentSettings(checks, serverId));
+  const updateRow = useServerRow(serverId, (checks) => checks.serverUpdateAccess(serverId));
+  const timezoneRow = useServerRow(serverId, (checks) => checks.canManageServerTimezone(serverId));
+  const agentsRow = useServerRow(serverId, (checks) => permitsAgentSettings(checks, serverId));
+  const signalHomeAccess = useServerRow(serverId, (checks) => checks.servesServerSignalHome(serverId));
+  const signalHomes = signalHome.query.data;
+  const signalHomeRow = signalHome.query.isError || (signalHomes?.homes.length ?? 0) > 1 ? signalHomeAccess : "hidden";
+  const signalHomeInUse = signalHome.served
+    ? signalHomes?.homes.find((home) => home.id === signalHomes.current)
+    : undefined;
   const updateShown = Boolean(update.access || update.query.data) || updateRow === "disabled";
-  if (!updateShown && timezoneRow === "hidden" && agentsRow === "hidden") return null;
+  if (!updateShown && timezoneRow === "hidden" && agentsRow === "hidden" && signalHomeRow === "hidden") return null;
   const zone = timezone.query.data;
   return (
     <SettingsSection
@@ -353,6 +389,29 @@ export function ServerGeneralSection({ serverId }: { serverId: string }) {
           <Typography.Paragraph>{t("mobile.server.settings.timezone")}</Typography.Paragraph>
         </SettingsRow>
       )}
+      {signalHomeRow === "hidden" ? null : (
+        <SettingsRow
+          leading={<RowIcon icon={RadioTower} />}
+          trailing={
+            signalHomeInUse ? (
+              <TrailingValue
+                tone={signalLatencyTone(signalHomeInUse.latencyMs)}
+                value={
+                  signalHomeInUse.latencyMs === null
+                    ? t("mobile.server.settings.signalHomeNoAnswer")
+                    : t("mobile.server.settings.signalHomeLatency", {
+                        latency: format.number(signalHomeInUse.latencyMs),
+                      })
+                }
+              />
+            ) : undefined
+          }
+          disabled={signalHomeRow === "disabled" || !signalHome.available}
+          onPress={() => router.push({ pathname: "/server-settings/signal-home", params: { serverId } })}
+        >
+          <Typography.Paragraph>{t("mobile.server.route.signalHome")}</Typography.Paragraph>
+        </SettingsRow>
+      )}
       {agentsRow === "hidden" ? null : (
         <SettingsRow
           leading={<RowIcon icon={Bot} />}
@@ -367,27 +426,33 @@ export function ServerGeneralSection({ serverId }: { serverId: string }) {
 }
 
 export function ServerAgentsSection({ serverId }: { serverId: string }) {
-  const {
-    canManageServerPersonality,
-    canManageAgentMemoryLimit,
-    canManageMemoryReview,
-    canManageSkillLearning,
-    canManageBrowsingMemory,
-  } = useMobileWorkspace();
+  const turnLimits = useServerFlag(serverId, "canManageServerTurnLimits");
+  const personality = useServerFlag(serverId, "canManageServerPersonality");
+  const memoryLimit = useServerFlag(serverId, "canManageAgentMemoryLimit");
+  const memoryReview = useServerFlag(serverId, "canManageMemoryReview");
+  const skillLearning = useServerFlag(serverId, "canManageSkillLearning");
+  const browsingMemory = useServerFlag(serverId, "canManageBrowsingMemory");
+  const remoteChatContent = useServerFlag(serverId, "canManageRemoteChatContent");
+  const mediaApprovalCredits = useServerFlag(serverId, "canManageMediaApprovalCredits");
+  const voiceModel = useServerFlag(serverId, "canManageServerVoiceModel");
   return (
     <>
-      {canManageServerPersonality(serverId) ? <ServerPersonalityRow serverId={serverId} /> : null}
-      {canManageAgentMemoryLimit(serverId) ? <ServerMemoryLimitRow serverId={serverId} /> : null}
-      {canManageMemoryReview(serverId) ? <ServerMemoryReviewRow serverId={serverId} /> : null}
-      {canManageSkillLearning(serverId) ? <ServerSkillLearningRow serverId={serverId} /> : null}
-      {canManageBrowsingMemory(serverId) ? <ServerBrowsingMemoryRow serverId={serverId} /> : null}
+      {turnLimits ? <ServerTurnLimitsRows serverId={serverId} /> : null}
+      {personality ? <ServerPersonalityRow serverId={serverId} /> : null}
+      {memoryLimit ? <ServerMemoryLimitRow serverId={serverId} /> : null}
+      {memoryReview ? <ServerMemoryReviewRow serverId={serverId} /> : null}
+      {skillLearning ? <ServerSkillLearningRow serverId={serverId} /> : null}
+      {browsingMemory ? <ServerBrowsingMemoryRow serverId={serverId} /> : null}
+      {remoteChatContent ? <ServerRemoteChatContentRow serverId={serverId} /> : null}
+      {mediaApprovalCredits ? <ServerMediaApprovalCreditsRow serverId={serverId} /> : null}
+      {voiceModel ? <ServerVoiceModelRow serverId={serverId} /> : null}
     </>
   );
 }
 
 export function ServerKeySettings({ server }: { server: MobileServer }) {
   const { t, format } = useText();
-  const keyRow = useServerRows(server.id)((checks) => checks.canRotateServerKey(server.id));
+  const keyRow = useServerRow(server.id, (checks) => checks.canRotateServerKey(server.id));
   const { rotateServerKey, reloadServerList } = useMobileWorkspaceActions();
   const locked = useRef(false);
   const [changing, setChanging] = useState(false);

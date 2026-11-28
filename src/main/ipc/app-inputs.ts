@@ -3,6 +3,7 @@ import type {
   AgentDefaults,
   AgentDockAction,
   AgentDockDragPhase,
+  AgentDockExtent,
   AgentDockInputRect,
   AgentDockPresentation,
   AgentMemoryLimitPreference,
@@ -62,6 +63,7 @@ import {
   isAgentDefaults,
   isAgentDockAction,
   isAgentDockDragPhase,
+  isAgentDockExtent,
   isAgentDockInputRegion,
   isAgentDockInteractive,
   isAgentDockPresentation,
@@ -372,6 +374,11 @@ export function parseAgentDockInputRegion(input: unknown): AgentDockInputRect[] 
   throw new Error("Agent dock input region is invalid.");
 }
 
+export function parseAgentDockExtent(input: unknown): AgentDockExtent | null {
+  if (isAgentDockExtent(input)) return input;
+  throw new Error("Agent dock extent is invalid.");
+}
+
 export function parseDynamicIslandXWayland(input: unknown): SetAgentDockXWaylandInput {
   if (isAgentDockXWayland(input)) return input;
   throw new Error("Dynamic Island XWayland state is required.");
@@ -440,6 +447,7 @@ export function parseExternalDestination(input: unknown): ExternalDestination {
     input !== "grok-bot-export" &&
     input !== "hosted-server-contact" &&
     input !== "download" &&
+    input !== "chrome-extension" &&
     input !== "mac-screen-recording"
   ) {
     throw new Error("Unknown external destination.");

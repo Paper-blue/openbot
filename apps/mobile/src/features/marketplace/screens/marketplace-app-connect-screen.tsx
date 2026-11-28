@@ -9,6 +9,7 @@ import { useEffect, useState } from "react";
 import { Linking, View } from "react-native";
 import { useCSSVariable } from "uniwind";
 import { useMobileSession } from "@/features/auth/context/mobile-session-context";
+import { RELAY_PASTE_PLACEHOLDER } from "@/features/servers/model/use-mcp-sign-in-relay";
 import { SettingsNote, SettingsRow, SettingsSection } from "@/features/settings/components/settings-content";
 import { useMobileWorkspaceSelector } from "@/features/workspace/context/mobile-workspace-context";
 import { SheetFormField } from "@/shared/components/sheet-form-field";
@@ -19,9 +20,8 @@ import { typeScale } from "@/shared/lib/type-scale";
 import { ListingIcon } from "../components/marketplace-parts";
 import { appListings } from "../model/marketplace-listings";
 import { pluginConnectMethod } from "../model/plugin-connect";
+import { useMobilePlugins } from "../model/use-mobile-plugins";
 import { usePluginConnect } from "../model/use-plugin-connect";
-
-const PASTE_PLACEHOLDER = "http://localhost/callback?code=…";
 
 export function MarketplaceAppConnectScreen() {
   const { t } = useText();
@@ -29,7 +29,8 @@ export function MarketplaceAppConnectScreen() {
   const actionForeground = String(useCSSVariable("--openbot-action-foreground"));
   const { serverId, slug } = useLocalSearchParams<{ serverId: string; slug: string }>();
   const { session } = useMobileSession();
-  const listing = session?.apiUrl ? appListings(session.apiUrl).find((item) => item.id === slug) : undefined;
+  const plugins = useMobilePlugins(serverId);
+  const listing = session?.apiUrl ? appListings(session.apiUrl, plugins).find((item) => item.id === slug) : undefined;
   const plugin = listing?.kind === "app" && listing.source === "plugin" ? listing.plugin : null;
   const app = plugin?.apps[0] ?? null;
   const canRelay = useMobileWorkspaceSelector((workspace) => workspace.canRelayMcpSignIn(serverId));
@@ -129,33 +130,36 @@ export function MarketplaceAppConnectScreen() {
               label={t("mobile.marketplace.app.stepOpen", { name: listing.name })}
             />
             <ConnectStep index={1} current={step} label={t("mobile.marketplace.app.stepAllow")} />
-            <ConnectStep
-              index={2}
-              current={step}
-              label={t("mobile.marketplace.app.stepReturn", { name: listing.name })}
-            />
+            {signingIn?.paste ? (
+              <>
+                <ConnectStep index={2} current={step} label={t("mobile.marketplace.app.stepBlank")} />
+                <ConnectStep index={3} current={step} label={t("mobile.marketplace.app.stepCopy")} />
+                <ConnectStep index={4} current={step} label={t("mobile.marketplace.app.stepPaste")} />
+              </>
+            ) : (
+              <ConnectStep
+                index={2}
+                current={step}
+                label={t("mobile.marketplace.app.stepReturn", { name: listing.name })}
+              />
+            )}
           </SettingsSection>
           {signingIn?.paste ? (
-            <View className="gap-3">
-              <Typography.Paragraph type="body-sm" className="px-1 text-grouped-secondary">
-                {t("mobile.marketplace.app.pasteHint")}
-              </Typography.Paragraph>
-              <SheetFormField
-                label={t("mobile.marketplace.app.pasteLabel")}
-                placeholder={PASTE_PLACEHOLDER}
-                value={address}
-                autoCapitalize="none"
-                autoCorrect={false}
-                inputMode="url"
-                onChangeText={setAddress}
-              />
-            </View>
+            <SheetFormField
+              label={t("mobile.marketplace.app.pasteLabel")}
+              placeholder={RELAY_PASTE_PLACEHOLDER}
+              value={address}
+              autoCapitalize="none"
+              autoCorrect={false}
+              inputMode="url"
+              onChangeText={setAddress}
+            />
           ) : null}
           {signingIn?.paste ? (
             <Button
               className="bg-action"
               feedbackVariant="scale"
-              isDisabled={!address.trim()}
+              isDisabled={!address.trim() || connect.pasting}
               onPress={() => void connect.paste(address)}
             >
               <Button.Label className="text-action-foreground">{t("mobile.marketplace.app.finishSignIn")}</Button.Label>

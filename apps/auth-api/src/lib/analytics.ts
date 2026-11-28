@@ -10,6 +10,7 @@ import {
 import { isBoolean, isOneOf } from "@openbot/contracts/runtime-values";
 import { OpenPanel, OpenPanelBase, type OpenPanelOptions, type TrackProperties } from "@openpanel/web";
 import { BRAND_ROUTE } from "./brand-page";
+import { CHROME_EXTENSION } from "./browser-extension";
 import { CLA_ROUTE } from "./cla";
 import { COMMERCIAL_LICENSE_ROUTE } from "./commercial-license";
 import { CONTACT_TOPICS } from "./contact";
@@ -28,7 +29,7 @@ import { MARKETPLACE_TAB_ROUTES } from "./marketplace-routes";
 import { MOBILE_APPS } from "./mobile-apps";
 import { PRICING_ROUTE } from "./pricing-page";
 import { PRIVACY_POLICY_ROUTE } from "./privacy-policy";
-import { pagePaths } from "./site-paths";
+import { localizedPagePath, TRANSLATED_SITE_LOCALES } from "./site-paths";
 import { TEAMS_ROUTE } from "./teams-page";
 import { TERMS_ROUTE } from "./terms";
 
@@ -45,8 +46,13 @@ export interface ArticleReference {
   slug: string;
 }
 
-export type BillingReturnKind = "plan" | "license" | "portal";
-export const BILLING_RETURN_KINDS = ["plan", "license", "portal"] as const satisfies readonly BillingReturnKind[];
+export type BillingReturnKind = "plan" | "license" | "portal" | "credits";
+export const BILLING_RETURN_KINDS = [
+  "plan",
+  "license",
+  "portal",
+  "credits",
+] as const satisfies readonly BillingReturnKind[];
 type BillingReturnOutcome = "completed" | "cancelled";
 
 type ContactTopicId = (typeof CONTACT_TOPICS)[number]["id"];
@@ -97,7 +103,7 @@ const LANDING_PLACEMENTS = [
   "content_related",
   "other",
 ] as const satisfies readonly LandingPlacement[];
-type LandingDownloadPlatform = "linux" | "macos" | "windows" | "ios" | "android";
+type LandingDownloadPlatform = "linux" | "macos" | "windows" | "ios" | "android" | "chrome";
 type LandingDestination =
   | "download_page"
   | "download_section"
@@ -214,6 +220,7 @@ const DOWNLOAD_PLATFORMS_BY_HREF = new Map<string, LandingDownloadPlatform>([
   [MOBILE_APPS.ios.href, "ios"],
   [MOBILE_APPS.android.href, "android"],
   [OPENBOT_ANDROID_APK_LINK, "android"],
+  [CHROME_EXTENSION.href, "chrome"],
 ]);
 
 const LINK_DESTINATIONS = new Map<string, LandingDestination>([
@@ -224,12 +231,11 @@ const LINK_DESTINATIONS = new Map<string, LandingDestination>([
   [OPENBOT_LINKS.contact, "contact"],
   [TEAMS_ROUTE, "teams"],
   [PRICING_ROUTE, "pricing"],
-  [pagePaths("/contact").pl, "contact"],
-  [pagePaths("/teams").pl, "teams"],
-  [pagePaths("/pricing").pl, "pricing"],
-  [pagePaths("/contact").pt, "contact"],
-  [pagePaths("/teams").pt, "teams"],
-  [pagePaths("/pricing").pt, "pricing"],
+  ...TRANSLATED_SITE_LOCALES.flatMap((locale) => [
+    [localizedPagePath(locale, "/contact"), "contact"] as const,
+    [localizedPagePath(locale, "/teams"), "teams"] as const,
+    [localizedPagePath(locale, "/pricing"), "pricing"] as const,
+  ]),
   [OPENBOT_LINKS.x, "x"],
   [OPENBOT_LINKS.threads, "threads"],
   [OPENBOT_LINKS.linkedin, "linkedin"],
@@ -481,7 +487,7 @@ function isSafeLandingProperty(name: LandingEventName, key: string, value: unkno
   if (key === "depth") return isOneOf(["start", "half", "end"] as const, value);
   if (key === "platform") {
     if (name === "join_page_action") return isOneOf(DOWNLOAD_PLATFORM_ORDER, value);
-    return isOneOf(["linux", "macos", "windows", "ios", "android"] as const, value);
+    return isOneOf(["linux", "macos", "windows", "ios", "android", "chrome"] as const, value);
   }
   if (key === "placement") return isOneOf(LANDING_PLACEMENTS, value);
   if (key === "destination") return [...LINK_DESTINATIONS.values()].some((destination) => destination === value);

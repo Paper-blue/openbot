@@ -19,7 +19,8 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import { useQueryScope } from "@/features/auth/context/mobile-session-context";
-import { useTurnStepLines } from "@/features/workspace/components/use-agent-activity";
+import { useRemoteChatContent } from "@/features/servers/model/use-remote-chat-content";
+import { useTurnStepLinesOf } from "@/features/workspace/components/use-agent-activity";
 import { useMobileWorkspaceSelector } from "@/features/workspace/context/mobile-workspace-context";
 import { queryKeys } from "@/features/workspace/model/query-keys";
 import { SheetScrollView } from "@/shared/components/sheet-scroll-view";
@@ -90,6 +91,7 @@ interface TimelineStepProps {
   accent: string;
   rail: string;
   reducedMotion: boolean;
+  remoteContent: boolean;
   onLayout: (id: string, y: number) => void;
 }
 
@@ -108,6 +110,7 @@ const TimelineStep = memo(
     accent,
     rail,
     reducedMotion,
+    remoteContent,
     onLayout,
   }: TimelineStepProps) {
     const { sourceText } = useText();
@@ -141,6 +144,7 @@ const TimelineStep = memo(
               animationEnabled={step.streaming}
               selectable
               linkFavicons={false}
+              remoteContent={remoteContent}
             />
           ) : (
             <Typography.Paragraph type="body-sm" className="text-muted">
@@ -160,6 +164,7 @@ const TimelineStep = memo(
     left.accent === right.accent &&
     left.rail === right.rail &&
     left.reducedMotion === right.reducedMotion &&
+    left.remoteContent === right.remoteContent &&
     left.onLayout === right.onLayout,
 );
 
@@ -210,9 +215,11 @@ export function TurnThinkingScreen() {
     ),
   );
   const serverId = serverParam ?? agent?.serverId ?? "";
+  const remoteContent = useRemoteChatContent(serverId);
   const { messages, activeTurnId, hasOlder, olderLoading, olderError } = useTurnConversation(agentId, serverId, taskId);
   const loadOlderMessages = useMobileWorkspaceSelector((current) => current.loadOlderMessages);
-  const lines = useTurnStepLines(serverId)[turnId];
+  const shownTurnIds = useMemo(() => [turnId], [turnId]);
+  const lines = useTurnStepLinesOf(serverId, shownTurnIds)[turnId];
   const steps = useMemo(() => turnThinkingSteps(messages, turnId, lines), [messages, turnId, lines]);
   const times = useMemo(() => turnTimes(messages, turnId), [messages, turnId]);
   const running = activeTurnId === turnId;
@@ -398,6 +405,7 @@ export function TurnThinkingScreen() {
                 accent={accent}
                 rail={rail}
                 reducedMotion={reducedMotion}
+                remoteContent={remoteContent}
                 onLayout={onStepLayout}
               />
             ))

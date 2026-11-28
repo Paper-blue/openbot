@@ -526,6 +526,42 @@ export const MOBILE_PLUGINS: readonly MobilePlugin[] = [
     ],
   },
   {
+    slug: "mem0",
+    name: "Mem0",
+    tagline: "Memory layer for AI agents",
+    description:
+      "Mem0 gives agents a long-term memory in your Mem0 account. Agents add facts and preferences, search them by meaning, and update or delete them. Other AI tools that you connect to Mem0 share the same memories. To make Mem0 the only memory of an agent, turn off OpenBot memory in the agent's settings. What agents save goes to your Mem0 account.",
+    category: "productivity",
+    creatorName: "Mem0",
+    version: "1.0.0",
+    prompts: [
+      { id: "prompt-recall", text: "Search Mem0 for what you know about my current projects before we start." },
+      { id: "prompt-save", text: "Add to Mem0 that I prefer short status updates with the open questions first." },
+      {
+        id: "prompt-clean",
+        text: "List my Mem0 memories about the old office and delete the ones that are out of date.",
+      },
+    ],
+    websiteUrl: "https://mem0.ai",
+    privacyPolicyUrl: "https://mem0.ai/privacy",
+    termsUrl: "https://mem0.ai/terms",
+    featured: false,
+    apps: [
+      {
+        id: "app-mem0-mcp",
+        name: "Mem0",
+        description:
+          "Add, search, update and delete memories in your Mem0 account over Mem0's MCP server with browser sign-in.",
+        server: {
+          name: "mem0",
+          transport: "http",
+          url: "https://mcp.mem0.ai/mcp/",
+          auth: [{ id: "mem0-oauth", kind: "link", label: "Sign in" }],
+        },
+      },
+    ],
+  },
+  {
     slug: "figma",
     name: "Figma",
     tagline: "Designs and prototypes",
@@ -3217,6 +3253,62 @@ export const MOBILE_PLUGINS: readonly MobilePlugin[] = [
     ],
   },
   {
+    slug: "coinmarketcap",
+    name: "CoinMarketCap",
+    tagline: "Crypto market data and news",
+    description:
+      "CoinMarketCap lets agents read crypto prices, market data, technical indicators, on-chain metrics, market sentiment, and crypto news from CoinMarketCap. Each user signs in to their own CoinMarketCap account through the browser, or connects with an API key. A free account includes monthly credits. The tools only read data: they cannot trade or move funds.",
+    category: "data-analytics",
+    creatorName: "CoinMarketCap",
+    version: "1.0.0",
+    prompts: [
+      {
+        id: "prompt-price",
+        text: "What are the current prices of Bitcoin and Ethereum, and how did they change in the last 7 days?",
+      },
+      {
+        id: "prompt-market",
+        text: "Give me a market overview: total market cap, Bitcoin dominance, and the Fear and Greed index.",
+      },
+      { id: "prompt-rsi", text: "Show the 14-day RSI and MACD for Solana, and tell me what they suggest." },
+    ],
+    websiteUrl: "https://coinmarketcap.com",
+    privacyPolicyUrl: "https://coinmarketcap.com/privacy",
+    termsUrl: "https://coinmarketcap.com/terms",
+    featured: false,
+    apps: [
+      {
+        id: "app-coinmarketcap-mcp",
+        name: "CoinMarketCap",
+        description:
+          "Crypto prices, market data, indicators and news, over CoinMarketCap's MCP server with browser sign-in or an API key.",
+        server: {
+          name: "coinmarketcap",
+          transport: "http",
+          url: "https://mcp.coinmarketcap.com/mcp",
+          auth: [
+            { id: "coinmarketcap-oauth", kind: "link", label: "Sign in" },
+            {
+              id: "coinmarketcap-key",
+              kind: "key",
+              label: "API key",
+              fields: [
+                {
+                  id: "api-key",
+                  label: "API key",
+                  header: "X-CMC-MCP-API-KEY",
+                  hint: "In CoinMarketCap, open API > Dashboard > API Keys and copy your key.",
+                },
+              ],
+              docsUrl: "https://coinmarketcap.com/api/dashboard/api-keys/",
+              docsLabel: "Get a key",
+            },
+          ],
+        },
+      },
+    ],
+  },
+  {
     slug: "convex",
     name: "Convex",
     tagline: "Convex app setup guidance",
@@ -3404,6 +3496,39 @@ export const MOBILE_PLUGINS: readonly MobilePlugin[] = [
           transport: "http",
           url: "https://mcp.datadoghq.com/v1/mcp",
           auth: [{ id: "datadog-oauth", kind: "link", label: "Sign in" }],
+        },
+      },
+    ],
+  },
+  {
+    slug: "datadog-eu",
+    name: "Datadog EU",
+    tagline: "Monitoring, logs and traces",
+    description:
+      "Datadog EU lets agents search logs, metrics, traces, monitors, dashboards and incidents in the organization of the signed-in account. Each user signs in to their own Datadog account on the EU site (datadoghq.eu) through the browser.",
+    category: "coding",
+    creatorName: "Datadog",
+    version: "1.0.0",
+    prompts: [
+      { id: "prompt-errors", text: "Which services had the most errors in the last hour?" },
+      { id: "prompt-monitor", text: "Why is the checkout latency monitor alerting?" },
+      { id: "prompt-incident", text: "Summarize the open incidents and their status." },
+    ],
+    websiteUrl: "https://www.datadoghq.com",
+    privacyPolicyUrl: "https://www.datadoghq.com/legal/privacy/",
+    termsUrl: "https://www.datadoghq.com/legal/terms/",
+    featured: false,
+    apps: [
+      {
+        id: "app-datadog-eu-mcp",
+        name: "Datadog EU",
+        description:
+          "Logs, metrics, traces, monitors, and incidents, over Datadog's EU MCP server with browser sign-in.",
+        server: {
+          name: "datadog-eu",
+          transport: "http",
+          url: "https://mcp.datadoghq.eu/v1/mcp",
+          auth: [{ id: "datadog-eu-oauth", kind: "link", label: "Sign in" }],
         },
       },
     ],

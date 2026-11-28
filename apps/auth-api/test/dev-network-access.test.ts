@@ -17,6 +17,7 @@ describe("development Auth API LAN access", () => {
       "/v1/me/analytics",
       "/v1/me/chat-color",
       "/v1/me/avatar",
+      "/v1/me/credits/transfer",
       "/v1/mobile/features?platform=ios&version=1.2.0",
       "/v1/mobile/changelog?platform=ios&after=1.4.1",
       "/v1/avatars/user-id?v=photo-version",
@@ -32,6 +33,15 @@ describe("development Auth API LAN access", () => {
       "/v2/remote/hosts/host-1/members/member-1",
       "/v2/remote/hosts/host-1/logo?v=logo-version",
       "/v2/remote/hosts/host-1/appearance",
+      "/v2/remote/hosts/host-1/hidden",
+      "/v2/remote/hosts/host-1/owner-transfer",
+      "/v2/remote/owner-transfers/",
+      "/v2/remote/owner-transfers/transfer-1/accept",
+      "/v2/remote/owner-transfers/transfer-1/decline",
+      "/v2/remote/watch/sessions",
+      "/v2/remote/watch/sessions/",
+      "/v2/remote/watch/sessions/watch-session-1",
+      "/v2/remote/watch/ticket",
       "/v1/agent-templates/AbCdEfGhIjKlMnOpQrSt_-",
       "/v1/agent-templates/AbCdEfGhIjKlMnOpQrSt_-/avatar",
       "/v2/hosting/plans",
@@ -55,6 +65,11 @@ describe("development Auth API LAN access", () => {
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v1/agent-templates/mine")).toBe(false);
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v1/agent-templates/template-id/card")).toBe(false);
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/remote/hosts/register")).toBe(false);
+    expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/remote/watch/sessions/watch-session-1/other")).toBe(
+      false,
+    );
+    expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/remote/watch/ticket/other")).toBe(false);
+    expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/remote/watch/other")).toBe(false);
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/remote/hosts/host-1/slack-route")).toBe(false);
     for (const path of [
       "/v2/remote/hosts/host-1/telegram-link",
@@ -68,6 +83,17 @@ describe("development Auth API LAN access", () => {
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/slack/authorize")).toBe(false);
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/remote/hosts/host-1/logo/other")).toBe(false);
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/remote/hosts/host-1/appearance/other")).toBe(false);
+    expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/remote/hosts/host-1/hidden/other")).toBe(false);
+    for (const path of [
+      "/v2/remote/hosts/host-1/owner-transfer/other",
+      "/v2/remote/hosts/host-1/owner-transfers",
+      "/v2/remote/owner-transfers/transfer-1",
+      "/v2/remote/owner-transfers/transfer-1/other",
+      "/v2/remote/owner-transfers/transfer-1/accept/other",
+      "/v2/remote/owner-transfers/accept",
+    ]) {
+      expect(developmentNetworkRequestAllowed("192.168.1.20", path)).toBe(false);
+    }
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/remote/sessions/session-1/other")).toBe(false);
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/hosting/servers/server-1/activity")).toBe(false);
     expect(developmentNetworkRequestAllowed("192.168.1.20", "/v2/hosting/servers/server-1")).toBe(false);
@@ -83,6 +109,7 @@ describe("development Auth API LAN access", () => {
       "/v1/marketplace/agents/listing-1",
       "/v1/marketplace/agents/listing-1/avatar",
       "/plugins/icon/linear?app=linear",
+      "/v1/plugins/catalog",
     ]) {
       expect(developmentNetworkRequestAllowed("192.168.1.20", path)).toBe(true);
     }
@@ -98,6 +125,8 @@ describe("development Auth API LAN access", () => {
       "/v1/marketplace",
       "/plugins/linear",
       "/plugins/icon/linear/other",
+      "/v1/plugins/catalog/extra",
+      "/v1/plugins",
     ]) {
       expect(developmentNetworkRequestAllowed("192.168.1.20", path)).toBe(false);
     }

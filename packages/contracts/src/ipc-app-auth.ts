@@ -20,6 +20,7 @@ export interface AppInfo {
   softwareRendering?: boolean;
   hourCycle?: HourCycle;
   aboveAppsSupport?: AboveAppsSupport;
+  dynamicIslandUnavailable?: boolean;
 }
 
 export const UPDATE_PHASES = [
@@ -425,4 +426,5 @@ export type ExternalDestination =
   | "grok-bot-export"
   | "hosted-server-contact"
   | "download"
+  | "chrome-extension"
   | "mac-screen-recording";

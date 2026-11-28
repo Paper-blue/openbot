@@ -75,6 +75,12 @@
       "detailSha256": "8ecc544dca109f960949c8ae554a61fc49246c4fa61d419b139ecbdae1f95b37"
     },
     {
+      "slug": "mem0",
+      "version": "1.0.0",
+      "featured": false,
+      "detailSha256": "1e2cdabd40b600c6853d645cba552d619ce92ab196a3c52ad6493ed6f506e0a9"
+    },
+    {
       "slug": "figma",
       "version": "1.1.0",
       "featured": true,
@@ -543,6 +549,12 @@
       "detailSha256": "8e560e0e2fb19409ff956ac7978867530dcf75a97629956d2e090f77aa2c27a9"
     },
     {
+      "slug": "coinmarketcap",
+      "version": "1.0.0",
+      "featured": false,
+      "detailSha256": "ada077098e78b447a73bd7c8433f25b83e55762dbdebc9417df06206cd55a382"
+    },
+    {
       "slug": "convex",
       "version": "1.0.0",
       "featured": false,
@@ -577,6 +589,12 @@
       "version": "1.0.0",
       "featured": false,
       "detailSha256": "1babf747acf9d8791b437547ca1abe65a7dd49778b49170c5a7249e66d0988fc"
+    },
+    {
+      "slug": "datadog-eu",
+      "version": "1.0.0",
+      "featured": false,
+      "detailSha256": "7c0875986a3df7e4e01b33067a9df194d1229e3d942cd7d61848cf3f78d43675"
     },
     {
       "slug": "dataforseo",

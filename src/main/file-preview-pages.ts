@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { extname, join, relative, sep } from "node:path";
 import { CHAT_VISUAL_PAGE_LIMIT, isChatVisualMimeType } from "@openbot/contracts/chat-visual";
+import { ATTACHMENT_LIMITS } from "@openbot/contracts/input-limits";
 import { isFilePreviewPageUrl } from "@openbot/contracts/ipc";
 import { runCauseEffect } from "../backend/effect-boundary";
 import { isPathInside } from "../backend/path-containment";
-import { attachmentDocumentHeaders, chatVisualResponse } from "./chat-visual-protocol";
+import { attachmentDocumentHeaders, chatVisualResponse, staticChatVisualOptions } from "./chat-visual-protocol";
+import { inlineContentDisposition } from "./content-disposition";
 import { fileResponse } from "./file-response";
 
 const FILE_PREVIEW_PAGE_CAPACITY = 8;
@@ -23,7 +25,29 @@ const PAGE_ASSET_TYPES: Readonly<Record<string, string>> = {
 
 interface FilePreviewPage {
   bytes: Uint8Array;
+  pdf: boolean;
   folder?: string;
+  name?: string;
+}
+
+function isPdfMimeType(mimeType: string): boolean {
+  return (mimeType.split(";", 1)[0] ?? "").trim().toLowerCase() === "application/pdf";
+}
+
+function pageByteLimit(mimeType: string): number {
+  if (isPdfMimeType(mimeType)) return ATTACHMENT_LIMITS.fileBytes;
+  return isChatVisualMimeType(mimeType) ? CHAT_VISUAL_PAGE_LIMIT : -1;
+}
+
+function pdfResponse(bytes: Uint8Array, name = ""): Response {
+  return new Response(new Uint8Array(bytes), {
+    headers: {
+      "Content-Type": "application/pdf",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Disposition": inlineContentDisposition(name),
+    },
+  });
 }
 
 function pageAssetType(path: string): string | undefined {
@@ -46,16 +70,20 @@ export class FilePreviewPages {
     this.#pages.clear();
   }
 
-  add(mimeType: string, bytes: Uint8Array, generation: number, folder?: string): string | undefined {
+  add(mimeType: string, bytes: Uint8Array, generation: number, folder?: string, name?: string): string | undefined {
     if (
       generation !== this.#generation ||
-      !isChatVisualMimeType(mimeType) ||
-      bytes.byteLength > CHAT_VISUAL_PAGE_LIMIT ||
+      bytes.byteLength > pageByteLimit(mimeType) ||
       this.#pages.size >= this.capacity
     )
       return undefined;
     const address = `openbot-visual://preview/${randomUUID()}`;
-    this.#pages.set(address, { bytes: bytes.slice(), ...(folder ? { folder } : {}) });
+    this.#pages.set(address, {
+      bytes: bytes.slice(),
+      pdf: isPdfMimeType(mimeType),
+      ...(folder ? { folder } : {}),
+      ...(name ? { name } : {}),
+    });
     return address;
   }
 
@@ -64,7 +92,7 @@ export class FilePreviewPages {
   }
 
   #page(url: URL): FilePreviewPage | undefined {
-    if (url.username || url.password || url.search) return undefined;
+    if (url.username || url.password || (url.search && !staticChatVisualOptions(url))) return undefined;
     const address = `${url.protocol}//${url.host}${url.pathname}`;
     if (!isFilePreviewPageUrl(address)) return undefined;
     return this.#pages.get(address);
@@ -77,12 +105,13 @@ export class FilePreviewPages {
   async response(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const page = request.method === "GET" ? this.#page(url) : undefined;
+    if (page?.pdf) return pdfResponse(page.bytes, page.name);
     if (page) {
       const base =
         page.folder && !/<base\b[^>]*\bhref\s*=/iu.test(new TextDecoder().decode(page.bytes))
           ? `<base href="${url.protocol}//${url.host}${url.pathname}/">`
           : undefined;
-      return chatVisualResponse(page.bytes, base ? { head: base } : {});
+      return chatVisualResponse(page.bytes, base ? { head: base } : {}, staticChatVisualOptions(url));
     }
     const asset = request.method === "GET" ? await this.#asset(url) : undefined;
     return asset ?? new Response("Not found", { status: 404 });

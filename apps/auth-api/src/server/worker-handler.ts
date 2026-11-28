@@ -1,10 +1,18 @@
 import { Effect, Result } from "effect";
 import { routeRequest as routeHostedSiteRequest } from "../../../site-router/src/index";
-import { createAccountAnalytics } from "./account-analytics";
+import { passkeyWalletHostResponse } from "../lib/near-sign-csp";
+import { OPENBOT_SECURITY_HEADERS, OPENBOT_SITE_URL } from "../lib/site-metadata";
+import { sendAccountActivitySnapshots } from "./account-activity";
+import { createAccountAnalytics, createAccountEventDelivery } from "./account-analytics";
 import { type AuthRetentionResult, pruneExpiredAuthData } from "./auth-data-retention";
 import { BillingSales } from "./billing-sales";
+import { BillingService } from "./billing-service";
 import { captureBillingSnapshot } from "./billing-snapshots";
 import { canonicalHostRedirect, permanentTrailingSlashRedirect } from "./canonical-redirect";
+import { CreditAudit } from "./credit-audit";
+import { CreditGrants } from "./credit-grants";
+import { CreditMediaService } from "./credit-media-service";
+import { withD1RequestSession } from "./d1-request-session";
 import { runApiEffect } from "./effect-runtime";
 import { createHostedBilling } from "./hosted-billing";
 import { createHostedPoolAlert } from "./hosted-pool-alert";
@@ -12,7 +20,8 @@ import { readHostedPool } from "./hosted-pool-snapshot";
 import type { HostedServerBindings } from "./hosted-server-service";
 import { HostedSiteService } from "./hosted-site-service";
 import { enforceMarketplaceIngress, MarketplaceRateLimitError } from "./marketplace-request-policy";
-import { observedD1 } from "./observed-d1";
+import { mediaGatewayFromBinding } from "./media-gateway";
+import { d1OverloadedRecently, observedD1 } from "./observed-d1";
 import { pageMarkdownResponse } from "./page-markdown";
 import {
   deliverPendingRemoteAuthEvents,
@@ -29,6 +38,25 @@ type AuthDataPruner = typeof pruneExpiredAuthData;
 type RetentionLogger = (result: AuthRetentionResult) => void;
 type WorkerExecutionContext = Pick<ExecutionContext, "waitUntil">;
 type RemoteAuthEventDelivery = typeof deliverPendingRemoteAuthEvents;
+type WorkerFetchBindings = Pick<WorkerBindings, "MARKETPLACE_INGRESS_RATE_LIMITER"> &
+  Partial<
+    Pick<WorkerBindings, "SITES" | "SITE_LOCAL_ORIGIN" | "DB" | "OPENPANEL_CLIENT_ID" | "OPENPANEL_CLIENT_SECRET">
+  >;
+
+const OVERLOAD_RETRY_AFTER_MIN_SECONDS = 10;
+const OVERLOAD_RETRY_AFTER_SPREAD_SECONDS = 20;
+
+function withOverloadRetryAfter(response: Response): Response {
+  if (response.status !== 500 || response.headers.has("Retry-After") || !d1OverloadedRecently(Date.now())) {
+    return response;
+  }
+  const delayed = new Response(response.body, response);
+  delayed.headers.set(
+    "Retry-After",
+    String(OVERLOAD_RETRY_AFTER_MIN_SECONDS + Math.floor(Math.random() * (OVERLOAD_RETRY_AFTER_SPREAD_SECONDS + 1))),
+  );
+  return delayed;
+}
 
 export function createWorkerHandler(
   fetchHandler: WorkerFetch,
@@ -36,62 +64,65 @@ export function createWorkerHandler(
   log: RetentionLogger = logRetentionResult,
   deliverRemoteAuthEvents: RemoteAuthEventDelivery = deliverPendingRemoteAuthEvents,
 ) {
-  return {
-    async fetch(
-      request: Request,
-      workerBindings: Pick<WorkerBindings, "MARKETPLACE_INGRESS_RATE_LIMITER"> &
-        Partial<
-          Pick<WorkerBindings, "SITES" | "SITE_LOCAL_ORIGIN" | "DB" | "OPENPANEL_CLIENT_ID" | "OPENPANEL_CLIENT_SECRET">
-        >,
-      context?: WorkerExecutionContext,
-    ) {
-      const bindings = workerBindings.DB ? { ...workerBindings, DB: observedD1(workerBindings.DB) } : workerBindings;
-      const hostRedirect = canonicalHostRedirect(request);
-      if (hostRedirect) return hostRedirect;
-      if (request.method === "GET" && new URL(request.url).pathname === "/billing/checkout-return") {
-        return runApiEffect(checkoutReturnResponse(request, bindings));
-      }
-      const earlyResponse = await runApiEffect(
-        Effect.gen(function* () {
-          const localSiteResponse = yield* serveLocalHostedSite(request, bindings);
-          if (localSiteResponse) return localSiteResponse;
-          yield* enforceMarketplaceIngress(request, bindings);
-          return null;
-        }).pipe(
-          Effect.catchIf(
-            (error) => error instanceof MarketplaceRateLimitError,
-            (error) =>
-              Effect.succeed(
-                Response.json(
-                  { error: { code: error.code, message: error.message } },
-                  {
-                    status: error.status,
-                    headers: {
-                      "Cache-Control": "no-store",
-                      "Retry-After": String(error.retryAfterSeconds),
-                      "X-Content-Type-Options": "nosniff",
-                    },
+  async function handleFetch(
+    request: Request,
+    workerBindings: WorkerFetchBindings,
+    context: WorkerExecutionContext | undefined,
+  ): Promise<Response> {
+    const bindings = workerBindings.DB ? { ...workerBindings, DB: observedD1(workerBindings.DB) } : workerBindings;
+    const hostRedirect = canonicalHostRedirect(request) ?? passkeyWalletHostResponse(request, OPENBOT_SITE_URL);
+    if (hostRedirect) return hostRedirect;
+    if (request.method === "GET" && new URL(request.url).pathname === "/billing/checkout-return") {
+      return runApiEffect(checkoutReturnResponse(request, bindings));
+    }
+    const earlyResponse = await runApiEffect(
+      Effect.gen(function* () {
+        const localSiteResponse = yield* serveLocalHostedSite(request, bindings);
+        if (localSiteResponse) return localSiteResponse;
+        yield* enforceMarketplaceIngress(request, bindings);
+        return null;
+      }).pipe(
+        Effect.catchIf(
+          (error) => error instanceof MarketplaceRateLimitError,
+          (error) =>
+            Effect.succeed(
+              Response.json(
+                { error: { code: error.code, message: error.message } },
+                {
+                  status: error.status,
+                  headers: {
+                    "Cache-Control": "no-store",
+                    "Retry-After": String(error.retryAfterSeconds),
+                    "X-Content-Type-Options": "nosniff",
                   },
-                ),
+                },
               ),
-          ),
+            ),
+        ),
+      ),
+    );
+    if (earlyResponse) return earlyResponse;
+    const markdown = await pageMarkdownResponse(request, fetchHandler);
+    if (markdown) return markdown;
+    const response = Promise.resolve(fetchHandler(request)).then((result) =>
+      withOverloadRetryAfter(permanentTrailingSlashRedirect(request, result)),
+    );
+    if (context && isEmailSignInStart(request)) {
+      context.waitUntil(
+        response.then(
+          () => undefined,
+          () => undefined,
         ),
       );
-      if (earlyResponse) return earlyResponse;
-      const markdown = await pageMarkdownResponse(request, fetchHandler);
-      if (markdown) return markdown;
-      const response = Promise.resolve(fetchHandler(request)).then((result) =>
-        permanentTrailingSlashRedirect(request, result),
+    }
+    return response;
+  }
+
+  return {
+    async fetch(request: Request, workerBindings: WorkerFetchBindings, context?: WorkerExecutionContext) {
+      return withStrictTransportSecurity(
+        await withD1RequestSession(request, workerBindings.DB, () => handleFetch(request, workerBindings, context)),
       );
-      if (context && isEmailSignInStart(request)) {
-        context.waitUntil(
-          response.then(
-            () => undefined,
-            () => undefined,
-          ),
-        );
-      }
-      return response;
     },
     async scheduled(
       controller: Pick<ScheduledController, "scheduledTime"> & Partial<Pick<ScheduledController, "cron">>,
@@ -121,11 +152,36 @@ export function createWorkerHandler(
             ),
             Effect.exit(tickSalesAnalytics(bindings, now)),
             Effect.exit(tickHostedPool(bindings, now)),
+            Effect.exit(tickReferralCredit(bindings)),
+            Effect.exit(tickCreditHolds(bindings, now)),
+            Effect.exit(tickCreditGrants(bindings, now)),
+            Effect.exit(tickAccountActivity(bindings, now)),
           ],
           { concurrency: "unbounded" },
         ).pipe(
-          Effect.flatMap(([retentionExit, deliveryExit, sitesExit, salesExit, poolExit]) =>
-            Effect.all([retentionExit, deliveryExit, sitesExit, salesExit, poolExit]),
+          Effect.flatMap(
+            ([
+              retentionExit,
+              deliveryExit,
+              sitesExit,
+              salesExit,
+              poolExit,
+              referralExit,
+              holdsExit,
+              grantsExit,
+              activityExit,
+            ]) =>
+              Effect.all([
+                retentionExit,
+                deliveryExit,
+                sitesExit,
+                salesExit,
+                poolExit,
+                referralExit,
+                holdsExit,
+                grantsExit,
+                activityExit,
+              ]),
           ),
         ),
       );
@@ -133,6 +189,15 @@ export function createWorkerHandler(
       if (sites) console.info("Hosted site cleanup completed.", sites);
     },
   } satisfies ExportedHandler<WorkerBindings>;
+}
+
+const STRICT_TRANSPORT_SECURITY = "Strict-Transport-Security";
+
+function withStrictTransportSecurity(response: Response): Response {
+  if (response.status === 101 || response.headers.has(STRICT_TRANSPORT_SECURITY)) return response;
+  const copy = new Response(response.body, response);
+  copy.headers.set(STRICT_TRANSPORT_SECURITY, OPENBOT_SECURITY_HEADERS[STRICT_TRANSPORT_SECURITY]);
+  return copy;
 }
 
 async function runSignalEntryCheck(bindings: Partial<SignalEntryBindings>): Promise<void> {
@@ -173,10 +238,21 @@ const tickSalesAnalytics = Effect.fn("SalesAnalytics.tick")(function* (bindings:
   yield* snapshot;
 });
 
-const tickHostedPool = Effect.fn("HostedPool.tick")(function* (bindings: SalesBindings, now: number) {
-  if (!bindings.OPENPANEL_CLIENT_ID?.trim() || !bindings.OPENPANEL_CLIENT_SECRET?.trim()) return;
-  const groups = yield* readHostedPool(bindings.DB, now);
-  if (groups.length === 0) return;
+const tickReferralCredit = Effect.fn("ReferralCredit.tick")(function* (bindings: SalesBindings) {
+  const secretKey = bindings.STRIPE_SECRET_KEY?.trim();
+  if (!secretKey) return;
+  const billing = new BillingService({
+    database: bindings.DB,
+    secretKey,
+    webhookSecret: null,
+    fetch: (input, init) => fetch(input, init),
+  });
+  yield* billing.releaseReferralCredit();
+});
+
+type AnalyticsBindings = Pick<WorkerBindings, "DB" | "OPENPANEL_CLIENT_ID" | "OPENPANEL_CLIENT_SECRET">;
+
+function tickAnalytics(bindings: AnalyticsBindings) {
   const sends: Effect.Effect<void>[] = [];
   const analytics = createAccountAnalytics({
     clientId: bindings.OPENPANEL_CLIENT_ID,
@@ -185,8 +261,51 @@ const tickHostedPool = Effect.fn("HostedPool.tick")(function* (bindings: SalesBi
     schedule: (send) => sends.push(send),
     database: bindings.DB,
   });
+  return { analytics, flush: Effect.suspend(() => Effect.all(sends, { concurrency: "unbounded", discard: true })) };
+}
+
+const tickCreditHolds = Effect.fn("CreditHolds.tick")(function* (
+  bindings: AnalyticsBindings & { MEDIA_GATEWAY?: Fetcher | undefined },
+  now: number,
+) {
+  const { analytics, flush } = tickAnalytics(bindings);
+  const result = yield* new CreditMediaService({
+    database: bindings.DB,
+    gateway: mediaGatewayFromBinding(bindings.MEDIA_GATEWAY),
+    now: () => now,
+    analytics,
+  })
+    .sweep()
+    .pipe(Effect.ensuring(flush));
+  const auditPruned = yield* new CreditAudit(bindings.DB, () => now).prune();
+  if (Object.values(result).some(Boolean) || auditPruned > 0)
+    console.info("Credit hold sweep completed.", { ...result, auditPruned });
+});
+
+const tickCreditGrants = Effect.fn("CreditGrants.tick")(function* (bindings: AnalyticsBindings, now: number) {
+  const { analytics, flush } = tickAnalytics(bindings);
+  const result = yield* new CreditGrants({ database: bindings.DB, now: () => now, analytics })
+    .sweep()
+    .pipe(Effect.ensuring(flush));
+  if (Object.values(result).some(Boolean)) console.info("Credit grant sweep completed.", result);
+});
+
+const tickAccountActivity = Effect.fn("AccountActivity.tick")(function* (bindings: AnalyticsBindings, now: number) {
+  const deliver = createAccountEventDelivery({
+    clientId: bindings.OPENPANEL_CLIENT_ID,
+    clientSecret: bindings.OPENPANEL_CLIENT_SECRET,
+    fetch: (input, init) => fetch(input, init),
+  });
+  yield* sendAccountActivitySnapshots(bindings.DB, deliver, now);
+});
+
+const tickHostedPool = Effect.fn("HostedPool.tick")(function* (bindings: SalesBindings, now: number) {
+  if (!bindings.OPENPANEL_CLIENT_ID?.trim() || !bindings.OPENPANEL_CLIENT_SECRET?.trim()) return;
+  const groups = yield* readHostedPool(bindings.DB, now);
+  if (groups.length === 0) return;
+  const { analytics, flush } = tickAnalytics(bindings);
   for (const group of groups) analytics.track(null, { name: "hosted_pool_snapshot", group });
-  yield* Effect.all(sends, { concurrency: "unbounded", discard: true });
+  yield* flush;
 });
 
 const checkoutReturnResponse = Effect.fn("BillingSales.returnResponse")(function* (

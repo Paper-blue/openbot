@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AgentProviderRef } from "@openbot/contracts/agent-providers";
 import { isNarrationItemId, showsNarration } from "@openbot/contracts/conversation-narration";
 import type {
@@ -11,6 +12,7 @@ import {
   CONVERSATION_PLAN_ITEM_TYPE,
   CONVERSATION_SUBAGENTS_ITEM_TYPE,
   MESSAGING_LIMITS,
+  NO_ANSWER_NOTICE_ITEM_TYPE,
 } from "@openbot/contracts/ipc";
 import type { DiscordEmbed } from "@openbot/contracts/signal-protocol/discord-api";
 import { sourceText } from "@openbot/i18n/source";
@@ -45,7 +47,14 @@ export interface MessagingAnswerFile {
 type MessagingTurnStatus = "completed" | "failed" | "interrupted";
 
 export type MessagingActivity =
-  | { type: "started"; link: MessagingLink; turnId: string; origin: MessagingOrigin | null; followUp: boolean }
+  | {
+      type: "started";
+      link: MessagingLink;
+      turnId: string;
+      origin: MessagingOrigin | null;
+      followUp: boolean;
+      teammateRequest: boolean;
+    }
   | {
       type: "finished";
       link: MessagingLink;
@@ -53,6 +62,7 @@ export type MessagingActivity =
       status: MessagingTurnStatus;
       origin: MessagingOrigin | null;
       followUp: boolean;
+      teammateRequest: boolean;
       answer: string | null;
       files: MessagingAnswerFile[];
       reason?: string | null;
@@ -105,6 +115,7 @@ interface MessagingPostPing {
 }
 
 export interface MessagingOutbound {
+  keysUnreadable(connectionId: string): boolean;
   places(connectionId: string): Effect.Effect<{ places: MessagingPlace[]; note?: string } | { error: string }>;
   history(
     connectionId: string,
@@ -207,6 +218,7 @@ export interface MessagingThreadsHooks {
   interrupt(agentId: string, turnId: string, threadId: string): Effect.Effect<void, MessagingThreadFailed>;
   forgetThread(threadId: string): Effect.Effect<void, MessagingThreadFailed>;
   ownChat(threadId: string): boolean;
+  appendSystemMessage(agentId: string, sideThreadId: string | null, message: ConversationMessage): void;
   contextSession(agentId: string, threadId: string): string | null;
   progressUpdates(agentId: string): AgentProviderRef | null;
 }
@@ -246,7 +258,7 @@ export class MessagingThreads {
   readonly #admissions = new Map<string, Deferred.Deferred<void>>();
   readonly #turnOrigins = new Map<
     string,
-    { deliveryIds: readonly string[]; origin: MessagingOrigin | null; followUp: boolean }
+    { deliveryIds: readonly string[]; origin: MessagingOrigin | null; followUp: boolean; teammateRequest: boolean }
   >();
   readonly #lastOrigins = new Map<string, MessagingOrigin>();
   readonly #stopsBeforeStart = new Set<string>();
@@ -323,6 +335,10 @@ export class MessagingThreads {
     this.#outbound = outbound;
   }
 
+  keysUnreadable(connectionId: string): boolean {
+    return this.#outbound?.keysUnreadable(connectionId) === true;
+  }
+
   setMentionHandler(
     handler: ((mention: MessagingDiscordMention) => Effect.Effect<MessagingMentionResult>) | null,
   ): void {
@@ -397,15 +413,15 @@ export class MessagingThreads {
     args: unknown,
     openFiles: (paths: string[]) => Effect.Effect<MessagingAnswerFile[], AttachmentOperationError>,
   ): Effect.fn.Return<OpenBotToolResponse, AttachmentOperationError> {
-    const call = parseMessagingOutboundTool(tool, args);
-    if ("error" in call) return openBotToolFailure(call.error);
     if (
-      call.tool === "messaging_history" &&
+      tool === "messaging_history" &&
       (this.store.linkForThread(turn.threadId) || this.#mailbox.turnServesExternalChat(agentId, turn.turnId))
     )
       return openBotToolFailure(
         "A turn that works for an external chat cannot read a place by name. In the turn that answers the chat, call messaging_history without connection and place.",
       );
+    const call = parseMessagingOutboundTool(tool, args);
+    if ("error" in call) return openBotToolFailure(call.error);
     const enabled = this.store.connections().filter((record) => record.enabled);
     if (call.tool === "messaging_list_places" && !call.connection)
       return openBotToolResult({
@@ -766,8 +782,10 @@ export class MessagingThreads {
           followUp = origin !== null;
         }
         const deliveryIds = active.map((context) => context.delivery.id);
-        this.#turnOrigins.set(event.turnId, { deliveryIds, origin, followUp });
-        this.#publish({ type: "started", link, turnId: event.turnId, origin, followUp });
+        const teammateRequest =
+          active.length > 0 && active.every(({ delivery }) => isTeammateMessage(delivery, this.#mailbox));
+        this.#turnOrigins.set(event.turnId, { deliveryIds, origin, followUp, teammateRequest });
+        this.#publish({ type: "started", link, turnId: event.turnId, origin, followUp, teammateRequest });
         let stopped = false;
         for (const deliveryId of deliveryIds) if (this.#stopsBeforeStart.delete(deliveryId)) stopped = true;
         if (stopped)
@@ -781,7 +799,12 @@ export class MessagingThreads {
       case "turn-completed": {
         const link = this.store.linkForThread(event.threadId);
         if (!link) return false;
-        const started = this.#turnOrigins.get(event.turnId) ?? { deliveryIds: [], origin: null, followUp: false };
+        const started = this.#turnOrigins.get(event.turnId) ?? {
+          deliveryIds: [],
+          origin: null,
+          followUp: false,
+          teammateRequest: false,
+        };
         this.#turnOrigins.delete(event.turnId);
         this.#progress.delete(event.turnId);
         if (
@@ -807,7 +830,7 @@ export class MessagingThreads {
               )
             : null;
         Effect.runFork(
-          this.#finished(link, event.turnId, event.status, started.origin, started.followUp, reason).pipe(
+          this.#finished(link, event.turnId, event.status, started, reason).pipe(
             Effect.uninterruptible,
             Effect.forkIn(scope, { startImmediately: true }),
           ),
@@ -817,6 +840,20 @@ export class MessagingThreads {
       default:
         return false;
     }
+  }
+
+  noteUndelivered(linkId: string, text: string): void {
+    const link = this.store.link(linkId);
+    if (!link) return;
+    this.#hooks.appendSystemMessage(link.agentId, this.#hooks.ownChat(link.threadId) ? null : link.threadId, {
+      id: randomUUID(),
+      author: "system",
+      source: "system",
+      status: "completed",
+      createdAt: new Date().toISOString(),
+      itemType: NO_ANSWER_NOTICE_ITEM_TYPE,
+      text,
+    });
   }
 
   #takes(threadId: string): boolean {
@@ -887,6 +924,7 @@ export class MessagingThreads {
       status,
       origin,
       followUp: delivery?.sender.kind === "agent",
+      teammateRequest: delivery !== undefined && isTeammateMessage(delivery, this.#mailbox),
       answer,
       files: [],
       reason,
@@ -957,11 +995,11 @@ export class MessagingThreads {
   readonly deleteForAgent = Effect.fn("MessagingThreads.deleteForAgent")(function* (
     this: MessagingThreads,
     agentId: string,
-  ): Effect.fn.Return<void, MessagingThreadFailed> {
+  ): Effect.fn.Return<string[], MessagingThreadFailed> {
     for (const threadId of this.store.threadIdsForAgent(agentId))
       yield* this.#hooks.forgetThread(threadId).pipe(toMessagingThreadFailed);
     for (const link of this.store.links(agentId)) this.#lastOrigins.delete(link.linkId);
-    yield* threadsStep(() => this.store.deleteForAgent(agentId));
+    return yield* threadsStep(() => this.store.deleteForAgent(agentId));
   });
 
   readonly #finished = Effect.fn("MessagingThreads.finished")(function* (
@@ -969,8 +1007,11 @@ export class MessagingThreads {
     link: MessagingLink,
     turnId: string,
     status: string,
-    origin: MessagingOrigin | null,
-    followUp: boolean,
+    {
+      origin,
+      followUp,
+      teammateRequest,
+    }: { origin: MessagingOrigin | null; followUp: boolean; teammateRequest: boolean },
     reason: string | null,
   ): Effect.fn.Return<void, MessagingThreadFailed> {
     const messages = yield* threadsStep(() => this.#turnMessages(link, turnId));
@@ -990,6 +1031,7 @@ export class MessagingThreads {
       status: status === "completed" ? "completed" : status === "interrupted" ? "interrupted" : "failed",
       origin,
       followUp,
+      teammateRequest,
       answer,
       files,
       reason,
@@ -1005,6 +1047,14 @@ export class MessagingThreads {
   #publish(activity: MessagingActivity): void {
     for (const listener of this.#listeners) listener(activity);
   }
+}
+
+function isTeammateMessage(delivery: DeliveryContext["delivery"], mailbox: MailboxStore): boolean {
+  return (
+    delivery.sender.kind === "agent" &&
+    delivery.sender.agentId !== delivery.recipientAgentId &&
+    (!delivery.replyToMessageId || mailbox.followsUpOwnAnswer(delivery))
+  );
 }
 
 export function isAnswer(message: ConversationMessage): boolean {

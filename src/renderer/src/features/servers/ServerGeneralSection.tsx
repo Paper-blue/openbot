@@ -1,5 +1,6 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { AvatarImageInput, ServerAppearance } from "@openbot/contracts/ipc";
+import { REMOTE_CHAT_CONTENT_CAPABILITY } from "@openbot/contracts/team-protocol/remote-chat-content-v1";
 import {
   Button,
   buttonVariants,
@@ -26,6 +27,8 @@ import { useText } from "@openbot/ui/text";
 import type { JSX } from "@solidjs/web";
 import { type Accessor, createStore, Show, snapshot } from "solid-js";
 import { actionToast } from "../../action-toast";
+import { ServerRemoteChatContentSetting } from "./ServerRemoteChatContentSetting";
+import { ServerSignalHomeSetting } from "./ServerSignalHomeSetting";
 import { serverCanAdminister } from "./server-capabilities";
 import type { ServerSettingsSectionHost } from "./server-settings-section";
 
@@ -64,7 +67,7 @@ interface ServerGeneralSection {
 
 export function createServerGeneralSection(host: ServerSettingsSectionHost): ServerGeneralSection {
   const { t, errorMessage, format } = useText();
-  const { props, local, configured, published, actionsAvailable, busy, run } = host;
+  const { props, local, configured, published, actionsAvailable, busy, run, menuMount } = host;
   const [panels, setPanels] = createStore<GeneralPanels>({
     confirmLeave: false,
     confirmRotateKey: false,
@@ -109,6 +112,12 @@ export function createServerGeneralSection(host: ServerSettingsSectionHost): Ser
   const canRemove = () => Boolean(props.onRemoveServer) && !local() && props.server.role === "owner";
   const canRotateKey = () => Boolean(props.onRotateHostKey) && (local() ? published() : actionsAvailable());
   const keyChangedAt = () => props.server.keyChangedAt;
+  const canSetRemoteChatContent = () =>
+    serverCanAdminister(props.server, REMOTE_CHAT_CONTENT_CAPABILITY) && (local() || actionsAvailable());
+  const signalHome = () =>
+    serverCanAdminister(props.server, "host-signal-home-v1") && (local() ? published() : actionsAvailable())
+      ? props.hostSignalHome
+      : undefined;
   const identityDirty = () =>
     canEditIdentity() &&
     (trimmedName() !== panels.identity.savedName ||
@@ -437,6 +446,20 @@ export function createServerGeneralSection(host: ServerSettingsSectionHost): Ser
             </Item>
           </ItemGroup>
         </SettingsSection>
+        <Show when={signalHome()}>
+          {(options) => (
+            <ServerSignalHomeSetting
+              {...options()}
+              serverId={props.server.id}
+              disabled={Boolean(busy())}
+              menuMount={menuMount()}
+              run={run}
+            />
+          )}
+        </Show>
+        <Show when={canSetRemoteChatContent()}>
+          <ServerRemoteChatContentSetting serverId={props.server.id} disabled={Boolean(busy())} run={run} />
+        </Show>
         <Show when={canRotateKey() || keyChangedAt() !== undefined}>
           <SettingsSection title={t("server.settings.hostKeyTitle")}>
             <ItemGroup class="settings-modal-card">

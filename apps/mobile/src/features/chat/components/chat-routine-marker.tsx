@@ -4,7 +4,6 @@ import CalendarCheck from "lucide-react-native/icons/calendar-check";
 import CalendarClock from "lucide-react-native/icons/calendar-clock";
 import CalendarPlus from "lucide-react-native/icons/calendar-plus";
 import CalendarX2 from "lucide-react-native/icons/calendar-x-2";
-import ChevronDown from "lucide-react-native/icons/chevron-down";
 import CirclePause from "lucide-react-native/icons/circle-pause";
 import CircleX from "lucide-react-native/icons/circle-x";
 import Clock3 from "lucide-react-native/icons/clock-3";
@@ -13,7 +12,6 @@ import TriangleAlert from "lucide-react-native/icons/triangle-alert";
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { View } from "react-native";
 import Animated, {
-  cubicBezier,
   Easing,
   interpolate,
   ReduceMotion,
@@ -23,9 +21,15 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import type { RoutineMarker, RoutineMarkerEvent, RoutineRunGroup } from "@/features/chat/model/chat-messages";
-import { useReducedMotion } from "@/shared/lib/motion";
 import { useText } from "@/shared/lib/text";
-import { ACTIVITY_ICON_SIZE, type ActivityColors, ChatActivityLine, useActivityColors } from "./chat-activity-line";
+import {
+  ACTIVITY_ICON_SIZE,
+  type ActivityColors,
+  ChatActivityLine,
+  ExpandChevron,
+  useActivityColors,
+} from "./chat-activity-line";
+import { ChatMarkdown } from "./chat-markdown";
 import { Spinner } from "./chat-subagents";
 
 const ROUTINE_MARKER_ICONS: Record<RoutineMarkerEvent, LucideIcon> = {
@@ -79,13 +83,35 @@ function MarkerIcon({ event, colors }: { event: RoutineMarkerEvent; colors: Acti
 export function RoutineMarkerRow({ message }: { message: RoutineMarker }) {
   const { t } = useText();
   const colors = useActivityColors();
-  return (
+  const [open, setOpen] = useState(false);
+  const answers = message.quietAnswers ?? [];
+  const line = (
     <ChatActivityLine
       icon={<MarkerIcon event={message.event} colors={colors} />}
       label={t(message.label)}
       name={message.routineName}
       accessibilityLabel={`${t(message.label)}, ${message.routineName}`}
+      {...(answers.length > 0
+        ? {
+            accessibilityState: { expanded: open },
+            onPress: () => setOpen(!open),
+            trailing: <ExpandChevron open={open} />,
+          }
+        : {})}
     />
+  );
+  if (answers.length === 0) return line;
+  return (
+    <View>
+      {line}
+      {open ? (
+        <View className="gap-2 ps-5 pe-1 pt-1">
+          {answers.map((answer) => (
+            <ChatMarkdown key={answer.id} body={answer.body} color={colors.name} compact finished />
+          ))}
+        </View>
+      ) : null}
+    </View>
   );
 }
 
@@ -116,7 +142,6 @@ function GroupedMarker({
 export function RoutineRunGroupRow({ group }: { group: RoutineRunGroup }) {
   const { t, format } = useText();
   const colors = useActivityColors();
-  const reducedMotion = useReducedMotion();
   const groupsState = useContext(RoutineGroupsContext);
   const { groups } = groupsState;
   const [saved] = useState(() => groups.get(group.id));
@@ -179,16 +204,7 @@ export function RoutineRunGroupRow({ group }: { group: RoutineRunGroup }) {
                 {format.number(count)}
               </Typography.Paragraph>
             </View>
-            <Animated.View
-              style={{
-                transform: [{ rotate: open ? "180deg" : "0deg" }],
-                transitionProperty: "transform",
-                transitionDuration: reducedMotion ? 0 : 160,
-                transitionTimingFunction: cubicBezier(0.23, 1, 0.32, 1),
-              }}
-            >
-              <ChevronDown size={12} color={colors.dim} strokeWidth={2} />
-            </Animated.View>
+            <ExpandChevron open={open} />
           </>
         }
       />

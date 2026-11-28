@@ -1,13 +1,17 @@
 import type { ArticleBody } from "../body";
 import { AgenticAIDefinition } from "./agentic-ai-definition";
+import { AIAgentProductivity } from "./ai-agent-productivity";
 import { AIAgentWorkflow } from "./ai-agent-workflow";
+import { AIAgentWorkflows } from "./ai-agent-workflows";
 import { AIAgentsExamples } from "./ai-agents-examples";
 import { AIAgentsVsAgenticAI } from "./ai-agents-vs-agentic-ai";
 import { AITeammatesVsAIChatbots } from "./ai-teammates-vs-ai-chatbots";
 import { AIWorkspaceVsChat } from "./ai-workspace-vs-chat";
+import { FixAgentErrors } from "./fix-agent-errors";
 import { ImportGrokBotAgents } from "./import-grok-bot-agents";
 import { ImportHermesAgents } from "./import-hermes-agents";
 import { InstallOpenBotVPS } from "./install-openbot-vps";
+import { IsOpenBotOpenSource } from "./is-openbot-open-source";
 import { OpenBot101 } from "./openbot-101";
 import { OpenBotHostedServers } from "./openbot-hosted-servers";
 import { OpenBotMarketplace } from "./openbot-marketplace";
@@ -15,6 +19,10 @@ import { WhatAreAIAgents } from "./what-are-ai-agents";
 import { WtfIsOpenBot } from "./wtf-is-openbot";
 
 export const GUIDE_BODIES: Readonly<Record<string, ArticleBody>> = {
+  "is-openbot-open-source": IsOpenBotOpenSource,
+  "fix-agent-errors": FixAgentErrors,
+  "ai-agent-workflows": AIAgentWorkflows,
+  "ai-agent-productivity": AIAgentProductivity,
   "ai-agent-workflow": AIAgentWorkflow,
   "ai-teammates-vs-ai-chatbots": AITeammatesVsAIChatbots,
   "ai-workspace-vs-chat": AIWorkspaceVsChat,

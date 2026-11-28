@@ -1,10 +1,17 @@
 import { CHANNEL_CHATS_CAPABILITY, CHANNEL_TASK_CANCEL_CAPABILITY } from "@openbot/contracts/ipc";
 import { CHANNEL_BROWSER_CAPABILITY } from "@openbot/contracts/team-protocol/channel-browser-v1";
+import { CHANNEL_FOLDERS_CAPABILITY } from "@openbot/contracts/team-protocol/channel-folders-v1";
 import { CHANNEL_ISOLATION_CAPABILITY } from "@openbot/contracts/team-protocol/channel-isolation-v1";
 import { CHANNEL_PICTURE_CAPABILITY } from "@openbot/contracts/team-protocol/channel-picture-v1";
 import { CHAT_HISTORY_CAPABILITY } from "@openbot/contracts/team-protocol/chat-history-v1";
 import { MESSAGE_DELETE_CAPABILITY } from "@openbot/contracts/team-protocol/message-delete-v1";
-import { createContext, type ParentProps, untrack, useContext } from "solid-js";
+import { CHANNELS_SYNC_COLLECTION } from "@openbot/contracts/team-protocol/sync-collections";
+import {
+  CHANNEL_MESSAGES_SYNC_LOG,
+  CHANNEL_PAGE_META_SYNC_COLLECTION,
+} from "@openbot/contracts/team-protocol/sync-logs";
+import { parseSyncName } from "@openbot/contracts/team-protocol/sync-v1";
+import { createContext, onSettled, type ParentProps, untrack, useContext } from "solid-js";
 import { noteAgentRequest } from "../../agent-requests";
 import { useAuth } from "../account/account-context";
 import { useAgents } from "../agents/agents-context";
@@ -72,6 +79,7 @@ export function ChannelsProvider(props: ParentProps) {
         writeChannelSelection(accountKey(), selectionServerId, channelId);
       }
     },
+    remote: () => activeServer()?.kind === "remote",
     supported: () => activeServerSupportsCapability(CHANNEL_CHATS_CAPABILITY),
     deletionSupported: () => activeServer()?.kind !== "remote" || serverRoleCanAdminister(activeServer()),
     taskCancelSupported: () => activeServerSupportsCapability(CHANNEL_TASK_CANCEL_CAPABILITY),
@@ -83,6 +91,15 @@ export function ChannelsProvider(props: ParentProps) {
       activeServer()?.kind === "local" || activeServerSupportsCapability(CHANNEL_PICTURE_CAPABILITY),
     contextActionsSupported: () =>
       activeServer() !== undefined && activeServerSupportsCapability(CHAT_HISTORY_CAPABILITY),
+    foldersMode: () => {
+      const server = activeServer();
+      if (server?.kind === "local") return "local";
+      return server?.kind === "remote" &&
+        activeServerSupportsCapability(CHANNEL_FOLDERS_CAPABILITY) &&
+        serverRoleCanAdminister(server)
+        ? "remote"
+        : null;
+    },
     beforeOpen: () => {
       setAgentSetupOpen(false);
       setDirectTyping(false);
@@ -97,5 +114,20 @@ export function ChannelsProvider(props: ParentProps) {
         saveRemoteFrameChannels(auth.user.id, server.id, channels);
     },
   });
+  onSettled(() =>
+    window.openbot.agent.onSyncChanged((change) => {
+      if (change.serverId !== selectionServerId) return;
+      if (change.name === CHANNELS_SYNC_COLLECTION.name) {
+        void controller.refresh(undefined, false);
+        return;
+      }
+      const synced = parseSyncName(change.name);
+      if (
+        synced?.param &&
+        (synced.base === CHANNEL_MESSAGES_SYNC_LOG.name || synced.base === CHANNEL_PAGE_META_SYNC_COLLECTION.name)
+      )
+        void controller.changed(synced.param);
+    }),
+  );
   return <ChannelsControllerProvider controller={controller}>{props.children}</ChannelsControllerProvider>;
 }

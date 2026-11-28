@@ -54,7 +54,7 @@ export const ORDER_METADATA = {
 } as const;
 
 export const LICENSE_INCLUDED_USERS = 2;
-export const LICENSE_MAX_USERS = 10;
+export const LICENSE_MAX_USERS = 25;
 export const LICENSE_SITES_PER_USER = 3;
 export const LICENSE_DEVICES_PER_USER = 3;
 export const LICENSE_YEAR_DISCOUNT_PERCENT = 20;
@@ -145,6 +145,16 @@ export function licenseIncludedUsers(tier: LicenseTier) {
 
 export function licenseMaxUsers(tier: LicenseTier) {
   return tier === "team" ? LICENSE_MAX_USERS : 1;
+}
+
+export const LICENSE_MONTHLY_CREDITS: Readonly<Record<LicenseTier, { base: number; extraUser: number }>> = {
+  starter: { base: 50, extraUser: 0 },
+  team: { base: 100, extraUser: 50 },
+};
+
+export function licenseMonthlyCredits(tier: LicenseTier, users: number): number {
+  const credits = LICENSE_MONTHLY_CREDITS[tier];
+  return credits.base + Math.max(0, users - 1) * credits.extraUser;
 }
 
 export function licensePlanPrice(plan: LicensePlan, currency: BillingCurrency): LicensePrice {

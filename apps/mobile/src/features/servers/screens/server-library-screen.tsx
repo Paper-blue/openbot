@@ -38,7 +38,7 @@ import {
   useLibraryPlace,
 } from "@/features/servers/model/library-place";
 import { useLibrary } from "@/features/servers/model/use-library-folders";
-import { useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
+import { useMobileWorkspaceSelector } from "@/features/workspace/context/mobile-workspace-context";
 import { AndroidBlurTarget } from "@/shared/components/android-header-blur";
 import { LargeTitle, LargeTitleBar, useLargeTitleScroll } from "@/shared/components/large-title";
 import { type MenuAction, type MenuComponentRef, MenuView } from "@/shared/components/menu-view";
@@ -80,8 +80,8 @@ function isLibraryPicture(file: StoredFileRow): boolean {
 export function ServerLibraryScreen() {
   const { t, errorMessage } = useText();
   const { serverId } = useLocalSearchParams<{ serverId: string }>();
-  const { servers, agents } = useMobileWorkspace();
-  const server = servers.find((item) => item.id === serverId);
+  const server = useMobileWorkspaceSelector((workspace) => workspace.servers.find((item) => item.id === serverId));
+  const agents = useMobileWorkspaceSelector((workspace) => workspace.agents);
   const { storage, folders, canOrganize } = useLibrary(serverId);
   const { available, query, rescan } = storage;
   const snapshot = folders.snapshot;
@@ -427,7 +427,7 @@ function LibraryTile({
     else if (action === "move") router.push({ pathname: "/library-folders", params: { serverId, fileId: file.id } });
     else if (action === "delete") confirmDelete();
     else if (action === "showInChat" && agentId && messageId)
-      router.push({ pathname: "/chat/[agentId]", params: { agentId, messageId } });
+      router.push({ pathname: "/chat/[agentId]", params: { agentId, serverId, messageId } });
   }
 
   function longPress() {

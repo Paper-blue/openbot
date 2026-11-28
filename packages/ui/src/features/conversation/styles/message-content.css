@@ -684,19 +684,26 @@
 .message-entry-agent
   .ui-bubble:has(
     .message-content-blocks :is(.message-data-table-scroll, .message-markdown-table-scroll, .message-markdown-image)
-  )
+  ) {
+  --message-wide-block-contain: inline-size;
+}
+
+.message-entry-agent
+  .ui-bubble
   :is(
     .message-content-blocks
       > :not(.message-markdown, .message-data-table-frame, .message-table-frame, .message-show-full),
     .message-markdown > :not(.message-table-frame, :has(.message-markdown-image, .message-table-frame)),
     .message-markdown
-      :has(.message-table-frame)
+      [data-holds-table]
       > :not(.message-table-frame, :has(.message-markdown-image, .message-table-frame))
   ) {
-  contain: inline-size;
+  contain: var(--message-wide-block-contain, none);
 }
 
-.message-entry-agent .ui-bubble:has(:is(.message-data-table-scroll, .message-code-block)) > .ui-bubble-content {
+.message-entry-agent
+  .ui-bubble:has(:is(.message-data-table-scroll, .message-code-block, .message-content-blocks .message-markdown-image))
+  > .ui-bubble-content {
   width: 100%;
 }
 
@@ -1125,9 +1132,11 @@
   box-sizing: border-box;
   width: max-content;
   max-width: min(280px, calc(100vw - 16px));
-  border: 1px solid var(--openbot-border-strong);
+  border: 1px solid var(--ui-menu-edge);
   border-radius: var(--openbot-radius-md);
-  background: var(--openbot-bg-surface-raised);
+  background: var(--ui-popover-frost-bg);
+  -webkit-backdrop-filter: var(--ui-popover-frost-filter);
+  backdrop-filter: var(--ui-popover-frost-filter);
   padding: 6px 8px;
   color: var(--openbot-text-primary);
   font-size: var(--openbot-text-sm);
@@ -1626,6 +1635,10 @@
   color: var(--file-reference-color);
 }
 
+.ui-bubble.message-bubble-colored.message-bubble-solid > .ui-bubble-content .message-file-reference {
+  color: var(--message-solid-text);
+}
+
 @media (hover: hover) and (pointer: fine) {
   .ui-button.message-file-reference:hover:not(:disabled),
   .composer-file-reference:hover {
@@ -1726,4 +1739,37 @@
 
 .reference-chip.message-reference-chip > .sr-only {
   user-select: none;
+}
+
+.message-remote-picture {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--openbot-space-3);
+  max-width: 100%;
+  padding: var(--openbot-space-2) var(--openbot-space-3);
+  border: 1px dashed var(--openbot-border-strong);
+  border-radius: var(--openbot-radius-md);
+  background: var(--openbot-bg-control);
+  vertical-align: middle;
+}
+
+.message-remote-picture-icon {
+  flex: none;
+  width: var(--openbot-icon-md);
+  height: var(--openbot-icon-md);
+  color: var(--openbot-text-muted);
+}
+
+.message-remote-picture-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--openbot-space-0-5);
+  min-width: 0;
+  font-size: var(--openbot-text-sm);
+  line-height: var(--openbot-leading-sm);
+}
+
+.message-remote-picture-note {
+  color: var(--openbot-text-secondary);
 }

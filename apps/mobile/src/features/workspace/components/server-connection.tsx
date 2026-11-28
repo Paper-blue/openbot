@@ -10,14 +10,18 @@ import {
 import {
   REMOTE_PEER_LOST_AFTER_MS,
   type RemoteTeamConnectionUpdate,
+  type RemoteTeamDiagnostic,
   type RemoteTeamEvent,
 } from "@openbot/team-client/remote-peer";
 import { errorReference } from "@openbot/user-errors/reference";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { MobileConnectionAnalytics } from "@/features/analytics/connection";
 import { mobileAnalytics } from "@/features/analytics/mobile-analytics";
+import { phoneVpn } from "@/features/support/model/phone-network-capture";
 import { supportLog, supportLogValue } from "@/features/support/model/support-log";
 import { referencedError } from "@/features/workspace/model/referenced-error";
+import type { MobileServerSync } from "@/features/workspace/sync/server-sync";
+import { type NetworkChange, strongerChange } from "@/shared/lib/network-change";
 import { subscribeNetworkMoves } from "@/shared/lib/network-path";
 import { RemoteTeamTransport, type RemoteTeamTransportRef } from "./remote-team-transport";
 
@@ -35,6 +39,7 @@ function endsQuietResume(status: RemoteRecoveryStatus): boolean {
 export interface ServerConnectionHandle {
   client: RemoteTeamTransportRef;
   refresh(): void;
+  reconnect(): void;
   quietStart(): void;
 }
 
@@ -48,7 +53,9 @@ interface Props {
   hostId: string;
   publicKey: string;
   active: boolean;
+  background: boolean;
   directory: RemoteTeamDirectoryClient;
+  sync: MobileServerSync;
   register(hostId: string, handle: ServerConnectionHandle | null): void;
   load(hostId: string, publicKey: string, client: RemoteTeamTransportRef, context: ServerLoadContext): Promise<void>;
   onStatus(
@@ -66,7 +73,9 @@ export const ServerConnection = memo(function ServerConnection({
   hostId,
   publicKey,
   active,
+  background,
   directory,
+  sync,
   register,
   load,
   onStatus,
@@ -80,8 +89,10 @@ export const ServerConnection = memo(function ServerConnection({
   const controller = useRef<ReturnType<typeof createRemoteConnectionRecovery> | null>(null);
   const activeRef = useRef(active);
   activeRef.current = active;
+  const backgroundRef = useRef(background);
+  backgroundRef.current = background;
   const generation = useRef(0);
-  const [analytics] = useState(() => new MobileConnectionAnalytics(mobileAnalytics));
+  const [analytics] = useState(() => new MobileConnectionAnalytics(mobileAnalytics, phoneVpn));
   const membershipRefreshPending = useRef(false);
   const inactiveSince = useRef<number | null>(null);
   const lastStatus = useRef<{ status: RemoteRecoveryStatus; failure: RemoteConnectionFailure | null } | null>(null);
@@ -116,21 +127,26 @@ export const ServerConnection = memo(function ServerConnection({
     supportLog.add("info", "connection", `${hostId} network restored`);
     controller.current?.networkRestored();
   }, [hostId]);
-  const networkMoved = useRef(false);
+  const networkMoved = useRef<NetworkChange | null>(null);
   const clientRef = useRef(client);
   clientRef.current = client;
   useEffect(() => {
     if (!client) return;
-    return subscribeNetworkMoves(() => {
-      supportLog.add("info", "connection", `${hostId} network changed${activeRef.current ? "" : " while inactive"}`);
-      if (activeRef.current) client.networkChanged();
-      else networkMoved.current = true;
+    return subscribeNetworkMoves((change) => {
+      supportLog.add("info", "connection", `${hostId} network ${change}${activeRef.current ? "" : " while inactive"}`);
+      if (activeRef.current) client.networkChanged(change);
+      else networkMoved.current = strongerChange(networkMoved.current, change);
     });
   }, [client, hostId]);
+  const handleDiagnostic = useCallback(
+    (step: RemoteTeamDiagnostic["step"], detail: string | undefined) => analytics.diagnostic(step, detail),
+    [analytics],
+  );
   const lostAfterMs = useRef(REMOTE_PEER_LOST_AFTER_MS);
   const handleConnectionUpdate = useCallback(
     (update: RemoteTeamConnectionUpdate) => {
       if (update.hostId !== hostId) return;
+      sync.connection(hostId, update);
       supportLog.add(
         update.state === "offline" ? "warn" : "info",
         "connection",
@@ -139,7 +155,7 @@ export const ServerConnection = memo(function ServerConnection({
       if (update.hostOffline && activeRef.current) onUnavailableRef.current?.(hostId);
       if (update.state === "online" && update.lostAfterMs !== undefined) lostAfterMs.current = update.lostAfterMs;
       if (update.state === "offline") {
-        if (activeRef.current) analytics.lost();
+        if (activeRef.current && !backgroundRef.current) analytics.lost();
         if (update.code === "session_revoked") {
           if (activeRef.current) void onMembershipChangedRef.current?.().catch(() => undefined);
           else membershipRefreshPending.current = true;
@@ -150,8 +166,16 @@ export const ServerConnection = memo(function ServerConnection({
       }
       if (update.resync) controller.current?.refresh();
     },
-    [hostId, analytics],
+    [hostId, analytics, sync],
   );
+  const handleSyncEvent = useCallback(
+    (id: string, value: unknown) => {
+      if (id === hostId) sync.receive(hostId, value);
+    },
+    [sync, hostId],
+  );
+  const handleNewPage = useCallback(() => sync.transportReset(hostId), [sync, hostId]);
+  useEffect(() => sync.setActive(hostId, active), [sync, hostId, active]);
 
   useEffect(() => {
     if (!client) return;
@@ -167,18 +191,18 @@ export const ServerConnection = memo(function ServerConnection({
           isCurrent: () => !disposed && activeRef.current && attempt === generation.current,
           check,
         };
-        const finish = analytics.attempt();
+        const finish = backgroundRef.current ? null : analytics.attempt();
         const initiatingContext = context;
         const started = Date.now();
         supportLog.add("info", "connection", `${hostId} attempt ${attempt} started${check ? ", check" : ""}`);
         return load(hostId, publicKey, client, initiatingContext).then(
           () => {
-            if (initiatingContext.isCurrent()) finish("succeeded", initiatingContext.stage);
+            if (initiatingContext.isCurrent()) finish?.("succeeded", initiatingContext.stage);
             supportLog.add("info", "connection", `${hostId} attempt ${attempt} loaded (${Date.now() - started} ms)`);
           },
           (error) => {
             if (initiatingContext.isCurrent()) {
-              finish("failed", initiatingContext.stage);
+              finish?.("failed", initiatingContext.stage);
               onUnavailableRef.current?.(hostId);
             }
             const reference = errorReference(error);
@@ -216,7 +240,15 @@ export const ServerConnection = memo(function ServerConnection({
       },
     );
     controller.current = recovery;
-    register(hostId, { client, refresh: () => recovery.refresh(), quietStart });
+    register(hostId, {
+      client,
+      refresh: () => recovery.refresh(),
+      reconnect: () => {
+        if (activeRef.current && lastStatus.current && lastStatus.current.status.phase !== "online") client.newPage();
+        recovery.refresh();
+      },
+      quietStart,
+    });
     recovery.setActive(activeRef.current);
     return () => {
       disposed = true;
@@ -249,9 +281,10 @@ export const ServerConnection = memo(function ServerConnection({
       inactiveSince.current = null;
     }
     controller.current?.setActive(active);
-    if (active && networkMoved.current) {
-      networkMoved.current = false;
-      clientRef.current?.networkChanged();
+    const moved = networkMoved.current;
+    if (active && moved) {
+      networkMoved.current = null;
+      clientRef.current?.networkChanged(moved);
     }
     const phase = lastStatus.current?.status.phase;
     if (returned && (phase === "waiting" || phase === "cooldown")) controller.current?.refresh();
@@ -260,6 +293,13 @@ export const ServerConnection = memo(function ServerConnection({
       void onMembershipChanged?.().catch(() => undefined);
     }
   }, [active, hostId, onMembershipChanged, analytics, endResume]);
+
+  const wasBackground = useRef(background);
+  useEffect(() => {
+    const opened = wasBackground.current && !background;
+    wasBackground.current = background;
+    if (opened) controller.current?.resetBackoff();
+  }, [background]);
 
   return (
     <RemoteTeamTransport
@@ -271,6 +311,9 @@ export const ServerConnection = memo(function ServerConnection({
       onNetworkRestored={handleNetworkRestored}
       onTeamEvent={onTeamEvent}
       onConnectionUpdate={handleConnectionUpdate}
+      onDiagnostic={handleDiagnostic}
+      onSyncEvent={handleSyncEvent}
+      onNewPage={handleNewPage}
     />
   );
 });

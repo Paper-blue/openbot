@@ -9,9 +9,11 @@ import {
 } from "@openbot/contracts/chat-math";
 import { chatPreviewKind } from "@openbot/contracts/chat-preview";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
-import { Button, Checkbox } from "@openbot/ui";
+import { markdownImageName } from "@openbot/contracts/markdown-preview-text";
+import { Button, Checkbox, Image as ImageIcon } from "@openbot/ui";
 import { Dynamic } from "@solidjs/web";
 import { Marked, type Token, type Tokens, type TokensList } from "marked";
+import markedCjkFriendly from "marked-cjk-friendly";
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { ScrollEdges } from "../../components/ScrollEdges";
 import { textDirection } from "../../content-direction";
@@ -128,6 +130,7 @@ const markdown = new Marked({
     },
   ],
 });
+markdown.use(markedCjkFriendly());
 
 const VOID_HTML_ELEMENTS = new Set([
   "area",
@@ -270,6 +273,7 @@ export function MarkdownMessageText(props: MarkdownMessageTextProps) {
       onOpenQuote: props.onOpenQuote,
       onOpenTag: props.onOpenTag,
       linkFavicons: props.linkFavicons,
+      remoteContent: props.remoteContent,
       fileDirectory: fileDirectory(),
     }),
   );
@@ -309,6 +313,7 @@ export function MarkdownInlineText(
     onOpenQuote: props.onOpenQuote,
     onOpenTag: props.onOpenTag,
     linkFavicons: props.linkFavicons,
+    remoteContent: props.remoteContent,
     fileDirectory: messageFileDirectory(props.body),
   });
   return <MarkdownInline tokens={tokens()} content={contentProps()} />;
@@ -414,7 +419,7 @@ function MarkdownBlock(props: {
     case "blockquote": {
       if (!tokenIs(token, "blockquote")) return token.raw;
       return (
-        <blockquote dir={tokensDirection(token.tokens)}>
+        <blockquote dir={tokensDirection(token.tokens)} data-holds-table={holdsTableAttribute(token.tokens)}>
           <MarkdownBlocks
             tokens={token.tokens}
             content={props.content}
@@ -458,6 +463,7 @@ function MarkdownBlock(props: {
             kind={preview}
             streaming={props.streaming === true}
             onOpenLink={props.content.onOpenLink}
+            remoteContent={props.content.remoteContent}
           />
         );
       return <CodeBlock block={block} streaming={props.streaming === true} />;
@@ -537,7 +543,11 @@ function MarkdownList(props: {
           />
         );
         return (
-          <li class={renderedItem.item.task ? "message-markdown-task" : undefined} dir="auto">
+          <li
+            class={renderedItem.item.task ? "message-markdown-task" : undefined}
+            dir="auto"
+            data-holds-table={holdsTableAttribute(renderedItem.item.tokens)}
+          >
             <Show when={renderedItem.item.task}>
               <Checkbox
                 class="message-markdown-checkbox"
@@ -547,7 +557,9 @@ function MarkdownList(props: {
               />
             </Show>
             <Show when={renderedItem.item.task} fallback={blocks()}>
-              <div class="message-markdown-task-body">{blocks()}</div>
+              <div class="message-markdown-task-body" data-holds-table={holdsTableAttribute(renderedItem.item.tokens)}>
+                {blocks()}
+              </div>
             </Show>
           </li>
         );
@@ -556,12 +568,19 @@ function MarkdownList(props: {
   );
 
   const direction = createMemo(() => tokensDirection(items()));
+  const listHoldsTable = createMemo(() => holdsTableAttribute(items().flatMap((item) => item.tokens)));
   return props.token.ordered ? (
-    <ol start={props.token.start === "" ? undefined : props.token.start} dir={direction()}>
+    <ol
+      start={props.token.start === "" ? undefined : props.token.start}
+      dir={direction()}
+      data-holds-table={listHoldsTable()}
+    >
       {list()}
     </ol>
   ) : (
-    <ul dir={direction()}>{list()}</ul>
+    <ul dir={direction()} data-holds-table={listHoldsTable()}>
+      {list()}
+    </ul>
   );
 }
 
@@ -718,7 +737,7 @@ function MarkdownInline(props: {
                 url={url}
                 title={token.title || linkTitle(token.text, url)}
                 isolate={linkTitle(token.text, token.href) === undefined}
-                favicon={props.content.linkFavicons !== false}
+                favicon={props.content.linkFavicons !== false && props.content.remoteContent === true}
                 onOpenLink={props.content.onOpenLink}
               >
                 {token.text === token.href ? (
@@ -757,7 +776,7 @@ function MarkdownInline(props: {
                 <MessageLink
                   url={url}
                   title={url}
-                  favicon={props.content.linkFavicons !== false}
+                  favicon={props.content.linkFavicons !== false && props.content.remoteContent === true}
                   onOpenLink={props.content.onOpenLink}
                 >
                   {token.text || t("chat.image.view")}
@@ -768,11 +787,12 @@ function MarkdownInline(props: {
               return <RichText body={token.text || token.raw} content={props.content} streamingTailAfter={after()} />;
             }
             return (
-              <MarkdownImage
+              <RemoteMarkdownImage
                 url={url}
                 alt={token.text}
                 title={token.title ?? undefined}
                 onOpenImage={props.content.onOpenImage}
+                remoteContent={props.content.remoteContent}
               />
             );
           }
@@ -852,6 +872,36 @@ function semanticChatTag(token: Token | undefined): string | null {
   if (!token || !tokenIs(token, "link")) return null;
   const target = /^(agent|skill|mcp|quote|tab|thread)(?:\+uri)?:([^\r\n]+)$/u.exec(token.href);
   return target?.[2] ? `@${token.raw}` : null;
+}
+
+function RemoteMarkdownImage(props: {
+  url: string;
+  alt: string;
+  title: string | undefined;
+  onOpenImage: ((image: HTMLImageElement) => void) | undefined;
+  remoteContent: boolean | undefined;
+}) {
+  const { t } = useText();
+  const [loaded, setLoaded] = createSignal(false);
+  return (
+    <Show
+      when={props.remoteContent !== true && !loaded()}
+      fallback={<MarkdownImage url={props.url} alt={props.alt} title={props.title} onOpenImage={props.onOpenImage} />}
+    >
+      <span class="message-remote-picture">
+        <ImageIcon class="message-remote-picture-icon" aria-hidden="true" />
+        <span class="message-remote-picture-text">
+          <strong class="message-remote-picture-name">{markdownImageName(props.alt, props.url)}</strong>
+          <span class="message-remote-picture-note">
+            {t("chat.remoteContent.pictureNotLoaded", { host: new URL(props.url).host })}
+          </span>
+        </span>
+        <Button variant="outline" size="sm" type="button" onClick={() => setLoaded(true)}>
+          {t("chat.remoteContent.loadPicture")}
+        </Button>
+      </span>
+    </Show>
+  );
 }
 
 function MarkdownImage(props: {
@@ -1053,6 +1103,19 @@ function activeStreamingTableCellIndex(token: Tokens.Table): number {
     if (sourceRow[sourceIndex] === "|" && !isEscapedMarkdownCharacter(sourceRow, sourceIndex)) cellIndex += 1;
   }
   return cellIndex < row.length ? cellIndex : -1;
+}
+
+function holdsTable(tokens: readonly Token[]): boolean {
+  return tokens.some(
+    (token) =>
+      tokenIs(token, "table") ||
+      (tokenIs(token, "blockquote") && holdsTable(token.tokens)) ||
+      (tokenIs(token, "list") && token.items.some((item) => holdsTable(item.tokens))),
+  );
+}
+
+function holdsTableAttribute(tokens: readonly Token[]): "" | undefined {
+  return holdsTable(tokens) ? "" : undefined;
 }
 
 function containerClosesFinalNestedTable(token: Tokens.Blockquote | Tokens.List): boolean {
@@ -1284,15 +1347,24 @@ function messageFileDirectory(body: string): FileDirectoryContext | null {
   return contexts.size === 1 ? (contexts.values().next().value ?? null) : null;
 }
 
+const ABSOLUTE_PATH = /^(?:~[/\\]|[/\\]|[A-Za-z]:[/\\])/u;
+
+function absoluteFilePath(path: string): boolean {
+  if (!ABSOLUTE_PATH.test(path) || /^[/\\]{2}/u.test(path) || /[\0\r\n]/u.test(path)) return false;
+  if (!/^[^.].*\.[\p{L}\p{N}_-]*\p{L}[\p{L}\p{N}_-]*$/u.test(fileReferenceName(path))) return false;
+  if (!/\s/u.test(path)) return true;
+  return !/\s-+\p{L}/u.test(path) && !/[/\\]s?bin[/\\]/u.test(path.split(/\s/u)[0] ?? "");
+}
+
 function mentionedFileTarget(
   value: string,
   directory: FileDirectoryContext | null,
 ): (FileDirectoryContext & { asWritten?: string }) | null {
   const path = value.trim();
-  if (!isFileReference(path)) return null;
+  if (!isFileReference(path) && !absoluteFilePath(path)) return null;
   const shared = sharedFileTarget(path);
   if (shared) return { path: shared, kind: "shared" };
-  if (/^(?:~[/\\]|[/\\]|[A-Za-z]:[/\\])/u.test(path)) {
+  if (ABSOLUTE_PATH.test(path)) {
     const workspace = workspaceFileTarget(path);
     return workspace ? { path: workspace, kind: "workspace" } : null;
   }
@@ -1362,14 +1434,4 @@ function linkFileTarget(href: string): FileDirectoryContext | null {
   const { shared, workspace } = linkFileTargets(href);
   if (shared) return { path: shared, kind: "shared" };
   return workspace ? { path: workspace, kind: "workspace" } : null;
-}
-
-export function markdownImageName(alt: string, url: string): string {
-  if (alt.trim()) return alt.trim();
-  try {
-    const path = new URL(url).pathname;
-    const name = decodeURIComponent(path.slice(path.lastIndexOf("/") + 1));
-    if (name) return name;
-  } catch {}
-  return url;
 }

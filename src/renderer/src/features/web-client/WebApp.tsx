@@ -14,6 +14,7 @@ import { forgetReferralCode, readReferralCode } from "@openbot/contracts/referra
 import { isBoolean, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { formatLocale, resolveLocale } from "@openbot/i18n";
 import { sourceText } from "@openbot/i18n/source";
+import { rememberAccountBookmark } from "@openbot/team-client/account-bookmark";
 import { markRemoteSync } from "@openbot/team-client/sync-profile";
 import { classifyFailure } from "@openbot/telemetry";
 import { NotificationObserver, Toaster, toast } from "@openbot/ui";
@@ -21,7 +22,7 @@ import { AccountLogin } from "@openbot/ui/features/account/AccountLogin";
 import { AppLoadingScreen } from "@openbot/ui/features/account/AppLoadingScreen";
 import { currentText } from "@openbot/ui/text";
 import { Dynamic } from "@solidjs/web";
-import { createEffect, createSignal, createStore, onSettled, Show } from "solid-js";
+import { createEffect, createSignal, createStore, flush, onSettled, Show } from "solid-js";
 import type { DesktopAnalyticsProperties } from "../../analytics";
 import {
   configureWebReports,
@@ -34,13 +35,19 @@ import {
   webReportsEnabled,
 } from "../../error-reports";
 import { StaticI18nProvider } from "../../i18n-context";
+import { startupLoadingScene } from "../../startup-animation-preference";
+import { clearStoredQueueEdit, clearStoredThreadQueueEdit } from "../conversation/composer-draft";
+import { clearStoredComposerDrafts } from "../conversation/composer-draft-storage";
+import { clearStorageUsageCache } from "../files/storage-usage";
 import { AnalyticsConsentRow, ConsentNotice } from "../onboarding/AnalyticsConsent";
 import { createOnboardingTeam, onboardingSessionSeed } from "../onboarding/onboarding-avatars";
 import { deleteRemoteWorkspaceFrames } from "../servers/remote-workspace-frame";
 import { WindowBackdropBubbles } from "../window/backdrop-bubbles";
 import { keepCachedWorkflows } from "../workflows/workflow-cache";
+import { WebExtensionConnect } from "./WebExtensionConnect";
 import { WebLanguageStep } from "./WebLanguageStep";
 import { phoneAppScreenWanted, WebPhoneAppScreen } from "./WebPhoneAppScreen";
+import { WebSlowLoadNotice } from "./WebSlowLoadNotice";
 import type { WebWorkspace } from "./WebWorkspace";
 import { createWebAccountCalls } from "./web-account";
 import { deleteSavedAgentPictures } from "./web-agent-pictures";
@@ -48,12 +55,18 @@ import { createWebAppearancePreference } from "./web-appearance-preference";
 import { takeWebAppStart, WEB_APP_BILLING_PARAM, type WebAppStart } from "./web-billing";
 import { syncWebChatBackground } from "./web-chat-background";
 import type { WebRuntimeFactory } from "./web-client-context";
+import { extensionReturnUrl, forgetExtensionConnect, takeExtensionConnect } from "./web-extension-connect";
+import { deleteCachedWebHosts } from "./web-host-cache";
 import { takeHostingReturn } from "./web-hosted-servers";
 import { createWebLanguagePreference } from "./web-language-preference";
 
 export { loadSavedLanguage } from "./web-language-preference";
 
 let workspaceImport: Promise<typeof WebWorkspace> | null = null;
+function accountRequestUrl(input: RequestInfo | URL): URL {
+  return new URL(input instanceof Request ? input.url : input, window.location.origin);
+}
+
 function loadWorkspace(): Promise<typeof WebWorkspace> {
   if (!workspaceImport) {
     workspaceImport = import("./WebWorkspace").then((module) => module.WebWorkspace);
@@ -73,6 +86,8 @@ class SignInIssueShown extends Error {
 class CompanySignInRequired extends Error {}
 
 const EMAIL_START_TIMEOUT_MS = 35_000;
+
+const SESSION_CHECK_TIMEOUT_MS = 15_000;
 
 const EMAIL_START_KEY_LIFE_MS = 10 * 60_000;
 
@@ -166,11 +181,13 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
   const [state, setState] = createStore<{
     account: CentralAuthUser | null;
     loaded: boolean;
+    retrying: boolean;
     login: CentralAuthState;
     resendAt: number;
   }>({
     account: null,
     loaded: false,
+    retrying: false,
     login: { status: "signed_out" },
     resendAt: 0,
   });
@@ -202,6 +219,15 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
   const [pluginSlug, setPluginSlug] = createSignal(takePluginLink());
   const [marketplaceListing, setMarketplaceListing] = createSignal(takeMarketplaceLink());
   const [startLink, setStartLink] = createSignal(takeStartLink());
+  const extensionConnect = takeExtensionConnect();
+  createEffect(
+    () => state.loaded && !state.account,
+    (signedOut) => {
+      if (!signedOut || !extensionConnect?.silent) return;
+      forgetExtensionConnect();
+      window.location.assign(extensionReturnUrl(extensionConnect, { error: "login_required" }));
+    },
+  );
   const initialBillingReturn = takeBillingReturn();
   const initialHostingReturn = takeHostingReturn();
   const [billingReturn, setBillingReturn] = createSignal(initialBillingReturn !== null);
@@ -216,6 +242,7 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
     pluginSlug() !== null ||
     marketplaceListing() !== null ||
     startLink() !== null ||
+    extensionConnect !== null ||
     initialBillingReturn !== null ||
     initialHostingReturn !== null ||
     companySignInReturnError !== null;
@@ -236,17 +263,27 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
       deleteRemoteWorkspaceFrames(null);
       void deleteSavedAgentPictures(null);
       keepCachedWorkflows(null);
+      deleteCachedWebHosts(null);
+      clearStorageUsageCache();
     }
     sessionGeneration += 1;
-    setState((draft) => {
-      draft.account = null;
-      draft.login = { status: "signed_out" };
-    });
+    flush(() =>
+      setState((draft) => {
+        draft.account = null;
+        draft.login = { status: "signed_out" };
+      }),
+    );
+    if (ended) {
+      clearStoredComposerDrafts();
+      clearStoredQueueEdit();
+      clearStoredThreadQueueEdit();
+    }
     resetAnalyticsBox();
   }
   const accountFetch: typeof fetch = async (input, init) => {
     const generation = sessionGeneration;
     const response = await fetch(input, init);
+    rememberAccountBookmark(accountRequestUrl(input), response);
     if (
       !disposed &&
       generation === sessionGeneration &&
@@ -267,7 +304,7 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
       | { email: string }
       | { challengeId: string | null; code: string; firstTouch?: FirstTouch; referralCode?: string }
       | Record<string, never>,
-    send?: { idempotencyKey: string; signal: AbortSignal },
+    send?: { idempotencyKey?: string; signal: AbortSignal },
   ) {
     const response = await accountFetch(`/api/browser/${path}`, {
       method: body ? "POST" : "GET",
@@ -277,7 +314,7 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
         ? {
             "Content-Type": "application/json",
             "X-OpenBot-Browser": "1",
-            ...(send ? { "Idempotency-Key": send.idempotencyKey } : {}),
+            ...(send?.idempotencyKey ? { "Idempotency-Key": send.idempotencyKey } : {}),
           }
         : {},
       ...(body ? { body: JSON.stringify(body) } : {}),
@@ -354,8 +391,17 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
   async function checkSession() {
     const generation = sessionGeneration;
     void loadWorkspace().catch(() => undefined);
+    const screenWaits = !state.loaded || (!state.account && state.login.status === "error");
+    if (screenWaits && state.loaded)
+      setState((draft) => {
+        draft.retrying = true;
+      });
     try {
-      const session = await request("session");
+      const session = await request(
+        "session",
+        undefined,
+        screenWaits ? { signal: AbortSignal.timeout(SESSION_CHECK_TIMEOUT_MS) } : undefined,
+      );
       markRemoteSync("session");
       const account = await showAccount(accountFrom(session));
       markRemoteSync("workspace-code");
@@ -377,7 +423,13 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
           setState((draft) => {
             draft.login = {
               status: "error",
-              issue: { code: "auth_api_unavailable", message: sourceText("error.auth.serviceUnavailable") },
+              issue: {
+                code: "auth_api_unavailable",
+                message:
+                  error instanceof DOMException && error.name === "TimeoutError"
+                    ? sourceText("error.auth.sessionTimeout")
+                    : sourceText("error.auth.serviceUnavailable"),
+              },
             };
           });
       }
@@ -387,6 +439,7 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
       if (!disposed)
         setState((draft) => {
           draft.loaded = true;
+          draft.retrying = false;
           if (returnError !== null && !draft.account && draft.login.status === "signed_out")
             draft.login = { status: "error", issue: companySignInIssue(returnError) };
         });
@@ -611,48 +664,72 @@ function WebAppContent(props: { createRuntime?: WebRuntimeFactory }) {
               }
             >
               {(accountId) => (
-                <Dynamic
-                  component={workspace()}
-                  accountId={accountId}
-                  accountEmail={state.account?.email ?? ""}
-                  accountName={state.account?.name ?? null}
-                  accountAvatarUrl={state.account?.avatarUrl ?? null}
-                  accountChatColor={state.account?.chatColor ?? null}
-                  accountFetch={accountFetch}
-                  onSessionCheck={checkSession}
-                  accountSessionEnded={() => sessionEnded}
-                  onLogout={logout}
-                  createRuntime={props.createRuntime}
-                  agentTemplateId={agentTemplateId()}
-                  onAgentTemplateClose={() => setAgentTemplateId(null)}
-                  inviteUrl={inviteUrl()}
-                  onInviteClose={() => setInviteUrl(null)}
-                  pluginSlug={pluginSlug()}
-                  onPluginSlugConsumed={() => setPluginSlug(null)}
-                  marketplaceListing={marketplaceListing()}
-                  onMarketplaceListingConsumed={() => setMarketplaceListing(null)}
-                  start={startLink()}
-                  onStartConsumed={() => setStartLink(null)}
-                  billingReturn={billingReturn()}
-                  onBillingReturnConsumed={() => setBillingReturn(false)}
-                  hostingReturn={hostingReturn()}
-                  onHostingReturnConsumed={() => setHostingReturn(null)}
-                  language={languagePreference.language()}
-                  onChangeLanguage={languagePreference.setLanguage}
-                  appearance={appearancePreference.appearance()}
-                  onChangeAppearance={appearancePreference.setAppearance}
-                />
+                <Show
+                  when={extensionConnect}
+                  fallback={
+                    <Dynamic
+                      component={workspace()}
+                      accountId={accountId}
+                      accountEmail={state.account?.email ?? ""}
+                      accountName={state.account?.name ?? null}
+                      accountAvatarUrl={state.account?.avatarUrl ?? null}
+                      accountChatColor={state.account?.chatColor ?? null}
+                      accountFetch={accountFetch}
+                      onSessionCheck={checkSession}
+                      accountSessionEnded={() => sessionEnded}
+                      onLogout={logout}
+                      createRuntime={props.createRuntime}
+                      agentTemplateId={agentTemplateId()}
+                      onAgentTemplateClose={() => setAgentTemplateId(null)}
+                      inviteUrl={inviteUrl()}
+                      onInviteClose={() => setInviteUrl(null)}
+                      pluginSlug={pluginSlug()}
+                      onPluginSlugConsumed={() => setPluginSlug(null)}
+                      marketplaceListing={marketplaceListing()}
+                      onMarketplaceListingConsumed={() => setMarketplaceListing(null)}
+                      start={startLink()}
+                      onStartConsumed={() => setStartLink(null)}
+                      billingReturn={billingReturn()}
+                      onBillingReturnConsumed={() => setBillingReturn(false)}
+                      hostingReturn={hostingReturn()}
+                      onHostingReturnConsumed={() => setHostingReturn(null)}
+                      language={languagePreference.language()}
+                      onChangeLanguage={languagePreference.setLanguage}
+                      appearance={appearancePreference.appearance()}
+                      onChangeAppearance={appearancePreference.setAppearance}
+                    />
+                  }
+                >
+                  {(request) => (
+                    <WebExtensionConnect
+                      variant={variant}
+                      request={request()}
+                      accountId={accountId}
+                      email={state.account?.email ?? ""}
+                      accountFetch={accountFetch}
+                    />
+                  )}
+                </Show>
               )}
             </Show>
           </Show>
           <Show when={loadingShown()}>
             <AppLoadingScreen
+              label={text.t("app.loading")}
+              title={text.t("app.loading")}
+              scene={startupLoadingScene()}
               ready={state.loaded}
               onExited={() => {
                 setLoadingShown(false);
                 void loadWorkspace().catch(() => undefined);
               }}
             />
+          </Show>
+          <Show when={!state.loaded}>
+            <WebSlowLoadNotice />
+          </Show>
+          <Show when={state.retrying}>
+            <WebSlowLoadNotice startsWait />
           </Show>
         </div>
       </NotificationObserver>

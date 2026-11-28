@@ -1,13 +1,14 @@
 import { agentNotificationLevelMap } from "@openbot/contracts/ipc";
-import { Link, router } from "expo-router";
+import { type Href, Link, router } from "expo-router";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Alert, StyleSheet, View } from "react-native";
 import { useUniwind } from "uniwind";
-import { useAgentPinTransition } from "@/features/agents/components/agent-pin-transition";
+import { useChatPinToggle } from "@/features/agents/components/use-chat-pin-toggle";
 import { useChatSectionMenu } from "@/features/agents/components/use-chat-section-menu";
 import { showFailureAlert } from "@/features/analytics/failure-reports";
 import {
   setSyncedNotificationLevels,
+  showAgentNotificationLevel,
   useSyncedNotificationLevels,
 } from "@/features/settings/model/notification-levels";
 import { useAgentUnread } from "@/features/workspace/components/use-live-workspace";
@@ -22,10 +23,10 @@ import { copyWithHaptic } from "@/shared/lib/clipboard";
 import { haptics } from "@/shared/lib/haptics";
 import { currentText, useText } from "@/shared/lib/text";
 
-function useAgentMenuActions(agent: MobileAgent) {
+function useAgentMenuActions(agent: MobileAgent, sectionMenuMounted = true) {
   const workspace = useMobileWorkspaceReader();
-  const { toggleAgentPinAnimated } = useAgentPinTransition();
-  const sectionMenu = useChatSectionMenu(agent.serverId, agent.id);
+  const { toggleAgentPin } = useChatPinToggle();
+  const sectionMenu = useChatSectionMenu(agent.serverId, agent.id, sectionMenuMounted);
   const isPinned = useMobileWorkspaceSelector(({ pinnedAgentIds }) => pinnedAgentIds.includes(agent.id));
   const canPin = useMobileWorkspaceSelector(({ pinnedAgentIds, pinnedChannelIds }) =>
     canToggleChatPin(pinnedAgentIds, pinnedChannelIds, agent.id),
@@ -60,7 +61,7 @@ function useAgentMenuActions(agent: MobileAgent) {
     }
   }
 
-  const handlePin = () => toggleAgentPinAnimated(agent.id);
+  const handlePin = () => toggleAgentPin(agent.id);
 
   const handleCopyId = () => copyWithHaptic(agent.id);
 
@@ -84,10 +85,13 @@ function useAgentMenuActions(agent: MobileAgent) {
   };
   const handleMute = () => {
     void haptics.selection();
+    const level = isMuted ? null : "nothing";
+    const undo = showAgentNotificationLevel(agent.serverId, agent.id, level);
     workspace()
-      .setAgentNotificationLevel({ agentId: agent.id, level: isMuted ? null : "nothing" }, agent.serverId)
+      .setAgentNotificationLevel({ agentId: agent.id, level }, agent.serverId)
       .then((snapshot) => setSyncedNotificationLevels(agent.serverId, snapshot))
       .catch((error: unknown) => {
+        undo();
         void haptics.notification("error");
         const text = currentText();
         showFailureAlert(
@@ -125,7 +129,7 @@ function useAgentMenuActions(agent: MobileAgent) {
   };
 }
 
-function useAgentContextMenu(agent: MobileAgent) {
+function useAgentContextMenu(agent: MobileAgent, dormant: boolean) {
   const { t } = useText();
   const {
     isPinned,
@@ -142,7 +146,7 @@ function useAgentContextMenu(agent: MobileAgent) {
     handleCopyId,
     handleDuplicate,
     handleDelete,
-  } = useAgentMenuActions(agent);
+  } = useAgentMenuActions(agent, !dormant);
   return (
     <Link.Menu>
       <Link.MenuAction icon={isUnread ? "envelope.open" : "envelope.badge"} onPress={handleRead}>
@@ -178,18 +182,26 @@ function useAgentContextMenu(agent: MobileAgent) {
   );
 }
 
+export function agentChatHref(agent: MobileAgent): Href {
+  return { pathname: "/chat/[agentId]", params: { agentId: agent.id, serverId: agent.serverId } };
+}
+
 export function AgentContextMenuLink({
   agent,
+  href = agentChatHref(agent),
   preview,
+  dormant = false,
   children,
 }: {
   agent: MobileAgent;
+  href?: Href;
   preview: ReactNode;
+  dormant?: boolean;
   children: ReactNode;
 }) {
-  const agentContextMenu = useAgentContextMenu(agent);
+  const agentContextMenu = useAgentContextMenu(agent, dormant);
   return (
-    <Link href={{ pathname: "/chat/[agentId]", params: { agentId: agent.id } }} asChild>
+    <Link href={href} asChild>
       <Link.Trigger>{children}</Link.Trigger>
       {preview}
       {agentContextMenu}

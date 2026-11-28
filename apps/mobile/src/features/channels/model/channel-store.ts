@@ -7,30 +7,51 @@ import {
   type ChannelCommand,
   type ChannelPage,
   type ChannelSummary,
+  type ChannelTask,
   type CreateChannelRoutineInput,
+  closedChannelTaskSequences,
   decodeChannel,
   decodeChannelMemories,
   decodeChannelPage,
   decodeChannelRoutines,
   decodeChannelSummaries,
   isAttachmentSummary,
+  mergeChannelTasks,
   type RespondToPromptInput,
   type UpdateChannelRoutineInput,
 } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
 import {
+  CHANNEL_COMPACT_AVAILABILITY_CAPABILITY,
+  CHANNEL_COMPACT_AVAILABILITY_ROUTE,
+  decodeChannelCompactAvailability,
+} from "@openbot/contracts/team-protocol/channel-compact-availability-v1";
+import {
   CHANNEL_PICTURE_CAPABILITY,
   CHANNEL_PICTURE_ROUTES,
 } from "@openbot/contracts/team-protocol/channel-picture-v1";
 import { CHANNEL_ROUTES } from "@openbot/contracts/team-protocol/channels-v1";
 import { CHAT_HISTORY_CAPABILITY, CHAT_HISTORY_ROUTES } from "@openbot/contracts/team-protocol/chat-history-v1";
+import { ROUTINES_ONCE_CAPABILITY } from "@openbot/contracts/team-protocol/routines-once-v1";
+import { CHANNELS_SYNC_COLLECTION } from "@openbot/contracts/team-protocol/sync-collections";
 import { decodeTeamProtocolV2Json, type TeamProtocolV2Json } from "@openbot/contracts/team-protocol/v2";
 import { sourceText } from "@openbot/i18n/source";
 import type { RemoteFileUpload } from "@openbot/team-client/remote-peer";
+import {
+  createOnceChannelRoutine,
+  isOnceSchedule,
+  listOnceChannelRoutines,
+  type RoutinesOncePost,
+  requireReleasedScheduleOn,
+  updateChannelRoutineOnce,
+} from "@openbot/team-client/routines-once";
+import type { SyncCollection } from "@openbot/team-client/sync-client";
 import { replaceEqualDeep } from "@tanstack/react-query";
 import { answeredPromptResolution } from "../../chat/model/question-prompt";
 import { saveChannelImage, savedChannelImage } from "../../workspace/model/agent-avatar-cache";
+import { type ChannelLogs, createChannelLogs } from "../../workspace/sync/message-logs";
+import type { MobileServerSync, SyncBinding } from "../../workspace/sync/server-sync";
 
 export type ChannelRequest = <T>(
   method: string,
@@ -49,6 +70,8 @@ export interface ChannelState {
   canCancelTasks: boolean;
   canSetPicture: boolean;
   canUseContextActions: boolean;
+  canUseOnceRoutines: boolean;
+  canCheckCompact: boolean;
   loading: boolean;
   listed: boolean;
   error: { cause: unknown } | null;
@@ -60,6 +83,8 @@ const FLAG_KEYS: readonly (keyof ChannelFlags)[] = [
   "canCancelTasks",
   "canSetPicture",
   "canUseContextActions",
+  "canUseOnceRoutines",
+  "canCheckCompact",
   "loading",
   "listed",
   "error",
@@ -80,6 +105,8 @@ const EMPTY: ChannelState = {
   canCancelTasks: false,
   canSetPicture: false,
   canUseContextActions: false,
+  canUseOnceRoutines: false,
+  canCheckCompact: false,
   loading: false,
   listed: false,
   error: null,
@@ -90,6 +117,7 @@ interface Entry {
   observed: Map<string, number>;
   pending: Promise<void> | null;
   dirty: boolean;
+  readList: boolean;
   readChannels: Set<string>;
   valid: boolean;
   writes: number;
@@ -98,6 +126,8 @@ interface Entry {
   changeTimer: ReturnType<typeof setTimeout> | null;
   changeReadAt: number;
   changeMissed: boolean;
+  channelsSync: SyncBinding<SyncCollection<ChannelSummary>> | null;
+  logReleases: Map<string, () => void>;
 }
 
 export class ChannelHistoryRefreshError extends Error {}
@@ -106,6 +136,7 @@ export class MobileChannelStore {
   private entries = new Map<string, Entry>();
   private listeners = new Map<string, Set<() => void>>();
   private active = true;
+  private readonly logs: ChannelLogs | null;
   setActive(active: boolean) {
     this.active = active;
     if (!active) return;
@@ -118,7 +149,10 @@ export class MobileChannelStore {
   constructor(
     private request: ChannelRequest,
     private onList?: (serverId: string, channels: ChannelSummary[]) => void,
-  ) {}
+    private sync?: MobileServerSync,
+  ) {
+    this.logs = sync ? createChannelLogs(sync, (serverId, channelId) => this.changed(serverId, channelId)) : null;
+  }
 
   private entry(serverId: string): Entry {
     let entry = this.entries.get(serverId);
@@ -131,6 +165,7 @@ export class MobileChannelStore {
         observed: new Map(),
         pending: null,
         dirty: false,
+        readList: false,
         readChannels: new Set(),
         valid: true,
         writes: 0,
@@ -139,10 +174,24 @@ export class MobileChannelStore {
         changeTimer: null,
         changeReadAt: 0,
         changeMissed: false,
+        channelsSync: null,
+        logReleases: new Map(),
       };
       this.entries.set(serverId, entry);
+      this.bindSync(serverId, entry);
     }
     return entry;
+  }
+  private bindSync(serverId: string, entry: Entry) {
+    if (!this.sync) return;
+    const channelsSync = this.sync.bindCollection(serverId, CHANNELS_SYNC_COLLECTION, {
+      requires: [CHANNEL_CHATS_CAPABILITY],
+    });
+    entry.channelsSync = channelsSync;
+    channelsSync.subscribe(() => {
+      if (!entry.valid || !entry.state.supported || channelsSync.current()?.status() !== "synced") return;
+      this.listChanged(serverId, entry);
+    });
   }
   get(serverId: string) {
     return this.entry(serverId).state;
@@ -201,6 +250,8 @@ export class MobileChannelStore {
       canCancelTasks: capabilities.includes(CHANNEL_TASK_CANCEL_CAPABILITY),
       canSetPicture: capabilities.includes(CHANNEL_PICTURE_CAPABILITY),
       canUseContextActions: capabilities.includes(CHAT_HISTORY_CAPABILITY),
+      canUseOnceRoutines: capabilities.includes(ROUTINES_ONCE_CAPABILITY),
+      canCheckCompact: capabilities.includes(CHANNEL_COMPACT_AVAILABILITY_CAPABILITY),
       ...(supported ? {} : { listed: true, channels: [], pages: new Map() }),
     });
   }
@@ -214,9 +265,20 @@ export class MobileChannelStore {
       canCancelTasks: capabilities.includes(CHANNEL_TASK_CANCEL_CAPABILITY),
       canSetPicture: capabilities.includes(CHANNEL_PICTURE_CAPABILITY),
       canUseContextActions: capabilities.includes(CHAT_HISTORY_CAPABILITY),
+      canUseOnceRoutines: capabilities.includes(ROUTINES_ONCE_CAPABILITY),
+      canCheckCompact: capabilities.includes(CHANNEL_COMPACT_AVAILABILITY_CAPABILITY),
       channels,
       pages: new Map(pages.filter((page) => ids.has(page.channel.id)).map((page) => [page.channel.id, page])),
     });
+  }
+  restorePages(serverId: string, pages: ChannelPage[]) {
+    const entry = this.entries.get(serverId);
+    if (!entry || entry.state.listed || !entry.state.channels.length || !pages.length) return;
+    const ids = new Set(entry.state.channels.map((channel) => channel.id));
+    const next = new Map(entry.state.pages);
+    for (const page of pages)
+      if (ids.has(page.channel.id) && !next.has(page.channel.id)) next.set(page.channel.id, page);
+    if (next.size !== entry.state.pages.size) this.publish(entry, { pages: next });
   }
   cachedChannels(serverId: string): { channels: ChannelSummary[]; pages: ChannelPage[] } | null {
     const state = this.entries.get(serverId)?.state;
@@ -238,6 +300,10 @@ export class MobileChannelStore {
     if (entry.changeTimer) clearTimeout(entry.changeTimer);
     entry.changeTimer = null;
     for (const id of entry.historyWaiters.keys()) this.finishHistory(entry, id, false);
+    entry.channelsSync?.release();
+    entry.channelsSync = null;
+    for (const release of entry.logReleases.values()) release();
+    entry.logReleases.clear();
     this.entries.delete(serverId);
   }
   dispose() {
@@ -246,13 +312,19 @@ export class MobileChannelStore {
   observe(serverId: string, channelId: string) {
     const entry = this.entry(serverId);
     entry.observed.set(channelId, (entry.observed.get(channelId) ?? 0) + 1);
-    if (entry.observed.get(channelId) === 1) void this.refresh(serverId);
+    if (entry.observed.get(channelId) === 1) {
+      if (this.logs && !entry.logReleases.has(channelId))
+        entry.logReleases.set(channelId, this.logs.retain(serverId, channelId));
+      void this.refresh(serverId);
+    }
     return () => {
       const count = (entry.observed.get(channelId) ?? 1) - 1;
       if (count) entry.observed.set(channelId, count);
       else {
         entry.observed.delete(channelId);
         entry.views.delete(channelId);
+        entry.logReleases.get(channelId)?.();
+        entry.logReleases.delete(channelId);
         if ((entry.state.pages.get(channelId)?.messages.length ?? 0) > 50) {
           const pages = new Map(entry.state.pages);
           const current = entry.state.pages.get(channelId);
@@ -269,6 +341,10 @@ export class MobileChannelStore {
     const entry = this.entry(serverId);
     if (!this.active || !entry.state.supported) return;
     if (entry.observed.has(channelId)) entry.readChannels.add(channelId);
+    this.listChanged(serverId, entry);
+  }
+  private listChanged(serverId: string, entry: Entry) {
+    entry.readList = true;
     if (entry.changeTimer) return;
     const wait = entry.changeReadAt + CHANGE_READ_INTERVAL_MS - Date.now();
     if (wait <= 0) {
@@ -293,6 +369,15 @@ export class MobileChannelStore {
   refresh(serverId: string, channelId?: string): Promise<void> {
     const entry = this.entry(serverId);
     if (!this.active || !entry.state.supported) return Promise.resolve();
+    entry.readList = true;
+    return this.readPages(serverId, entry, channelId);
+  }
+  private readPage(serverId: string, channelId: string): Promise<void> {
+    const entry = this.entry(serverId);
+    if (!this.active || !entry.state.supported || !entry.observed.has(channelId)) return Promise.resolve();
+    return this.readPages(serverId, entry, channelId);
+  }
+  private readPages(serverId: string, entry: Entry, channelId?: string): Promise<void> {
     for (const id of entry.observed.keys()) {
       if (!channelId || channelId === id) entry.readChannels.add(id);
     }
@@ -306,6 +391,8 @@ export class MobileChannelStore {
     const run = async () => {
       do {
         entry.dirty = false;
+        const readList = entry.readList || !entry.state.listed;
+        entry.readList = false;
         const readChannels = [...entry.readChannels];
         entry.readChannels.clear();
         this.publish(entry, {
@@ -316,15 +403,10 @@ export class MobileChannelStore {
           const writes = entry.writes;
           let listedIds: Set<string> | undefined;
           const list = async () => {
-            const channels = await this.request(
-              "GET",
-              CHANNEL_ROUTES.list,
-              decodeChannelSummaries,
-              undefined,
-              serverId,
-            );
+            const channels = await this.listChannels(serverId, entry);
             if (!entry.valid || !this.active) return;
             if (writes !== entry.writes) {
+              entry.readList = true;
               entry.dirty = true;
               return;
             }
@@ -341,13 +423,7 @@ export class MobileChannelStore {
             });
           };
           const read = async (id: string) => {
-            const page = await this.request(
-              "POST",
-              CHANNEL_ROUTES.read,
-              decodeChannelPage,
-              { channelId: id },
-              serverId,
-            );
+            const page = await this.latestPage(serverId, id);
             if (!entry.valid || !this.active) return;
             if (writes !== entry.writes) {
               entry.dirty = true;
@@ -362,10 +438,14 @@ export class MobileChannelStore {
               nextPages.set(id, merged);
               this.publish(entry, { pages: nextPages });
             }
+            const first = page.messages[0]?.sequence ?? 0;
+            const held = merged.messages.filter((message) => message.sequence < first);
+            const closed = current ? closedChannelTaskSequences(page.tasks, current.tasks, held) : [];
+            if (closed.length) void this.readClosedTasks(serverId, entry, id, closed).catch(() => undefined);
             this.finishHistory(entry, id, true);
           };
           const results = await Promise.allSettled([
-            list(),
+            ...(readList ? [list()] : []),
             ...readChannels.map((id) =>
               read(id).catch((error) => {
                 if (writes === entry.writes) this.finishHistory(entry, id, false);
@@ -385,6 +465,39 @@ export class MobileChannelStore {
       entry.pending = null;
     });
     return entry.pending;
+  }
+  private async latestPage(serverId: string, channelId: string): Promise<ChannelPage> {
+    const synced = await this.logs?.read(serverId, channelId);
+    return synced ?? this.request("POST", CHANNEL_ROUTES.read, decodeChannelPage, { channelId }, serverId);
+  }
+  private async listChannels(serverId: string, entry: Entry): Promise<ChannelSummary[]> {
+    const binding = entry.channelsSync;
+    if (binding?.current()?.status() === "synced") await this.sync?.settle(serverId);
+    const synced = binding?.current();
+    if (synced?.status() === "synced") return [...synced.values()];
+    const channels = await this.request("GET", CHANNEL_ROUTES.list, decodeChannelSummaries, undefined, serverId);
+    return channels.sort(CHANNELS_SYNC_COLLECTION.compare);
+  }
+  private async readClosedTasks(serverId: string, entry: Entry, channelId: string, sequences: number[]) {
+    let covered = Number.POSITIVE_INFINITY;
+    for (const sequence of sequences) {
+      if (sequence >= covered) continue;
+      const page = await this.request(
+        "POST",
+        CHANNEL_ROUTES.read,
+        decodeChannelPage,
+        { channelId, beforeSequence: sequence + 1 },
+        serverId,
+      );
+      covered = page.messages[0]?.sequence ?? sequence;
+      const latest = entry.state.pages.get(channelId);
+      if (!entry.valid || !latest) return;
+      const tasks = mergeChannelTasks(latest.tasks, page.tasks, latest.messages);
+      if (tasks.length === latest.tasks.length) continue;
+      const pages = new Map(entry.state.pages);
+      pages.set(channelId, { ...latest, tasks });
+      this.publish(entry, { pages });
+    }
   }
   private finishHistory(entry: Entry, channelId: string, success: boolean) {
     const waiters = entry.historyWaiters.get(channelId);
@@ -409,7 +522,7 @@ export class MobileChannelStore {
       const waiters = entry.historyWaiters.get(channelId) ?? new Set();
       waiters.add(finish);
       entry.historyWaiters.set(channelId, waiters);
-      void this.refresh(serverId, channelId).then(
+      void this.readPage(serverId, channelId).then(
         () => finish(false),
         () => finish(false),
       );
@@ -438,10 +551,12 @@ export class MobileChannelStore {
     if (!entry.valid || !latest || latest.olderCursor !== current.olderCursor) return;
     const messages = new Map(page.messages.map((message) => [message.id, message]));
     for (const message of latest.messages) messages.set(message.id, message);
+    const merged = [...messages.values()].sort((a, b) => a.sequence - b.sequence);
     const pages = new Map(entry.state.pages);
     pages.set(channelId, {
       ...latest,
-      messages: [...messages.values()].sort((a, b) => a.sequence - b.sequence),
+      messages: merged,
+      tasks: mergeChannelTasks(latest.tasks, page.tasks, merged),
       olderCursor: page.olderCursor,
     });
     this.publish(entry, { pages });
@@ -491,7 +606,7 @@ export class MobileChannelStore {
       });
       entry.writes++;
       this.publish(entry, { pages });
-      void this.refresh(serverId, channelId);
+      void this.readPage(serverId, channelId);
     }
   }
   async command(serverId: string, command: ChannelCommand, options?: { waitForRefresh: boolean }) {
@@ -499,13 +614,20 @@ export class MobileChannelStore {
     if (!entry.state.supported) throw new Error(sourceText("error.remote.channelsUnsupported"));
     const unreadChannel =
       command.type === "read" ? entry.state.channels.find((channel) => channel.id === command.channelId) : undefined;
-    const result = await this.request(
-      "POST",
-      CHANNEL_ROUTES.command,
-      decodeChannel,
-      decodeTeamProtocolV2Json(command),
-      serverId,
-    );
+    const undoTasks = this.showTaskCommand(entry, command);
+    let result: Channel;
+    try {
+      result = await this.request(
+        "POST",
+        CHANNEL_ROUTES.command,
+        decodeChannel,
+        decodeTeamProtocolV2Json(command),
+        serverId,
+      );
+    } catch (error) {
+      if (undoTasks()) void this.readPage(serverId, command.channelId);
+      throw error;
+    }
     if (entry.valid && command.type === "read") {
       const channels = entry.state.channels.map((channel) =>
         channel === unreadChannel &&
@@ -517,21 +639,39 @@ export class MobileChannelStore {
       if (channels.some((channel, index) => channel !== entry.state.channels[index])) this.publish(entry, { channels });
       return result;
     }
-    if (entry.valid) {
-      this.applyChannel(entry, result);
-      if (options?.waitForRefresh && command.type === "send" && entry.observed.has(result.id))
-        await this.refreshHistory(serverId, result.id);
-      else if (
-        options?.waitForRefresh &&
-        (command.type === "resume" || command.type === "reassign" || command.type === "cancel")
-      )
-        await this.refreshHistory(serverId, result.id, sourceText("error.remote.taskHistoryRefreshFailed"));
-      else {
-        const refresh = this.refresh(serverId);
-        if (options?.waitForRefresh) await refresh;
-      }
+    if (!entry.valid) return result;
+    this.applyChannel(entry, result);
+    if (!entry.observed.has(result.id)) return result;
+    if (options?.waitForRefresh && command.type === "send") await this.refreshHistory(serverId, result.id);
+    else if (
+      options?.waitForRefresh &&
+      (command.type === "resume" || command.type === "reassign" || command.type === "cancel")
+    )
+      await this.refreshHistory(serverId, result.id, sourceText("error.remote.taskHistoryRefreshFailed"));
+    else {
+      const read = this.readPage(serverId, result.id);
+      if (options?.waitForRefresh) await read;
     }
     return result;
+  }
+  private showTaskCommand(entry: Entry, command: ChannelCommand): () => boolean {
+    const page = entry.state.pages.get(command.channelId);
+    const tasks = page ? commandTasks(page.tasks, command) : null;
+    if (!page || !tasks) return () => false;
+    entry.writes += 1;
+    this.publishPage(entry, command.channelId, { ...page, tasks });
+    return () => {
+      const current = entry.state.pages.get(command.channelId);
+      if (!entry.valid || current?.tasks !== tasks) return false;
+      entry.writes += 1;
+      this.publishPage(entry, command.channelId, { ...current, tasks: page.tasks });
+      return true;
+    };
+  }
+  private publishPage(entry: Entry, channelId: string, page: ChannelPage) {
+    const pages = new Map(entry.state.pages);
+    pages.set(channelId, page);
+    this.publish(entry, { pages });
   }
   private applyChannel(entry: Entry, result: Channel) {
     entry.writes += 1;
@@ -586,28 +726,60 @@ export class MobileChannelStore {
   async markAllRead(serverId: string, operationId: () => string) {
     const entry = this.entry(serverId);
     if (!entry.state.supported) return;
-    const unread = entry.state.channels.filter((channel) => channel.unreadCount > 0).map((channel) => channel.id);
-    if (unread.length === 0) return;
-    const results = await Promise.allSettled(
-      unread.map(async (channelId) => {
-        const page = await this.request("POST", CHANNEL_ROUTES.read, decodeChannelPage, { channelId }, serverId);
-        await this.command(serverId, {
-          type: "read",
-          operationId: operationId(),
-          channelId,
-          throughSequence: page.throughSequence,
-        });
-      }),
+    const unread = new Map(
+      entry.state.channels.filter((channel) => channel.unreadCount > 0).map((channel) => [channel.id, channel]),
     );
-    await this.refresh(serverId);
+    if (unread.size === 0) return;
+    const shown = new Map<string, ChannelSummary>();
+    entry.writes += 1;
+    this.publish(entry, {
+      channels: entry.state.channels.map((channel) => {
+        if (!unread.has(channel.id)) return channel;
+        const read = { ...channel, unreadCount: 0 };
+        shown.set(channel.id, read);
+        return read;
+      }),
+    });
+    const results = await Promise.allSettled(
+      [...unread.keys()].map((channelId) => this.#readThrough(serverId, channelId, operationId)),
+    );
+    const failed = new Set([...unread.keys()].filter((_, index) => results[index]?.status === "rejected"));
+    if (entry.valid && failed.size) {
+      entry.writes += 1;
+      this.publish(entry, {
+        channels: entry.state.channels.map((channel) =>
+          failed.has(channel.id) && shown.get(channel.id) === channel ? (unread.get(channel.id) ?? channel) : channel,
+        ),
+      });
+    }
     const failure = results.find((result) => result.status === "rejected");
     if (failure) throw failure.reason;
+  }
+  async markRead(serverId: string, channelId: string, operationId: () => string) {
+    await this.#readThrough(serverId, channelId, operationId);
+    await this.refresh(serverId);
+  }
+  async #readThrough(serverId: string, channelId: string, operationId: () => string) {
+    const page = await this.request("POST", CHANNEL_ROUTES.read, decodeChannelPage, { channelId }, serverId);
+    await this.command(serverId, {
+      type: "read",
+      operationId: operationId(),
+      channelId,
+      throughSequence: page.throughSequence,
+    });
   }
   memories(serverId: string, channelId: string) {
     return this.request("POST", CHANNEL_ROUTES.memories, decodeChannelMemories, { channelId }, serverId);
   }
   routines(serverId: string, channelId: string) {
     return this.request("POST", CHANNEL_ROUTES.routines, decodeChannelRoutines, { channelId }, serverId);
+  }
+  async onceRoutines(serverId: string, channelId: string) {
+    if (!this.entry(serverId).state.canUseOnceRoutines) return [];
+    return listOnceChannelRoutines(this.oncePost(serverId), channelId);
+  }
+  private oncePost(serverId: string): RoutinesOncePost {
+    return (path, decode, body) => this.request("POST", path, decode, body, serverId);
   }
   async saveMemory(serverId: string, channelId: string, text: string, memoryId?: string) {
     await this.request(
@@ -622,6 +794,11 @@ export class MobileChannelStore {
     await this.request("POST", CHANNEL_ROUTES.memoryDelete, () => undefined, { channelId, memoryId }, serverId);
   }
   async createRoutine(serverId: string, input: CreateChannelRoutineInput) {
+    if (isOnceSchedule(input.schedule)) {
+      requireReleasedScheduleOn(input.schedule, this.entry(serverId).state.canUseOnceRoutines);
+      await createOnceChannelRoutine(this.oncePost(serverId), input);
+      return;
+    }
     await this.request(
       "POST",
       CHANNEL_ROUTES.routineCreate,
@@ -631,6 +808,10 @@ export class MobileChannelStore {
     );
   }
   async updateRoutine(serverId: string, input: UpdateChannelRoutineInput) {
+    if (this.entry(serverId).state.canUseOnceRoutines) {
+      await updateChannelRoutineOnce(this.oncePost(serverId), input);
+      return;
+    }
     await this.request(
       "POST",
       CHANNEL_ROUTES.routineUpdate,
@@ -669,6 +850,17 @@ export class MobileChannelStore {
   async compactContext(serverId: string, channelId: string) {
     await this.contextAction(serverId, CHAT_HISTORY_ROUTES.channelCompact, channelId, false);
   }
+  async compactAvailable(serverId: string, channelId: string): Promise<boolean> {
+    if (!this.entry(serverId).state.canCheckCompact) return true;
+    const answer = await this.request(
+      "POST",
+      CHANNEL_COMPACT_AVAILABILITY_ROUTE,
+      decodeChannelCompactAvailability,
+      { channelId },
+      serverId,
+    );
+    return answer.available;
+  }
   async deleteHistory(serverId: string, channelId: string) {
     await this.contextAction(serverId, CHAT_HISTORY_ROUTES.channelDelete, channelId);
   }
@@ -704,13 +896,59 @@ export class MobileChannelStore {
   }
 }
 
+function commandTasks(tasks: readonly ChannelTask[], command: ChannelCommand): ChannelTask[] | null {
+  if (command.type !== "resume" && command.type !== "reassign" && command.type !== "cancel") return null;
+  const { type, taskId, recipientAgentId } = command;
+  const selected = tasks.find((task) => task.id === taskId);
+  if (!selected || closedTask(selected)) return null;
+  if (type === "cancel") {
+    if (selected.state !== "paused" && selected.state !== "failed") return null;
+    const cancelled = taskBranch(tasks, selected.rootTaskId);
+    return tasks.map(
+      (task): ChannelTask =>
+        cancelled.has(task.id) ? { ...task, state: "cancelled", error: null, revision: task.revision + 1 } : task,
+    );
+  }
+  if (type === "reassign" && !recipientAgentId) return null;
+  const branch = taskBranch(tasks, selected.id);
+  return tasks.map((task): ChannelTask => {
+    if (!branch.has(task.id)) return task;
+    if (type === "reassign" && task.id !== selected.id && task.state !== "paused" && task.state !== "failed")
+      return task;
+    return {
+      ...task,
+      state: "queued",
+      error: null,
+      revision: task.revision + 1,
+      assignmentCount: 0,
+      ownerAgentId: type === "reassign" && task.id === selected.id ? recipientAgentId : task.ownerAgentId,
+    };
+  });
+}
+
+function taskBranch(tasks: readonly ChannelTask[], taskId: string): Set<string> {
+  const branch = new Set([taskId]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const task of tasks)
+      if (task.parentTaskId && branch.has(task.parentTaskId) && !branch.has(task.id)) {
+        branch.add(task.id);
+        grew = true;
+      }
+  }
+  return new Set(tasks.filter((task) => branch.has(task.id) && !closedTask(task)).map((task) => task.id));
+}
+
+function closedTask(task: ChannelTask): boolean {
+  return task.state === "completed" || task.state === "cancelled";
+}
+
 function mergeLatestChannelPage(current: ChannelPage | undefined, page: ChannelPage): ChannelPage {
   if (!current) return page;
   const first = page.messages[0]?.sequence ?? 0;
   const older = current.messages.filter((message) => message.sequence < first);
-  const merged =
-    !older.length || (older.at(-1)?.sequence ?? 0) + 1 < first
-      ? page
-      : { ...page, messages: [...older, ...page.messages], olderCursor: current.olderCursor };
-  return replaceEqualDeep(current, merged);
+  if (!older.length || (older.at(-1)?.sequence ?? 0) + 1 < first) return replaceEqualDeep(current, page);
+  const messages = [...older, ...page.messages];
+  const tasks = mergeChannelTasks(page.tasks, current.tasks, older);
+  return replaceEqualDeep(current, { ...page, messages, tasks, olderCursor: current.olderCursor });
 }

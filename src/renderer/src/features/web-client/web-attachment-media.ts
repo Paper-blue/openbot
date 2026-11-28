@@ -3,8 +3,9 @@ import type { AttachmentSummary } from "@openbot/contracts/ipc";
 import { base64ToBytes, bytesToBase64 } from "@openbot/team-client/base64";
 import { MOBILE_ATTACHMENT_BYTES } from "@openbot/team-client/remote-peer";
 import type { AttachmentMediaSource } from "@openbot/ui/features/conversation/AttachmentCards";
-import { createSignal } from "solid-js";
-import type { WebWorkspaceRuntime } from "./web-runtime";
+import { createEffect, createRoot, createSignal } from "solid-js";
+import { createDownloadLimit } from "./web-download-limit";
+import type { WebFile, WebWorkspaceRuntime } from "./web-runtime";
 
 const WEB_THUMBNAIL_BYTES = 2 * 1024 * 1024;
 const WEB_GENERATED_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -37,6 +38,8 @@ interface WebMediaFile {
 export interface WebAttachmentMedia extends AttachmentMediaSource {
   file(attachmentId: string): Promise<WebMediaFile | null>;
   keep(attachment: AttachmentSummary, bytes: Uint8Array<ArrayBuffer>): void;
+  copyUrl(attachmentId: string): string | undefined;
+  readonly withCopies: AttachmentMediaSource;
   dispose(): void;
 }
 
@@ -49,18 +52,17 @@ interface Entry {
 }
 
 export function createWebAttachmentMedia(
-  remote: Pick<WebWorkspaceRuntime, "download">,
+  remote: Pick<WebWorkspaceRuntime, "download"> & Partial<Pick<WebWorkspaceRuntime, "downloadPreview">>,
   hostId: () => string,
   urls: { create(blob: Blob): string; revoke(url: string): void } = {
     create: (blob) => URL.createObjectURL(blob),
     revoke: (url) => URL.revokeObjectURL(url),
   },
+  copies?: () => boolean | undefined,
 ): WebAttachmentMedia {
   const entries = new Map<string, Entry>();
   const [shown, setShown] = createSignal<ReadonlyMap<string, string>>(new Map());
   const loading = new Map<string, Promise<boolean>>();
-  const waiting: (() => void)[] = [];
-  let active = 0;
   let cachedHost = "";
   let total = 0;
   let generation = 0;
@@ -93,14 +95,7 @@ export function createWebAttachmentMedia(
     }
     publish();
   };
-  const slot = async () => {
-    if (active >= CONCURRENT_DOWNLOADS) await new Promise<void>((resolve) => waiting.push(resolve));
-    active += 1;
-  };
-  const release = () => {
-    active -= 1;
-    waiting.shift()?.();
-  };
+  const limited = createDownloadLimit(CONCURRENT_DOWNLOADS);
 
   const entryFor = (attachment: AttachmentSummary, type: string, bytes: Uint8Array<ArrayBuffer>): Entry => {
     const blob = new Blob([bytes], { type });
@@ -112,49 +107,105 @@ export function createWebAttachmentMedia(
   const limitFor = (type: string, size: "thumbnail" | "generated") =>
     playableMediaKind(type) ? WEB_MEDIA_BYTES : size === "generated" ? WEB_GENERATED_IMAGE_BYTES : WEB_THUMBNAIL_BYTES;
 
-  async function download(attachment: AttachmentSummary, type: string, limit: number, key: string) {
+  async function download(attachment: AttachmentSummary, type: string, limit: number, key: string, copy = false) {
     const started = generation;
-    await slot();
-    try {
-      if (generation !== started) return false;
-      const file = await remote.download(attachment.id);
-      const bytes = base64ToBytes(file.base64);
-      if (bytes.byteLength > limit || generation !== started) return false;
-      store(key, entryFor(attachment, type, bytes));
-      return true;
-    } catch {
-      return false;
-    } finally {
-      release();
-    }
+    return limited(async () => {
+      try {
+        if (generation !== started) return false;
+        const file: WebFile =
+          copy && remote.downloadPreview
+            ? await remote.downloadPreview(attachment.id)
+            : await remote.download(attachment.id);
+        const bytes = base64ToBytes(file.base64);
+        if (bytes.byteLength > limit || generation !== started) return false;
+        store(key, entryFor(attachment, copy && MEDIA_TYPES.has(file.mimeType) ? file.mimeType : type, bytes));
+        return true;
+      } catch {
+        return false;
+      }
+    });
   }
 
-  return {
+  const loadOnce = (key: string, start: () => Promise<boolean>) => {
+    const entry = entries.get(key);
+    if (entry) {
+      entries.delete(key);
+      entries.set(key, entry);
+      return Promise.resolve(true);
+    }
+    const running = loading.get(key);
+    if (running) return running;
+    const job = start().finally(() => {
+      if (loading.get(key) === job) loading.delete(key);
+    });
+    loading.set(key, job);
+    return job;
+  };
+  const copyKey = (host: string, attachmentId: string) => `${host}:copy:${attachmentId}`;
+  const shownUrl = (key: string) => (disposed ? undefined : shown().get(key));
+
+  let copiesKnown: Promise<void> | null = null;
+  let stopWaiting: (() => void) | null = null;
+  const whenCopiesKnown = () => {
+    copiesKnown ??= new Promise<void>((resolve) => {
+      createRoot((dispose) => {
+        stopWaiting = () => {
+          copiesKnown = null;
+          stopWaiting = null;
+          dispose();
+          resolve();
+        };
+        createEffect(
+          () => copies?.() !== undefined,
+          (known) => {
+            if (known) stopWaiting?.();
+          },
+        );
+      });
+    });
+    return copiesKnown;
+  };
+  const fullUrl = (id: string) => shownUrl(`${hostId()}:${id}`);
+  const load = (
+    attachment: AttachmentSummary,
+    size: "thumbnail" | "generated" = "thumbnail",
+    copied = false,
+  ): Promise<boolean> => {
+    const host = currentHost();
+    const key = `${host}:${attachment.id}`;
+    const type = mediaType(attachment);
+    if (!type) return Promise.resolve(false);
+    const limit = limitFor(type, size);
+    if (attachment.size > limit) return Promise.resolve(false);
+    const whole = () => loadOnce(key, () => download(attachment, type, limit, key));
+    if (!copied || size !== "thumbnail" || !remote.downloadPreview || !copies) return whole();
+    const supported = copies();
+    if (supported === undefined)
+      return whenCopiesKnown().then(() => (disposed ? false : load(attachment, size, copied)));
+    if (!supported) return whole();
+    if (entries.has(key) || playableMediaKind(type) || type === SVG_TYPE) return whole();
+    const copy = copyKey(host, attachment.id);
+    const started = generation;
+    return loadOnce(copy, () => download(attachment, type, limit, copy, true)).then(
+      (shown) => shown || (generation === started && !disposed && whole()),
+    );
+  };
+  const limits = {
     thumbnailLimit: WEB_THUMBNAIL_BYTES,
     generatedImageLimit: WEB_GENERATED_IMAGE_BYTES,
     mediaLimit: WEB_MEDIA_BYTES,
-    url: (id) => (disposed ? undefined : shown().get(`${hostId()}:${id}`)),
-    load(attachment, size = "thumbnail") {
-      const host = currentHost();
-      const key = `${host}:${attachment.id}`;
-      const entry = entries.get(key);
-      if (entry) {
-        entries.delete(key);
-        entries.set(key, entry);
-        return Promise.resolve(true);
-      }
-      const running = loading.get(key);
-      if (running) return running;
-      const type = mediaType(attachment);
-      if (!type) return Promise.resolve(false);
-      const limit = limitFor(type, size);
-      if (attachment.size > limit) return Promise.resolve(false);
-      const job = download(attachment, type, limit, key).finally(() => {
-        if (loading.get(key) === job) loading.delete(key);
-      });
-      loading.set(key, job);
-      return job;
+  };
+
+  return {
+    ...limits,
+    url: fullUrl,
+    copyUrl: (id) => shownUrl(copyKey(hostId(), id)),
+    withCopies: {
+      ...limits,
+      url: (id) => fullUrl(id) ?? shownUrl(copyKey(hostId(), id)),
+      load: (attachment, size) => load(attachment, size, true),
     },
+    load: (attachment, size) => load(attachment, size),
     async file(attachmentId) {
       if (disposed) return null;
       const key = `${currentHost()}:${attachmentId}`;
@@ -172,6 +223,7 @@ export function createWebAttachmentMedia(
     },
     dispose() {
       disposed = true;
+      stopWaiting?.();
       clear();
     },
   };

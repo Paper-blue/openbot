@@ -18,6 +18,7 @@ import { useSetup } from "../onboarding/onboarding-context";
 import { useRemoteDesktop } from "../remote-desktop/remote-desktop-context";
 import { useSettings } from "../settings/settings-context";
 import { useWindowPage } from "../window/window-page-context";
+import { watchAgentWorkflows } from "../workflows/agent-workflow-toast";
 import { useServerSwitch } from "./server-switch";
 import { useServers } from "./servers-context";
 import { activeServerId, serversPort } from "./servers-port";
@@ -36,7 +37,7 @@ const ServerSelection = createSimpleContext({
       setPendingThreadSelection,
       setPreviousServerId,
     } = useServerSwitch();
-    const { agentSetupOpen, creatingAgent } = useAgents();
+    const { agentList, agentSetupOpen, creatingAgent } = useAgents();
     const { stopComposerTyping } = useConversationController();
     const { setDirectTyping } = useDirectMessages();
     const { chatWindow } = usePlatform();
@@ -152,6 +153,14 @@ const ServerSelection = createSimpleContext({
       }),
     );
 
+    if (!chatWindow)
+      watchAgentWorkflows({
+        activeServer: () => servers().find((server) => server.active),
+        workflowsOnScreen: () => windowPage.page() === "workflows",
+        agentName: (agentId) => agentList().find((agent) => agent.id === agentId)?.name,
+        open: (workflow) => void openNotifiedWorkflow(workflow).catch(() => undefined),
+      });
+
     async function joinServer(input: { inviteUrl: string }): Promise<void> {
       const analytics = desktopAnalytics.scope();
       const entryPoint = pendingInviteUrl() ? "invite_deep_link" : "in_app";
@@ -181,11 +190,24 @@ const ServerSelection = createSimpleContext({
       await saveSetup(provider);
     }
 
+    async function openServerDuringSetup(serverId: string, provider: AgentProviderId): Promise<boolean> {
+      const previousServerId = servers().find((server) => server.active)?.id ?? "local";
+      if (!(await selectServer(serverId, false))) return false;
+      try {
+        await saveSetup(provider, null, { path: "existing" });
+      } catch (error) {
+        await selectServer(previousServerId, false).catch(() => false);
+        throw error;
+      }
+      return true;
+    }
+
     return {
       selectServer,
       joinServer,
       createLocalServer,
       joinRemoteDuringSetup,
+      openServerDuringSetup,
       openInstalledMarketplaceAgent,
     };
   },

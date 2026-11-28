@@ -30,6 +30,7 @@ export function useConversationReads({
   capabilities,
   activeServerId,
   agents,
+  readSynced,
 }: {
   liveState: LiveWorkspaceStore;
   readRefresh: ReturnType<typeof createRemoteReadRefresh>;
@@ -41,15 +42,23 @@ export function useConversationReads({
   capabilities: ServerCapabilities;
   activeServerId: RefObject<string | null>;
   agents: RefObject<MobileAgent[]>;
+  readSynced: (
+    serverId: string,
+    fallback: () => Promise<Record<string, MobileConversationRead>>,
+  ) => Promise<Record<string, MobileConversationRead>>;
 }) {
   const readWrites = useRef(new Map<string, Promise<void>>());
   const applyConversationReads = useCallback(
     (reads: Record<string, MobileConversationRead>) => {
       liveState.update("unreadAgentIds", (current) => mergeRemoteUnreadIds(current, reads));
-      liveState.update("unreadCounts", (current) => ({
-        ...current,
-        ...Object.fromEntries(Object.entries(reads).map(([agentId, read]) => [agentId, read.unreadCount])),
-      }));
+      liveState.update("unreadCounts", (current) =>
+        Object.entries(reads).every(([agentId, read]) => current[agentId] === read.unreadCount)
+          ? current
+          : {
+              ...current,
+              ...Object.fromEntries(Object.entries(reads).map(([agentId, read]) => [agentId, read.unreadCount])),
+            },
+      );
       liveState.update("firstUnreadMessageIds", (current) =>
         Object.entries(reads).every(([agentId, read]) => current[agentId] === read.firstUnreadMessageId)
           ? current
@@ -81,7 +90,15 @@ export function useConversationReads({
             serverId,
             () =>
               Effect.tryPromise(() =>
-                request("GET", TEAM_API_ROUTES.agents.conversationReads, decodeConversationReads, undefined, serverId),
+                readSynced(serverId, () =>
+                  request(
+                    "GET",
+                    TEAM_API_ROUTES.agents.conversationReads,
+                    decodeConversationReads,
+                    undefined,
+                    serverId,
+                  ),
+                ),
               ),
             applyConversationReads,
             () => !removedServers.current.has(serverId),
@@ -106,7 +123,7 @@ export function useConversationReads({
       readLoads.current.set(serverId, load);
       return load.promise;
     },
-    [request, readRefresh, applyConversationReads, activeServerId, removedServers],
+    [request, readRefresh, applyConversationReads, activeServerId, removedServers, readSynced],
   );
 
   const refreshConversationReads = useCallback(

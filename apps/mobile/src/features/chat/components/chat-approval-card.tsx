@@ -7,6 +7,8 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "reac
 import { ScrollView, View } from "react-native";
 import { useCSSVariable } from "uniwind";
 import { showWarningAlert } from "@/features/analytics/failure-reports";
+import { useChatCardSurface } from "@/features/chat/components/chat-bubble-fill";
+import { approvalCommandText, approvalTitle, shortPath } from "@/features/chat/model/approval-text";
 import {
   phoneNetwork,
   refreshPhoneNetwork,
@@ -19,30 +21,12 @@ import {
   type PendingApproval,
 } from "@/features/workspace/model/pending-approvals";
 import { haptics } from "@/shared/lib/haptics";
-import { type MobileText, useText } from "@/shared/lib/text";
+import { useText } from "@/shared/lib/text";
 
 export type ApprovalDecision = "accept" | "decline";
 
-const SHELL_WRAPPER = /^(?:\/(?:usr\/)?bin\/)?(?:ba|z)?sh -l?c (?:'([^']*)'|"([^"\\$`]*)")$/su;
-const HOME_FOLDER = /^(?:\/Users|\/home)\/[^/]+(?=\/|$)/u;
-
-export function approvalTitle(approval: PendingApproval, t: MobileText["t"]): string {
-  if (approval.kind === "command") return t("mobile.chat.approval.title.command");
-  if (approval.kind === "file-change") return t("mobile.chat.approval.title.fileChange");
-  return t("mobile.chat.approval.title.permissions");
-}
-
-function commandText(command: string) {
-  const match = SHELL_WRAPPER.exec(command);
-  return match?.[1] ?? match?.[2] ?? command;
-}
-
 function wholeReadFailed(error: unknown) {
   return !(error instanceof InactiveRequestError);
-}
-
-function shortPath(path: string) {
-  return path.replace(HOME_FOLDER, "~");
 }
 
 export function ChatApprovalCard({
@@ -65,6 +49,7 @@ export function ChatApprovalCard({
   loadWhole: () => Promise<void>;
 }) {
   const { t, errorMessage, sourceText } = useText();
+  const card = useChatCardSurface();
   const [foreground, muted] = useThemeColor(["foreground", "muted"]);
   const [warningText] = useCSSVariable(["--openbot-warning-text"]);
   const [pending, setPending] = useState<ApprovalDecision | null>(null);
@@ -194,10 +179,7 @@ export function ChatApprovalCard({
       accessibilityLabel={t("mobile.chat.approval.label")}
       accessibilityState={{ busy: pending !== null }}
     >
-      <View
-        className="max-w-[92%] self-start gap-2.5 rounded-[20px] bg-control/60 px-4 py-3"
-        style={{ borderCurve: "circular" }}
-      >
+      <View className={`max-w-[92%] self-start gap-2.5 rounded-[20px] ${card.fillClass} px-4 py-3`} style={card.style}>
         {showAgentName ? (
           <Typography.Paragraph type="body-xs" className="text-text-secondary" numberOfLines={1}>
             {t("mobile.chat.approval.from", { name: agentName })}
@@ -274,7 +256,7 @@ export function ChatApprovalCard({
                 className="bg-transparent p-0"
                 style={{ color: foreground, fontSize: 13, lineHeight: 19 }}
               >
-                {commandText(approval.command)}
+                {approvalCommandText(approval.command)}
               </Typography.Code>
             ) : null}
             {approval.kind === "file-change" ? (

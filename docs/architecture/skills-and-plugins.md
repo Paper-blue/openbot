@@ -94,8 +94,13 @@ uses it in two places: `openbot_browser.list_logins` returns the logins saved fo
 site (id, title, username), and `AttentionRegistry` answers a `submit_secret` password or
 authenticator request for a saved login by filling it through the same `prepareSecret` path as the
 secure card, with no card. While agent code from `evaluate` can still run in the page,
-`BrowserHost` reports `agentScriptedOrigin` and the card opens instead, because that code could read
-the filled fields. The mark is per document, and it stays until a main-frame navigation, a close, or an idle unload.
+`BrowserHost` reports `agentScriptedOrigin`, because that code could read the filled fields. When the
+call names a `loginId`, the agent gets the skip text at once, with no card: a reload of the sign-in page
+lets the saved login fill, and a scheduled routine has nobody to answer a card (#14181). Without a
+`loginId`, the card opens instead, so the agent can still let the user type the password. In a routine
+turn, a call that names a `loginId` never opens a card: when OpenBot skips the saved login for any
+reason, or its fill does not finish, the agent gets the reason at once and reports the sign-in (#16283).
+The mark is per document, and it stays until a main-frame navigation, a close, or an idle unload.
 A script can also write Cache Storage that a service worker serves as page code, also to a page that
 the worker claims after it loaded, so the origin stays tainted in that session. Thus, while a scripted
 page is open, no page of its origin in the same session fills. When it ends, a same-origin page of a
@@ -199,7 +204,14 @@ and `mcpAuthorization()` gives it a fresh bearer at each hand-off. An enabled se
 with the name `github` wins. For `gh` and `git`, the service writes the token to
 `<userData>/provider-state/github` (mode 0600), and each provider gets `GH_CONFIG_DIR` and a
 `GIT_CONFIG_*` credential helper that reads that file. The environment holds only paths, never the
-token. Codex gets these values through `shell_environment_policy.set` in the thread config.
+token. The helper gives the `openbotgit[bot]` token for a repository that has one. For other
+repositories, it first asks the git credential helpers that the computer had before (with the
+original `GH_CONFIG_DIR` and no prompts), and gives the connector's user token only when they have
+no credential. The OpenBot GitHub App reaches only the repositories where it is installed, so this
+keeps git working on private repositories that the user's own login reaches. The fallback only
+reads: git does not send a store or an erase to the helpers of the computer, and when GitHub refuses
+the computer's credential, git does not try the connector token in the same command. Codex gets
+these values through `shell_environment_policy.set` in the thread config.
 
 A user token makes GitHub show "user with OpenBotGit". To show `openbotgit[bot]`, the desktop sends
 the user token to `POST /v1/github/installation-tokens` on the account Worker
@@ -215,7 +227,8 @@ granted the permission, the proxy adds an explanation to the `create_repository`
 agent can give to the user. With no key it answers 503, and the desktop keeps the user token.
 `src/main/github-bot-tokens.ts` renews the set ten minutes before the first token expires.
 - `git`: the helper runs with `useHttpPath`, and takes the bot token for the repository from
-  `provider-state/github/repositories`, or else the user token.
+  `provider-state/github/repositories`, or else the computer's own git login,
+  or else the user token.
 - MCP: `src/main/github-mcp-proxy.ts` is a loopback MCP server with a secret bearer. It forwards to
   `api.githubcopilot.com/mcp/` with one upstream client for each token, because GitHub binds an MCP
   session to its token. A tool call with `owner` and `repo` arguments uses that repository's bot
@@ -243,4 +256,6 @@ The backend local skill tools derive the agent from the calling provider session
 
 A plugin is one developer's bundle: an MCP server, shown as an app, the skills that drive it, and the listing text. The catalog of available plugins is a static file set that the Account Worker serves from `openbot.run` without an account, and the main process keeps a copy in the user-data directory rather than in SQLite, because a remote catalog is a cache and not the source of truth. An install saves the app as a host-global MCP server and installs the pinned skills into the chosen agent. A share link at `openbot.run/plugins/<slug>` opens a public page, and `openbot://plugins/<slug>` opens the listing in the app; neither one installs anything.
 
-See [plugin distribution and sharing](../plugin-distribution.md) for the catalog shape, the fetch and cache rules, the install and uninstall order, the deep-link parser rules, and the security review. Three parts of that design run today. The Apps tab installs the listing's pinned skills into the chosen agent and saves its app as a host-global MCP server. The links work: `openbot.run/marketplace/apps` (which `openbot.run/plugins` redirects to) and `openbot.run/plugins/<slug>` are pages on the public site, and `openbot://plugins/<slug>` opens that listing in the app, which is one of the link kinds that `src/main/deep-link-router.ts` recognises beside an invitation. Both sides read one catalog, generated from `marketplace/plugin-catalog/`, because a listing that said one thing on the page and another in the app would be two catalogs. The Apps tab also uninstalls a listing. The catalog files, the Worker routes that serve them, and the cache in the main process are still design.
+See [plugin distribution and sharing](../plugin-distribution.md) for the catalog shape, the fetch and cache rules, the install and uninstall order, the deep-link parser rules, and the security review. Three parts of that design run today. The Apps tab installs the listing's pinned skills into the chosen agent and saves its app as a host-global MCP server. The links work: `openbot.run/marketplace/apps` (which `openbot.run/plugins` redirects to) and `openbot.run/plugins/<slug>` are pages on the public site, and `openbot://plugins/<slug>` opens that listing in the app, which is one of the link kinds that `src/main/deep-link-router.ts` recognises beside an invitation. Both sides read one catalog, generated from `marketplace/plugin-catalog/`, because a listing that said one thing on the page and another in the app would be two catalogs. The Apps tab also uninstalls a listing.
+
+The Account Worker serves the whole catalog as JSON at `/v1/plugins/catalog` (`apps/auth-api/src/lib/plugin-catalog-response.ts`), with an ETag from the catalog hash. A merge to `main` deploys the Worker, so a catalog change reaches every client without a desktop release, a store build or an OTA update. The desktop renderer reads it through the main process (`skills:plugin-catalog`), the web client and the phone read it directly (`@openbot/team-client/marketplace-catalog`), and each client keeps its generated list as the first and offline list, and keeps each generated entry that the remote list does not have. The host (`src/main/plugin-catalog-service.ts`) loads it at start and every 30 minutes, keeps its bundled snapshot for entries that the remote list does not have, and uses the result to recognise catalog apps (the `npx` runtime, the agent's app setup steps and analytics slugs). A host announces `plugin-catalog-v1` only after it has loaded the remote catalog once. A client shows a new remote entry with a `stdio` app only on a host with that capability; a new `http` app shows on every host. `decodePluginCatalog` (`packages/contracts/src/plugin-catalog.ts`) drops an entry that it cannot read, such as a sign-in kind that an older client does not know, so a new entry that needs new client code still needs a release. The agent tool that suggests an app still names only the apps of the host's bundled snapshot. `bun run test:plugin-catalog` checks the whole path.

@@ -19,11 +19,19 @@ export interface WorkerBindings {
   GITHUB_TOKEN_RATE_LIMITER: RateLimit;
   LIVE_ACTIVITY_RATE_LIMITER?: RateLimit;
   FEEDBACK_RATE_LIMITER?: RateLimit;
+  WATCH_TICKET_RATE_LIMITER?: RateLimit;
   AUTH_EXPOSE_DEVELOPMENT_CODE?: string;
+  BROWSER_EXTENSION_IDS?: string;
   EMAIL_SMTP_HOST?: string;
   EMAIL_SMTP_PORT?: string;
   EMAIL_SMTP_USERNAME?: string;
   EMAIL_SMTP_PASSWORD?: string;
+  EMAIL_SMTP_OVERFLOW_USERNAME?: string;
+  EMAIL_SMTP_OVERFLOW_PASSWORD?: string;
+  EMAIL_SMTP_OVERFLOW_2_USERNAME?: string;
+  EMAIL_SMTP_OVERFLOW_2_PASSWORD?: string;
+  EMAIL_SMTP_OVERFLOW_3_USERNAME?: string;
+  EMAIL_SMTP_OVERFLOW_3_PASSWORD?: string;
   EMAIL_FROM?: string;
   EMAIL_REPLY_TO?: string;
   EMAIL_LICENSE_FROM?: string;
@@ -33,10 +41,20 @@ export interface WorkerBindings {
   EMAIL_DELIVERY_WEBHOOK_URL?: string;
   EMAIL_DELIVERY_WEBHOOK_SECRET?: string;
   SKILLS_ADMIN_TOKEN?: string;
+  MEDIA_GATEWAY?: Fetcher;
+  NEAR_INTENTS_PARTNER_KEY?: string;
+  NEAR_INTENTS_AGENT_API_URL?: string;
   SITE_OPERATIONS_ADMIN_TOKEN?: string;
   SERVER_CLAIMS_ADMIN_TOKEN?: string;
+  CF_ACCESS_TEAM_DOMAIN?: string;
+  CF_ACCESS_ADMIN_AUD?: string;
+  STORE_REVIEW_EMAIL?: string;
+  STORE_REVIEW_CODE?: string;
   SITE_REPORT_HASH_SECRET?: string;
   COMPANY_SIGN_IN_SECRET?: string;
+  HOSTED_ARCHIVE_KEY_SECRET?: string;
+  B2_WORKER_KEY_ID_EU?: string;
+  B2_WORKER_APPLICATION_KEY_EU?: string;
   SITE_COOKIE_ISOLATION_READY?: string;
   SITE_PUBLISH_ENABLED?: string;
   SITE_LOCAL_ORIGIN?: string;
@@ -184,6 +202,15 @@ export interface EmailCodeDelivery {
   }): Effect.Effect<void, EmailDeliveryError | SmtpFailure>;
 }
 
+export interface OwnerTransferEmailDelivery {
+  send(message: {
+    email: string;
+    fromEmail: string;
+    serverName: string;
+    appUrl: string;
+  }): Effect.Effect<void, EmailDeliveryError | SmtpFailure>;
+}
+
 export interface TeamInviteEmailDelivery {
   send(message: {
     email: string;
@@ -220,6 +247,8 @@ export interface EmailChallengeRecord {
   deliveryState: EmailChallengeDeliveryState;
 }
 
+export type SessionReads = "replica" | "primary";
+
 export interface AuthRepository {
   listAccountSessions(
     userId: string,
@@ -255,7 +284,7 @@ export interface AuthRepository {
     windowStart: number,
     limit: number,
   ): Effect.Effect<{ allowed: boolean; count: number; windowStart: number }, AuthStoreError>;
-  authenticate(sessionToken: string, now: number): Effect.Effect<AuthUser | null, AuthStoreError>;
+  authenticate(sessionToken: string, now: number, reads?: SessionReads): Effect.Effect<AuthUser | null, AuthStoreError>;
   authenticateDesktopSession(sessionToken: string, now: number): Effect.Effect<AuthUser | null, AuthStoreError>;
   revokeSession(sessionToken: string, now: number): Effect.Effect<void, AuthStoreError>;
   revokeMobileSession(sessionToken: string, now: number): Effect.Effect<boolean, AuthStoreError>;

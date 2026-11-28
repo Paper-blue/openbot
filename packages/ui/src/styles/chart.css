@@ -4,11 +4,21 @@
   min-width: 0;
   font-size: var(--openbot-text-sm);
 }
+.ui-chart-empty {
+  display: grid;
+  place-items: center;
+  height: 300px;
+  margin: 0;
+  color: var(--openbot-text-muted);
+  font-size: var(--openbot-text-sm);
+}
 .ui-chart-tooltip {
-  background: var(--openbot-bg-surface);
+  background: var(--ui-popover-frost-bg);
+  -webkit-backdrop-filter: var(--ui-popover-frost-filter);
+  backdrop-filter: var(--ui-popover-frost-filter);
   color: var(--openbot-text-primary);
   padding: var(--openbot-space-3);
-  border: 1px solid var(--openbot-border-strong);
+  border: 1px solid var(--ui-menu-edge);
   border-radius: var(--openbot-radius-md);
   font-size: var(--openbot-text-sm);
   font-variant-numeric: tabular-nums;
@@ -32,4 +42,7 @@
   border-top: 1px solid var(--openbot-border-strong);
   padding-top: var(--openbot-space-2);
   color: var(--openbot-text-muted);
+}
+.ui-chart-cursor {
+  fill: var(--openbot-bg-control-hover);
 }

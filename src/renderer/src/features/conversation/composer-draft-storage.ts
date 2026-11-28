@@ -45,6 +45,12 @@ function decodeStoredDrafts(value: unknown): StoredComposerDrafts {
     : { agents: {}, channels: {}, threads: {} };
 }
 
+export function clearStoredComposerDrafts(): void {
+  try {
+    window.localStorage.removeItem(COMPOSER_DRAFTS_STORAGE_KEY);
+  } catch {}
+}
+
 export function writeComposerDraftsOnChange(owner: ComposerDraftOwner): void {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const write = () => {
@@ -86,8 +92,7 @@ export function writeComposerDraftsOnChange(owner: ComposerDraftOwner): void {
         owner.unsentTexts(),
       ] as const,
     () => {
-      clearTimeout(timer);
-      timer = setTimeout(write, WRITE_DELAY_MS);
+      timer ??= setTimeout(write, WRITE_DELAY_MS);
     },
     { defer: true },
   );
